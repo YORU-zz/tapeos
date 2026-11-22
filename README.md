@@ -1,6 +1,6 @@
 # TapeOS（Sharp X1 版）
 
-> **暫定版 2026-11-22** ― これは開発中スナップショットの先行公開です。
+> **暫定版 2026-11-23** ― これは開発中スナップショットの先行公開です。
 > 内容は予告なく変更されることがあります。また本リポジトリは暫定版の
 > 配布場所で、再現プロジェクト完了後の本公開の際には、正本リポジトリへ
 > 統合／移行される予定です。
@@ -35,6 +35,7 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
   - EDAS ― エディタ／アセンブラ（`src/edas.z80`、TOSR リロケータブル版は `src/edasr.z80`）
   - NEWASM ― オンマシンアセンブラ（`src/newasm.z80`）
   - SCED ― スクリーンエディタ（`src/sced.z80`）
+  - MCED ― MicroEmacs 風エディタ（`src/mced.z80`）。モードレスな Emacs 系操作（C-k キル／C-y ヤンク、リージョン、検索、C-x プレフィクス）で、SCED とは別プログラム。ファイル形式は SCED と互換
 
 ### 設計：機種依存部と共通部の分離
 
@@ -54,7 +55,7 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
 ```
 
 `build/` にバイナリ（tapeos.bin、tapeos-shell.bin、edas.bin、
-newasm.bin、sced.bin など）とディスク／テープイメージが生成
+newasm.bin、sced.bin、mced.bin など）とディスク／テープイメージが生成
 されます。pasmo の場所は `PASMO=/path/to/pasmo ./build.sh` で
 上書きできます。
 
@@ -62,6 +63,7 @@ newasm.bin、sced.bin など）とディスク／テープイメージが生成
 なしでもそのまま試せます。
 
 - `images/shell.d88` ― TapeOS シェルの起動ディスクイメージ
+- `images/mced.d88` ― シェル起動ディスク＋ MCED プログラムファイル入り。起動後に `r mced` / `g 4000` で MCED が使えます
 - `images/tapeos.cmt` ― テープイメージ（IPL の CMT ブート用）
 - `images/font.d88` ― 漢字フォント（美咲フォント由来）のディスク
 

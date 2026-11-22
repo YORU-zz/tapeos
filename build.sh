@@ -13,8 +13,10 @@
 #   edasr.bin         EDAS, TOSR relocatable edition
 #   newasm.bin        NEWASM on-machine assembler (TOSD program)
 #   sced.bin          SCED screen editor (TOSD program)
+#   mced.bin          MCED MicroEmacs-style editor (TOSD program)
 #   tapeos.d88        bootable disk image of the M1 program
 #   shell.d88         bootable disk image of the shell
+#   mced.d88          bootable shell disk with the MCED program file
 #   tapeos.cmt        tape image of the shell (IPL CMT boot)
 set -e
 cd "$(dirname "$0")"
@@ -31,10 +33,13 @@ echo "== assemble =="
 "$PASMO" src/edasr.z80 build/edasr.bin build/edasr.lst
 "$PASMO" src/newasm.z80 build/newasm.bin build/newasm.lst
 "$PASMO" src/sced.z80 build/sced.bin build/sced.lst
+"$PASMO" src/mced.z80 build/mced.bin build/mced.lst
 
 echo "== disk / tape images =="
 python3 tools/mkd88.py build/tapeos.bin build/tapeos.d88
 python3 tools/mkd88.py build/tapeos-shell.bin build/shell.d88
+python3 tools/mkd88.py build/tapeos-shell.bin build/mced.d88 0x2000 0x2000 full
+python3 tools/putfile.py build/mced.d88 build/mced.bin MCED 0x4000
 python3 tools/mkcmt.py build/tapeos-shell.bin build/tapeos.cmt
 
 echo "== done =="
