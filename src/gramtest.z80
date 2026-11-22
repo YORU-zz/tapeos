@@ -1,0 +1,152 @@
+; gramtest.z80 - M3 diagnostic #2: is the background dash pattern
+; sitting in GRAM (graphic VRAM) and shining through the text?
+;
+; Phase 1: read GRAM bytes (offsets 8..31 of the 32-byte block of
+;   cells 0,1,2,3 and 1000) through the I/O ports into RAM 0xE500,
+;   before touching anything. Port for GRAM offset o (bank 0):
+;   port = (o & 31) * 0x800 + (o >> 5), valid for (o & 31) in 8..31,
+;   which are exactly the bytes the text/graphics mixer reads.
+; Phase 2: clear all those GRAM bytes (bank 0) to zero.
+; Phase 3: fill the text screen with spaces (atr 0x07) + a label.
+; If the screenshot is clean afterwards, the pattern was in GRAM.
+
+LOADADDR        equ     02000h
+SIGADDR         equ     0e100h
+DUMPADDR        equ     0e500h
+
+        org     LOADADDR
+
+start:
+        di
+        ld      sp, 0e000h
+
+        ld      hl, sig_text
+        ld      de, SIGADDR
+        ld      bc, sig_end - sig_text
+        ldir
+
+        ; ---------- phase 1: read GRAM blocks ----------
+        ld      iy, DUMPADDR
+        ld      hl, cell_list
+        ld      b, 5                    ; 5 cells
+cell_loop:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        push    hl
+        push    bc
+        ; DE = cell index; read j = 8..31
+        ld      a, 8
+j_loop:
+        push    af
+        ; BC = j*0x800 + cell
+        ld      h, a
+        ld      l, 0
+        add     hl, hl                  ; j*0x200
+        add     hl, hl                  ; j*0x400
+        add     hl, hl                  ; j*0x800
+        ld      c, e
+        ld      b, d                    ; BC = cell (temp)
+        push    hl
+        ld      l, c
+        ld      h, b
+        pop     bc                      ; BC = j*0x800
+        add     hl, bc                  ; HL = port
+        ld      c, l
+        ld      b, h                    ; BC = port
+        in      a, (c)
+        ld      (iy+0), a
+        inc     iy
+        pop     af
+        inc     a
+        cp      32
+        jr      nz, j_loop
+        pop     bc
+        pop     hl
+        djnz    cell_loop
+
+        ; ---------- phase 2: clear GRAM (bank 0, bytes 8..31) ----
+        ld      de, 0                   ; cell 0..2047
+clr_cell:
+        ld      a, 8
+clr_j:
+        push    af
+        ld      h, a
+        ld      l, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; HL = j*0x800
+        ld      c, e
+        ld      b, d
+        push    hl
+        ld      l, c
+        ld      h, b
+        pop     bc
+        add     hl, bc                  ; HL = port
+        ld      c, l
+        ld      b, h
+        xor     a
+        out     (c), a
+        pop     af
+        inc     a
+        cp      32
+        jr      nz, clr_j
+        inc     de
+        ld      a, d
+        cp      08h
+        jr      nz, clr_cell
+
+        ; ---------- phase 3: text screen full of spaces ----------
+        ld      de, 0
+        ld      hl, 2048
+txt_loop:
+        ld      c, e
+        ld      a, d
+        add     a, 030h
+        ld      b, a
+        ld      a, 020h
+        out     (c), a
+        res     4, b
+        ld      a, 007h
+        out     (c), a
+        inc     de
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, txt_loop
+
+        ld      hl, msg
+        ld      de, 40*2 + 2
+puts:
+        ld      a, (hl)
+        or      a
+        jr      z, done
+        inc     hl
+        push    hl
+        push    af
+        ld      c, e
+        ld      a, d
+        add     a, 030h
+        ld      b, a
+        pop     af
+        out     (c), a
+        res     4, b
+        ld      a, 007h
+        out     (c), a
+        pop     hl
+        inc     de
+        jr      puts
+
+done:
+        jr      done
+
+cell_list:
+        dw      0, 1, 2, 3, 1000
+
+sig_text:
+        db      "TAPEOS-GRAMTEST"
+sig_end:
+
+msg:
+        db      "AFTER GRAM CLEAR", 0

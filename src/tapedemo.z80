@@ -1,0 +1,23 @@
+; tapedemo.z80 - M3 test payload: a program loaded from tape
+; through the shell's T command and started with G.
+; It prints a message through the IOCS table (0xE400), writes a
+; signature into RAM at 0xE600 for the harness, and RETs to the
+; shell. Load/exec address is 0x8000 (set by mkcmt.py args), so
+; it does not overwrite the shell at 0x2000.
+
+        org     08000h
+
+start:
+        ld      hl, msg
+        call    0e409h                  ; IOCS PRTMSG
+        ld      hl, sig_text
+        ld      de, 0e600h
+        ld      bc, sig_end - sig_text
+        ldir
+        ret
+
+msg:
+        db      "LOADED FROM TAPE", 13, 10, 0
+sig_text:
+        db      "TAPE-DEMO-RAN"
+sig_end:

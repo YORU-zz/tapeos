@@ -1,0 +1,328 @@
+; emmdiag - EMM / bank-memory probe (M5 storage investigation)
+; OUROBO/ROS reproduction project (P2)
+;
+; Standalone diagnostic, loaded by the compatible IPL from FDD
+; at 02000h like src/boot.z80. It probes the two expansion
+; memory candidates for the TapeOS RAMDISK:
+;
+;   * EMM at ports 0d00h-0d03h (address L/M/H + data, the
+;     interface the compatible IPL itself uses for EMM boot:
+;     EMM_LOAD1ST / EMM_LOADFILE in the IPL source; the data
+;     port auto-increments the address - the IPL relies on it
+;     for reads, this diag also tests it for writes).
+;   * the X1turbo bank register at port 0b00h (read only).
+;
+; Result block in RAM (the harness dumps it):
+;   0e100h  "EMMDIAG" signature
+;   0e110h  4 bytes read back from EMM byte address 001000h
+;           (after writing 11 22 33 44 there)
+;   0e116h  3 bytes read back from 00fffeh (after writing
+;           55 66 77: crosses the 64K boundary if the address
+;           register is wider than 16 bits)
+;   0e114h  2 bytes read back from 010000h (after writing
+;           cc dd there; written after the boundary readback)
+;   0e119h  value read from port 0b00h (bank register)
+;   0e11ah  value read from never-written EMM address 002000h
+;   0e11ch  3 bytes: IN from ports 0d00h/01h/02h after setting
+;           the address to 001000h
+;
+; On the stock (M3-patched) core the EMM ports are dummy
+; handlers: writes are dropped and reads return 0ffh, so all
+; EMM readbacks come back 0ffh. After the M5 core patch they
+; must return the exact patterns written.
+
+LOADADDR        equ     02000h
+SIGADDR         equ     0e100h
+RESBASE         equ     0e110h
+TEXTPORT        equ     03000h
+
+EMM_L           equ     00d00h
+EMM_M           equ     00d01h
+EMM_H           equ     00d02h
+EMM_D           equ     00d03h
+BANKPORT        equ     00b00h
+
+        org     LOADADDR
+
+start:
+        di
+        ld      sp, 0e000h
+
+        ld      hl, sig_text
+        ld      de, SIGADDR
+        ld      bc, sig_end - sig_text
+        ldir
+
+        call    clear_gram
+        call    clear_screen
+
+        ld      a, 07h
+        ld      (attrv), a
+        ld      hl, msg_title
+        ld      de, 40*2 + 2
+        call    putstr
+
+        ; ---- test 1: write/read 4 bytes at 0001000h ----
+        ld      hl, 0010h               ; address high word
+        ld      a, 00h                  ; address low byte
+        call    emm_set
+        ld      bc, EMM_D
+        ld      a, 011h
+        out     (c), a
+        ld      a, 022h
+        out     (c), a
+        ld      a, 033h
+        out     (c), a
+        ld      a, 044h
+        out     (c), a
+        ld      hl, 0010h
+        ld      a, 00h
+        call    emm_set
+        ld      de, RESBASE + 0         ; -> 0e110h
+        ld      a, 4
+        ld      (rd_cnt), a
+        call    emm_rd
+
+        ; ---- test 2: 64K boundary at 000fffeh ----
+        ld      hl, 00ffh               ; bits 8..23 = 000fffh
+        ld      a, 0feh
+        call    emm_set
+        ld      bc, EMM_D
+        ld      a, 055h
+        out     (c), a
+        ld      a, 066h
+        out     (c), a
+        ld      a, 077h                 ; lands at 0010000h
+        out     (c), a
+        ld      hl, 00ffh
+        ld      a, 0feh
+        call    emm_set
+        ld      de, RESBASE + 6         ; -> 0e116h
+        ld      a, 3
+        ld      (rd_cnt), a
+        call    emm_rd
+
+        ; ---- test 3: above 64K at 0010000h ----
+        ld      hl, 0100h               ; bits 8..23 = 001000h
+        ld      a, 00h
+        call    emm_set
+        ld      bc, EMM_D
+        ld      a, 0cch
+        out     (c), a
+        ld      a, 0ddh
+        out     (c), a
+        ld      hl, 0100h
+        ld      a, 00h
+        call    emm_set
+        ld      de, RESBASE + 4         ; -> 0e114h
+        ld      a, 2
+        ld      (rd_cnt), a
+        call    emm_rd
+
+        ; ---- test 4: never-written cell at 0002000h ----
+        ld      hl, 0020h
+        ld      a, 00h
+        call    emm_set
+        ld      bc, EMM_D
+        in      a, (c)
+        ld      (RESBASE + 0ah), a      ; -> 0e11ah
+
+        ; ---- test 5: address ports readback ----
+        ld      hl, 0010h
+        ld      a, 00h
+        call    emm_set
+        ld      bc, EMM_L
+        in      a, (c)
+        ld      (RESBASE + 0ch), a      ; -> 0e11ch
+        inc     c
+        in      a, (c)
+        ld      (RESBASE + 0dh), a
+        inc     c
+        in      a, (c)
+        ld      (RESBASE + 0eh), a
+
+        ; ---- test 6: bank register port (read only) ----
+        ld      bc, BANKPORT
+        in      a, (c)
+        ld      (RESBASE + 09h), a      ; -> 0e119h
+
+        ; ---- show the result block as hex ----
+        ld      hl, msg_res
+        ld      de, 40*4 + 2
+        call    putstr
+        ld      hl, RESBASE
+        ld      de, 40*5 + 2
+        ld      b, 16
+        call    puthexs
+        ld      hl, msg_done
+        ld      de, 40*7 + 2
+        call    putstr
+
+done:
+        jr      done
+
+; emm_set: set the EMM address register.
+;   hl = address bits 8..23 (h = bits 16..23, l = bits 8..15)
+;   a  = address bits 0..7
+emm_set:
+        ld      bc, EMM_L
+        out     (c), a
+        inc     c
+        out     (c), l
+        inc     c
+        out     (c), h
+        ret
+
+; emm_rd: read (rd_cnt) bytes from EMM_D into (de)...
+; The byte count cannot live in b: with bc = EMM_D the b
+; register is the port's high byte (0dh), so the count is
+; kept in memory (same reason the IPL counts with a).
+emm_rd:
+        ld      bc, EMM_D
+emr_lp:
+        in      a, (c)
+        ld      (de), a
+        inc     de
+        ld      a, (rd_cnt)
+        dec     a
+        ld      (rd_cnt), a
+        jr      nz, emr_lp
+        ret
+
+rd_cnt:
+        db      0
+
+; ---------------------------------------------------------------
+; clear_gram / clear_screen / putstr: same as src/boot.z80
+; ---------------------------------------------------------------
+clear_gram:
+        ld      hl, 0
+cg_cell:
+        ld      a, 8
+cg_j:
+        push    af
+        push    hl
+        sla     a
+        sla     a
+        sla     a
+        ld      b, a
+        ld      a, h
+        and     07h
+        or      b
+        ld      b, a
+        ld      c, l
+        xor     a
+        out     (c), a
+        pop     hl
+        pop     af
+        inc     a
+        cp      32
+        jr      nz, cg_j
+        inc     hl
+        ld      a, h
+        cp      08h
+        jr      nz, cg_cell
+        ret
+
+clear_screen:
+        ld      de, 0
+        ld      hl, 2048
+cs_loop:
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(TEXTPORT)
+        ld      b, a
+        ld      a, 020h
+        out     (c), a
+        res     4, b
+        ld      a, 007h
+        out     (c), a
+        inc     de
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, cs_loop
+        ret
+
+putstr:
+        ld      a, (hl)
+        or      a
+        ret     z
+        inc     hl
+        push    hl
+        push    af
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(TEXTPORT)
+        ld      b, a
+        pop     af
+        out     (c), a
+        res     4, b
+        ld      a, (attrv)
+        out     (c), a
+        pop     hl
+        inc     de
+        jr      putstr
+
+; puthexs: print b bytes from (hl) as hex pairs at cell de.
+puthexs:
+        ld      a, (hl)
+        inc     hl
+        push    hl
+        push    bc
+        call    puthex
+        pop     bc
+        pop     hl
+        djnz    puthexs
+        ret
+
+; puthex: print a as two hex digits at cell de (de += 2),
+; plus one space (de += 1).
+puthex:
+        push    af
+        rrca
+        rrca
+        rrca
+        rrca
+        call    putnib
+        pop     af
+        call    putnib
+        ld      a, ' '
+        call    putch
+        ret
+
+putnib:
+        and     00fh
+        cp      10
+        jr      c, pn_d
+        add     a, 'A' - 10
+        jr      putch
+pn_d:
+        add     a, '0'
+putch:
+        push    af
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(TEXTPORT)
+        ld      b, a
+        pop     af
+        out     (c), a
+        res     4, b
+        ld      a, (attrv)
+        out     (c), a
+        inc     de
+        ret
+
+attrv:
+        db      07h
+
+sig_text:
+        db      "EMMDIAG"
+sig_end:
+
+msg_title:
+        db      "EMM PROBE (M5)", 0
+msg_res:
+        db      "RESULT 0E110H:", 0
+msg_done:
+        db      "PROBE DONE", 0

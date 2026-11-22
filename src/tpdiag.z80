@@ -1,0 +1,117 @@
+; tpdiag.z80 - M3 diagnostic: does the deck respond to TapeOS-
+; style control, and does port B bit1 toggle after PLAY?
+; Results in RAM:
+;   0xE200: sensor (0xEB reply) before PLAY
+;   0xE201: state  (0xEA reply) before PLAY
+;   0xE202: sensor after PLAY
+;   0xE203: state  after PLAY
+;   0xE210..: 512 port-B samples (~200us apart), byte = bit1 mask
+
+        org     02000h
+
+start:
+        di
+        ld      sp, 0e000h
+        ld      hl, sig_text
+        ld      de, 0e100h
+        ld      bc, sig_end - sig_text
+        ldir
+
+        call    rd_sensor
+        ld      (0e200h), a
+        call    rd_state
+        ld      (0e201h), a
+
+        ld      a, 2                    ; PLAY
+        call    mt_ctrl
+
+        call    rd_sensor
+        ld      (0e202h), a
+        call    rd_state
+        ld      (0e203h), a
+
+        ; sample port B bit1, 512 samples ~200us apart
+        ld      hl, 0e210h
+        ld      de, 512
+samp:
+        ld      bc, 01a01h
+        in      a, (c)
+        and     002h
+        ld      (hl), a
+        inc     hl
+        ld      a, 50                   ; ~200us (50 * 4us)
+sdly:
+        dec     a
+        jr      nz, sdly
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, samp
+
+        ld      a, 1                    ; STOP
+        call    mt_ctrl
+done:
+        jr      done
+
+; --- sub-CPU helpers, following the compatible IPL ---
+wait_wr:
+        ld      bc, 01a01h
+ww1:
+        in      a, (c)
+        and     040h
+        jr      nz, ww1
+        ret
+
+read_49:
+        ld      bc, 01a01h
+r49_1:
+        in      a, (c)
+        and     020h
+        jr      nz, r49_1
+        ld      bc, 01900h
+        in      a, (c)
+        ret
+
+; mt_ctrl: a = deck command (IPL MT_CTRL: ei + double wait)
+mt_ctrl:
+        push    bc
+        push    af
+        ei
+        call    wait_wr
+        ld      bc, 01900h
+        ld      a, 0e9h
+        out     (c), a
+        call    wait_wr
+        di
+        call    wait_wr
+        ld      bc, 01900h
+        pop     af
+        out     (c), a
+        pop     bc
+        ret
+
+rd_sensor:
+        ei
+        call    wait_wr
+        ld      bc, 01900h
+        ld      a, 0ebh
+        out     (c), a
+        call    wait_wr
+        di
+        call    read_49
+        ret
+
+rd_state:
+        ei
+        call    wait_wr
+        ld      bc, 01900h
+        ld      a, 0eah
+        out     (c), a
+        call    wait_wr
+        di
+        call    read_49
+        ret
+
+sig_text:
+        db      "TAPEOS-TPDIAG"
+sig_end:

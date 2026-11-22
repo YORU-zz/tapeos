@@ -1,0 +1,68 @@
+; ---------------------------------------------------------------
+; TAPE4800 build variant of tapeos.z80 (tape-4800).
+; Identical to the X1 master except TAPE4800, which swaps
+; the tape writer phases and reader sample point in
+; tape_x1.inc to the 4800 bps step. Runs against the
+; core's XMIL_TAPE_BPS=4800. The default build stays
+; byte-identical to the classic shell.
+; Assemble from the tapeos/ directory, like the original.
+; ---------------------------------------------------------------
+; TapeOS - monitor shell with MZ-80B-style IOCS call table
+; OUROBO/ROS reproduction project (P2)
+;
+; X1 target (this file). Since M7 stage 2 the TapeOS sources are
+; shared between targets in three layers (see mz-survey.md 4.1):
+;   common layer : shell.inc, cmd_core.inc, helpers.inc,
+;                  scroll.inc, console.inc, tail.inc, common.inc
+;   IOCS layer   : the jump-table templates (template_*.inc);
+;                  entry numbers and call convention are common
+;   machine layer: machine_*.inc (constants), boot_*.inc,
+;                  display/keyboard primitives, media IOCS
+; The MZ-80B target is src/tapeos_mz80b.z80. Include paths are
+; relative to the tapeos/ directory (pasmo resolves INCLUDE
+; against the current directory), so assemble from there.
+;
+; Loaded by the X1 compatible IPL (CC0, meister68k) from FDD at
+; 02000h (see tools/mkd88.py). At entry the IPL ROM is already
+; disconnected, so no IPL routines can be used. All console I/O
+; is done by TapeOS itself:
+;   - text output: direct writes to the X1 text VRAM ports
+;       char = 03000h + offset, attr = 02000h + offset,
+;       offset = y * 40 + x (IPL initialises the CRTC to WIDTH 40)
+;   - key input: sub-CPU (80C49) transaction, same wire protocol
+;     the compatible IPL uses (command 0E6h to port 01900h, status
+;     via 8255 port B at 01A01h, two reply bytes: function keys,
+;     then ASCII). Interrupts stay disabled; delivery is by polling
+;     the ports, which is how the emulated sub-CPU hands over data.
+;
+; IOCS call table (MZ-80B flavour, see README): 28 jump-table
+; entries at fixed address 0E400h, 3 bytes each (JP). The shell
+; itself calls the table for all of its console I/O (dogfooding):
+; C_xxx equates in common.inc are absolute addresses into the
+; table.
+
+TARGET_X1       equ     1
+HAS_KANJI       equ     1
+KF_ADV2         equ     1               ; kanji glyphs are 2 cells wide
+TAPE4800        equ     1               ; 4800 bps tape (writer + reader)
+
+        include "src/machine_x1.inc"
+        include "src/common.inc"
+        include "src/boot_x1.inc"
+        include "src/shell.inc"
+        include "src/cmd_tape.inc"
+        include "src/cmd_core.inc"
+        include "src/cmd_media.inc"
+        include "src/cmd_kanji.inc"
+        include "src/kanji_x1.inc"
+        include "src/helpers.inc"
+        include "src/vram_x1.inc"
+        include "src/scroll.inc"
+        include "src/gram_x1.inc"
+        include "src/kb_x1.inc"
+        include "src/console.inc"
+        include "src/tape_x1.inc"
+        include "src/fd_x1.inc"
+        include "src/tail.inc"
+        include "src/template_x1.inc"
+        include "src/data_x1.inc"

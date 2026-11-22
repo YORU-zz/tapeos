@@ -1,0 +1,142 @@
+; fddiag.z80 - M4 diagnostic: replicate the compatible IPL's
+; FDC read sequence exactly (LOADFILE / FDC_SEEK / FDC_READ),
+; journaling status bytes and the byte count into RAM so the
+; harness can dump them.
+;   0xE100: signature "FDDIAG"
+;   0xE120: journal: [0]=stat after restore wait
+;                    [1]=stat after seek
+;                    [2]=stat before read cmd
+;                    [3]=final stat after transfer
+;                    [4..5]=byte count (LE16)
+;   0xE200: the 256 bytes read (record 32 = track1/side0/sec1)
+
+        org     02000h
+
+FDCR    equ     00ff8h
+FDDR    equ     00ffbh
+FDSR    equ     00ffah
+FDNO    equ     00ffch
+
+start:
+        di
+        ld      sp, 0e000h
+        ld      hl, sig
+        ld      de, 0e100h
+        ld      bc, 6
+        ldir
+
+        ; clear journal + buffer
+        ld      hl, 0e120h
+        ld      b, 16
+        xor     a
+jclr:
+        ld      (hl), a
+        inc     hl
+        djnz    jclr
+
+        ; --- FDC_RESTORE (IPL LOAD1ST does this first) ---
+        ld      a, 2
+        call    fdc_cmd                 ; cmd + wait busy
+        in      a, (c)                  ; bc = FDCR still
+        ld      (0e120h), a             ; stat after restore
+
+        ; --- LOADFILE for record 32, one sector ---
+        ; drive select: drive 0, side 0, motor on
+        ld      bc, FDNO
+        ld      a, 080h
+        out     (c), a
+
+        ; seek track 1
+        ld      a, 1
+        call    fdc_seek
+        ld      (0e121h), a             ; stat after seek & 99h style
+
+        ; read sector 1 into 0xE200
+        ld      hl, 0e200h
+        ld      a, 0                    ; sector (0-origin)
+        call    fdc_read
+        ld      (0e123h), a             ; final stat (rlca'd like IPL)
+
+        ; byte count = hl - 0xE200
+        ld      de, 0e200h
+        or      a
+        sbc     hl, de
+        ld      (0e124h), hl
+
+        ; motor off
+        ld      bc, FDNO
+        xor     a
+        out     (c), a
+
+        ; write "DONE" marker over the buffer tail area in journal
+        ld      a, 0aah
+        ld      (0e12fh), a
+hang:
+        jr      hang
+
+; --- IPL FDC_CMD: a = command, waits for busy to clear ---
+fdc_cmd:
+        ld      bc, FDCR
+        out     (c), a
+        ; fall into wait
+wait_busy:
+        in      a, (c)
+        and     081h
+        jr      nz, wait_busy
+        ret
+
+; --- IPL FDC_SEEK: a = track; returns stat & 099h in a ---
+fdc_seek:
+        ld      bc, FDDR
+        out     (c), a
+        ld      a, 01eh
+        call    fdc_cmd
+        in      a, (c)
+        and     099h
+        ret
+
+; --- IPL FDC_READ: a = sector (0-origin), hl = buffer ---
+; returns the final status byte (after the IPL's rlca undo)
+fdc_read:
+        ld      bc, FDSR
+        inc     a
+        out     (c), a
+        ld      c, 0f8h
+        call    wait_busy2
+        ld      d, 0f8h                 ; status port low byte
+        ld      e, 0fbh                 ; data port low byte
+        ld      bc, FDCR
+        ld      a, 080h
+        out     (c), a                  ; read command
+        call    wait1
+fr_lp:
+        in      a, (c)                  ; status
+        rrca                            ; BUSY?
+        jr      nc, fr_done
+        rrca                            ; DRQ?
+        jr      nc, fr_lp
+        ld      c, e                    ; data register
+        in      a, (c)
+        ld      (hl), a
+        inc     hl
+        ld      c, d                    ; status register
+        jr      fr_lp
+fr_done:
+        rlca                            ; undo the first rrca
+        ret
+
+wait_busy2:
+        in      a, (c)
+        and     081h
+        jr      nz, wait_busy2
+        ret
+
+wait1:
+        ld      a, 16
+w1_lp:
+        dec     a
+        jr      nz, w1_lp
+        ret
+
+sig:
+        db      "FDDIAG"

@@ -1,0 +1,280 @@
+; ---------------------------------------------------------------
+; exttest.z80 - IOCS-direct test for the extended IOCS
+; (ep.31): MINIT / MDIR / MSTORE / MFREE driven through the
+; call table, including a 3-block MSTORE whose content is
+; verified byte by byte by walking the FAT chain in RAM.
+; Loaded at 0x4000 from FD and started with G 4000; RETs to
+; the shell. Result block at 0xE620 (16 bytes):
+;   +0  "EXT-IOCS"
+;   +8  stage reached (0FFh = all passed)
+;   +9  flags (bit 0 set = failed at the stage in +8)
+;   +10 free blocks after MINIT(64)        (expect 62)
+;   +12 free blocks after the BIG store    (expect 59)
+;   +14 free blocks after MFREE(BIG)       (expect 62)
+; The free counts are recomputed here from the published
+; pool format (directory at MDIR's return, FAT next block),
+; not taken from the implementation's word for it.
+; ---------------------------------------------------------------
+
+C_MINIT         equ     0e433h          ; IOCS_BASE + 3*17
+C_MDIR          equ     0e436h          ; IOCS_BASE + 3*18
+C_MSTORE        equ     0e439h          ; IOCS_BASE + 3*19
+C_MFREE         equ     0e451h          ; IOCS_BASE + 3*27
+RESULT          equ     0e620h
+SRCBUF          equ     05000h
+
+        org     04000h
+
+start:
+        ld      hl, sig
+        ld      de, RESULT
+        ld      bc, 8
+        ldir
+        xor     a
+        ld      (RESULT + 9), a
+        ; ---- stage 1: MINIT(64) must grant 64
+        ld      a, 1
+        ld      (RESULT + 8), a
+        ld      hl, 64
+        call    C_MINIT
+        jp      c, fail
+        ld      a, h
+        or      a
+        jp      nz, fail
+        ld      a, l
+        cp      64
+        jp      nz, fail
+        ; ---- stage 2: free blocks = 62
+        ld      a, 2
+        ld      (RESULT + 8), a
+        call    countfree
+        jp      c, fail
+        ld      (RESULT + 10), hl
+        ld      a, l
+        cp      62
+        jp      nz, fail
+        ; ---- stage 3: store a 600-byte pattern as BIG
+        ld      a, 3
+        ld      (RESULT + 8), a
+        ld      hl, SRCBUF
+        ld      bc, 600
+        ld      e, 0
+fill_lp:
+        ld      (hl), e
+        inc     hl
+        inc     e
+        dec     bc
+        ld      a, b
+        or      c
+        jr      nz, fill_lp
+        ld      hl, name_big
+        ld      de, SRCBUF
+        ld      bc, 600
+        call    C_MSTORE
+        jp      c, fail
+        ; ---- stage 4: free blocks = 59 (3 blocks used)
+        ld      a, 4
+        ld      (RESULT + 8), a
+        call    countfree
+        jp      c, fail
+        ld      (RESULT + 12), hl
+        ld      a, l
+        cp      59
+        jp      nz, fail
+        ; ---- stage 5: verify BIG byte by byte, chain walk
+        ld      a, 5
+        ld      (RESULT + 8), a
+        call    verify
+        jp      c, fail
+        ; ---- stage 6: MFREE(BIG); free blocks = 62 again
+        ld      a, 6
+        ld      (RESULT + 8), a
+        ld      hl, name_big
+        call    C_MFREE
+        jp      c, fail
+        call    countfree
+        jp      c, fail
+        ld      (RESULT + 14), hl
+        ld      a, l
+        cp      62
+        jp      nz, fail
+        ; ---- stage 7: MFREE(BIG) again must fail
+        ld      a, 7
+        ld      (RESULT + 8), a
+        ld      hl, name_big
+        call    C_MFREE
+        jp      nc, fail                ; success here is wrong
+        ; ---- stage 8: duplicate MSTORE name must fail
+        ld      a, 8
+        ld      (RESULT + 8), a
+        ld      hl, name_tiny
+        ld      de, SRCBUF
+        ld      bc, 4
+        call    C_MSTORE
+        jp      c, fail
+        ld      hl, name_tiny
+        ld      de, SRCBUF
+        ld      bc, 4
+        call    C_MSTORE
+        jp      nc, fail                ; success here is wrong
+        ld      hl, name_tiny
+        call    C_MFREE
+        jp      c, fail
+        ; ---- all passed
+        ld      a, 0ffh
+        ld      (RESULT + 8), a
+        ret
+fail:
+        ld      hl, RESULT + 9
+        set     0, (hl)
+        ret
+
+; countfree: -> hl = free blocks, recomputed from the pool
+; format: MDIR gives the directory block; total at +6;
+; FAT entries from block 2, zero = free.
+countfree:
+        call    C_MDIR
+        ret     c
+        ld      de, 6
+        add     hl, de
+        ld      a, (hl)                 ; total blocks
+        ld      (cf_tot), a
+        ld      de, 254                 ; base+6 +254 = FAT[2]
+        add     hl, de
+        ld      de, 0                   ; count
+        ld      b, 2                    ; block index
+cf_lp:
+        ld      a, (cf_tot)
+        cp      b
+        jr      z, cf_done
+        ld      a, (hl)
+        inc     hl
+        or      (hl)
+        inc     hl
+        jr      nz, cf_next
+        inc     de
+cf_next:
+        inc     b
+        jr      cf_lp
+cf_done:
+        ex      de, hl
+        or      a
+        ret
+
+; verify: walk BIG's FAT chain and compare all 600 bytes
+; against the pattern (byte = offset mod 256). carry = fail.
+verify:
+        call    C_MDIR
+        ret     c
+        ld      de, 16
+        add     hl, de                  ; first entry
+        ld      b, 8
+vf_find:
+        push    hl
+        push    bc
+        ld      de, name_big
+        ld      b, 10
+vf_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, vf_neq
+        inc     de
+        inc     hl
+        djnz    vf_cmp
+        pop     bc
+        pop     hl
+        jr      vf_found
+vf_neq:
+        pop     bc
+        pop     hl
+        ld      de, 16
+        add     hl, de
+        djnz    vf_find
+        scf
+        ret
+vf_found:
+        ld      de, 10
+        add     hl, de
+        ld      a, (hl)                 ; start block
+        ld      (v_blk), a
+        call    v_blkaddr               ; hl = block address
+        ld      bc, 600                 ; bytes left in total
+        ld      de, 256
+        ld      (v_left), de            ; bytes left in block
+        xor     a
+        ld      (v_pat), a
+v_lp:
+        ld      a, (v_pat)
+        cp      (hl)
+        jr      nz, v_fail
+        inc     a
+        ld      (v_pat), a
+        inc     hl
+        dec     bc
+        ld      a, b
+        or      c
+        jr      z, v_done
+        push    hl
+        ld      hl, (v_left)
+        dec     hl
+        ld      (v_left), hl
+        ld      a, h
+        or      l
+        pop     hl
+        jr      nz, v_lp
+        ; advance: FAT[v_blk] must be a link (0x80|next)
+        ld      a, (v_blk)
+        add     a, a
+        ld      l, a
+        ld      h, 091h                 ; MEMFAT page (format)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      a, d
+        cp      080h
+        jr      nz, v_fail
+        ld      a, e
+        ld      (v_blk), a
+        call    v_blkaddr
+        ld      de, 256
+        ld      (v_left), de
+        jr      v_lp
+v_done:
+        ; the last block's FAT entry must be the end mark
+        ld      a, (v_blk)
+        add     a, a
+        ld      l, a
+        ld      h, 091h
+        ld      a, (hl)
+        cp      0ffh
+        jr      nz, v_fail
+        inc     hl
+        ld      a, (hl)
+        cp      0ffh
+        jr      nz, v_fail
+        or      a
+        ret
+v_fail:
+        scf
+        ret
+v_blkaddr:
+        ld      a, (v_blk)
+        add     a, 090h                 ; MEMBASE page (format)
+        ld      h, a
+        ld      l, 0
+        ret
+
+sig:
+        db      "EXT-IOCS"
+name_big:
+        db      "BIG       "
+name_tiny:
+        db      "TINY      "
+cf_tot:
+        db      0
+v_blk:
+        db      0
+v_pat:
+        db      0
+v_left:
+        dw      0

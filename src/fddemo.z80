@@ -1,0 +1,24 @@
+; fddemo.z80 - M4 test payload: a program saved to and loaded
+; from floppy disk through the shell's W / R commands (it is
+; first brought into memory from tape, then saved to FD).
+; It prints a message through the IOCS table (0xE400), writes a
+; signature into RAM at 0xE680 for the harness, and RETs to the
+; shell. Load/exec address is 0x8000, so it does not overwrite
+; the shell at 0x2000.
+
+        org     08000h
+
+start:
+        ld      hl, msg
+        call    0e409h                  ; IOCS PRTMSG
+        ld      hl, sig_text
+        ld      de, 0e680h
+        ld      bc, sig_end - sig_text
+        ldir
+        ret
+
+msg:
+        db      "LOADED FROM DISK", 13, 10, 0
+sig_text:
+        db      "FD-DEMO-RAN"
+sig_end:

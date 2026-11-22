@@ -1,0 +1,160 @@
+; TapeOS M1 - FDD boot banner program for SHARP X1
+; OUROBO/ROS reproduction project (P2)
+;
+; Loaded by the X1 compatible IPL (CC0, meister68k) from FDD:
+;   load address 02000h, exec address 02000h (see tools/mkd88.py header)
+; At entry the IPL ROM is already disconnected by the IPL redirector,
+; so this program must not call IPL routines. Text output is done by
+; writing the X1 text VRAM directly through I/O ports, using the same
+; addressing scheme as the compatible IPL:
+;   char port = 03000h + offset, attr port = 02000h + offset
+;   offset = y * 40 + x   (IPL initialises the CRTC to WIDTH 40)
+;
+; After printing the banner the program also writes a signature string
+; into RAM at 0E100h so the headless harness can prove it really ran.
+
+LOADADDR        equ     02000h
+SIGADDR         equ     0e100h
+TEXTPORT        equ     03000h          ; text VRAM port base
+ATTRMASK        equ     04h             ; bit in B that selects attr (res 4,b)
+
+        org     LOADADDR
+
+start:
+        di
+        ld      sp, 0e000h
+
+        ; --- signature for the verification harness ---
+        ld      hl, sig_text
+        ld      de, SIGADDR
+        ld      bc, sig_end - sig_text
+        ldir
+
+        ; --- clear GVRAM (IPL leftovers shine through text) ---
+        call    clear_gram
+
+        ; --- clear the text screen ---
+        call    clear_screen
+
+        ; --- banner ---
+        ld      a, 02h                  ; red (same value the IPL uses)
+        ld      (attrv), a
+        ld      hl, msg_title
+        ld      de, 40*8 + 10
+        call    putstr
+
+        ld      a, 07h                  ; white
+        ld      (attrv), a
+        ld      hl, msg_sub1
+        ld      de, 40*10 + 4
+        call    putstr
+        ld      hl, msg_sub2
+        ld      de, 40*11 + 4
+        call    putstr
+        ld      hl, msg_sub3
+        ld      de, 40*13 + 4
+        call    putstr
+
+done:
+        jr      done
+
+; ---------------------------------------------------------------
+; clear_gram: zero GVRAM bank 0 (offsets 8..31 of every 32-byte
+; cell block). The graphic plane is composited under the text
+; plane on the X1, and the IPL leaves leaked bytes in GVRAM
+; (xmil: PPI port C bit5 falling edge arms the one-shot GVRAM
+; write latch, so part of the IPL's own text output lands in
+; GVRAM and shows through blank cells as a dash/dot pattern).
+; Port for block offset j of cell c is (j << 11) + c, j = 8..31.
+; ---------------------------------------------------------------
+clear_gram:
+        ld      hl, 0                   ; cell index 0..2047
+cg_cell:
+        ld      a, 8                    ; j = 8..31
+cg_j:
+        push    af
+        push    hl
+        sla     a
+        sla     a
+        sla     a                       ; a = j * 8
+        ld      b, a
+        ld      a, h
+        and     07h                     ; cell >> 8 (cell < 2048)
+        or      b
+        ld      b, a                    ; B = port high byte
+        ld      c, l                    ; C = port low byte
+        xor     a
+        out     (c), a
+        pop     hl
+        pop     af
+        inc     a
+        cp      32
+        jr      nz, cg_j
+        inc     hl
+        ld      a, h
+        cp      08h
+        jr      nz, cg_cell
+        ret
+
+; ---------------------------------------------------------------
+; clear_screen: fill the whole text VRAM (2048 cells) with spaces
+; ---------------------------------------------------------------
+clear_screen:
+        ld      de, 0                   ; offset
+        ld      hl, 2048                ; TXTSIZ
+cs_loop:
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(TEXTPORT)
+        ld      b, a
+        ld      a, 020h                 ; space
+        out     (c), a
+        res     4, b                    ; attribute port
+        ld      a, 007h
+        out     (c), a
+        inc     de
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, cs_loop
+        ret
+
+; ---------------------------------------------------------------
+; putstr: print a 0-terminated string
+;   hl = string, de = offset (y*40+x), attribute from (attrv)
+; ---------------------------------------------------------------
+putstr:
+        ld      a, (hl)
+        or      a
+        ret     z
+        inc     hl
+        push    hl
+        push    af
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(TEXTPORT)
+        ld      b, a
+        pop     af
+        out     (c), a                  ; character
+        res     4, b                    ; attribute port
+        ld      a, (attrv)
+        out     (c), a
+        pop     hl
+        inc     de
+        jr      putstr
+
+attrv:
+        db      07h
+
+sig_text:
+        db      "TAPEOS-M1-RUNNING"
+sig_end:
+
+msg_title:
+        db      "T A P E O S", 0
+msg_sub1:
+        db      "X1 SINGLETASK OS", 0
+msg_sub2:
+        db      "OUROBO/ROS REPRODUCTION PROJECT", 0
+msg_sub3:
+        db      "M1: FDD BOOT OK", 0

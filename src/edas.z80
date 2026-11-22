@@ -1,0 +1,4841 @@
+; edas.z80 - TapeOS on-machine editor/assembler (M6)
+; OUROBO/ROS reproduction project (P2)
+;
+; In the fiction, the protagonist ran EDAS (the MZ-80B editor/
+; assembler from I/O magazine) on his X1 with its IOCS calls
+; redirected to his own MZ-80B-style IOCS call table, and
+; developed on the machine itself (ep. 18). This program is
+; that piece of the early X1 environment: a line editor and a
+; Z80 assembler that live on TapeOS as an ordinary TOSD file
+; and do ALL of their input/output through the IOCS table at
+; 0E400h - console via INKEY/KEYIN/CONOUT/PRTMSG/CRLF/GETLIN/
+; HEXOUT/HEX16, storage via the block entries DREAD/DWRITE
+; (FD) and RREAD/RWRITE/RINIT (RAMDISK). The TOSD directory
+; handling is implemented here, on top of those block entries
+; (the shell's file layer is not part of the IOCS table, so an
+; application carries its own, exactly as EDAS did).
+;
+; Placement: a separate program file "EDAS", loaded by the
+; shell's R command to 04000h and started with G 4000. Q
+; returns (RET) to the shell. It cannot be built into the
+; shell: the FD system area (records 0..31) caps the shell at
+; 7936 bytes and the shell is already 5182.
+;
+; Memory map:
+;   04000h..        this program (code + strings + variables)
+;   06400h..064ffh  directory sector buffer (own copy)
+;   06600h..06dffh  symbol table: 128 entries x 16 bytes
+;   07000h..07fffh  source text buffer (4 KB)
+;   08000h..0dfffh  assembly output area / file staging
+; The assembler refuses to emit outside 08000h..0dfffh, so a
+; source program can never overwrite EDAS, the text buffer,
+; the shell (02000h) or the IOCS/system page (0e000h+).
+;
+; Text buffer format: a sequence of lines, each stored as a
+; length byte (0..72) followed by the characters, closed by a
+; single 0ffh terminator byte. Line numbers are positional
+; (1-based) and implicit.
+;
+; Assembler: two passes. Pass 1 defines labels/EQU symbols
+; (forward references allowed; instruction sizes never depend
+; on operand values, so no phase errors are possible). Pass 2
+; emits and reports the first error with its line number.
+; Mnemonics, registers and labels are case-insensitive (all
+; identifiers are upper-cased while scanning); string and
+; character literals keep their case. See README (M6) for the
+; supported instruction set and the documented limitations.
+
+; ---- IOCS table (3 bytes per entry) ----
+; The table address is this program's one machine-dependent
+; constant: 0e400h on the X1, 0c400h on the MZ machines.
+; The MZ masters (src/edas_mz80b.z80 / src/edas_mz80k.z80,
+; M7 stage 4) define EDAS_MZ - the ep.18 arrangement, where
+; EDAS ran on another machine by redirecting its IOCS calls
+; to the common monitor's table. The PC-8801 master
+; (src/edas_pc88.z80, PC88 stage 3) defines EDAS_PC88: its
+; table sits at the X1 address 0e400h, so only the emit
+; guard moves (OUTMAX below, 0c000h - the 8801's OS body
+; and work page live in the 0c000h page, not at 0e000h).
+        IF      DEFINED EDAS_MZ
+IOCS_BASE       equ     0c400h
+        ELSE
+IOCS_BASE       equ     0e400h
+        ENDIF
+C_INKEY         equ     IOCS_BASE + 3 * 0
+C_KEYIN         equ     IOCS_BASE + 3 * 1
+C_CONOUT        equ     IOCS_BASE + 3 * 2
+C_PRTMSG        equ     IOCS_BASE + 3 * 3
+C_CRLF          equ     IOCS_BASE + 3 * 4
+C_GETLIN        equ     IOCS_BASE + 3 * 5
+C_CLRSCR        equ     IOCS_BASE + 3 * 6
+C_LOCATE        equ     IOCS_BASE + 3 * 7
+C_HEXOUT        equ     IOCS_BASE + 3 * 8
+C_HEX16         equ     IOCS_BASE + 3 * 9
+C_DREAD         equ     IOCS_BASE + 3 * 15
+C_DWRITE        equ     IOCS_BASE + 3 * 16
+C_RREAD         equ     IOCS_BASE + 3 * 24
+C_RWRITE        equ     IOCS_BASE + 3 * 25
+C_RINIT         equ     IOCS_BASE + 3 * 26
+
+; ---- fixed work areas (RAM only, not part of the binary) ----
+EDIRBUF         equ     06400h          ; TOSD directory sector
+ESYMTAB         equ     06600h          ; symbol table
+SYMMAX          equ     128             ; entries of 16 bytes
+ETEXT           equ     07000h          ; source text buffer
+ETEXTSZ         equ     01000h          ; 4 KB
+ERAW            equ     08000h          ; file staging area
+OUTMIN          equ     08000h          ; emit guard: low
+        IF      DEFINED EDAS_PC88
+OUTMAX          equ     0c000h          ; emit guard: high (excl);
+                                        ; the PC-8801 OS body,
+                                        ; stack and work page
+                                        ; live at 0c000h and up
+        ELSE
+        IF      DEFINED EDAS_MZ
+OUTMAX          equ     0d000h          ; emit guard: high (excl);
+                                        ; text VRAM at 0d000h
+        ELSE
+OUTMAX          equ     0e000h          ; emit guard: high (excl)
+        ENDIF
+        ENDIF
+ORGDEF          equ     08000h          ; default ORG
+        IF      DEFINED EDAS_TOSR
+TS_STUB_LEN     equ     109             ; TOSR self-relocation
+                                        ; stub length (reloc
+                                        ; stage 1 template)
+        ENDIF
+MAXLINE         equ     72              ; max source line length
+DIRREC          equ     32              ; FD directory record
+FDMAXREC        equ     1280            ; FD records (320 KB)
+RDDATA0         equ     1               ; RAMDISK data from block 1
+FDDATA0         equ     48              ; FD data from record 48
+
+; operand types produced by parse_op
+OT_NONE         equ     0
+OT_R8           equ     1               ; 8-bit reg, (HL) = code 6
+OT_RR           equ     2               ; BC/DE/HL/SP = 0/1/2/3
+OT_RR2          equ     3               ; AF (push/pop form) = 3
+OT_IMM          equ     4               ; expression value
+OT_IND          equ     5               ; (expression)
+OT_IBC          equ     6               ; (BC)
+OT_IDE          equ     7               ; (DE)
+OT_ISP          equ     8               ; (SP)
+OT_IX           equ     9               ; IX / IY itself
+OT_IXD          equ     10              ; (IX+d) / (IY+d)
+OT_IC           equ     11              ; (C)
+OT_I            equ     12              ; I register
+OT_R            equ     13              ; R register
+
+        org     04000h
+
+; ---------------------------------------------------------------
+; Entry. The shell's G command calls here; RET returns.
+; ---------------------------------------------------------------
+edas_start:
+        ld      (ed_sp), sp             ; for error recovery
+        xor     a
+        ld      (ed_drv), a             ; default drive: FD
+        call    txt_clear
+        ld      hl, msg_banner
+        call    C_PRTMSG
+ed_loop:
+        ld      sp, (ed_sp)             ; keep the stack shallow
+        ld      hl, msg_prompt
+        call    C_PRTMSG
+        ld      hl, ed_linebuf
+        ld      b, 80
+        call    C_GETLIN                ; a = length
+        or      a
+        jr      z, ed_loop              ; empty line
+        ld      hl, ed_linebuf
+        ld      a, (hl)
+        inc     hl
+        ld      (ed_argp), hl           ; args follow the letter
+        call    upcase
+        cp      'H'
+        jp      z, ec_help
+        cp      'N'
+        jp      z, ec_new
+        cp      'P'
+        jp      z, ec_print
+        cp      'A'
+        jp      z, ec_append
+        cp      'I'
+        jp      z, ec_insert
+        cp      'D'
+        jp      z, ec_delete
+        cp      'E'
+        jp      z, ec_edit
+        cp      'R'
+        jp      z, ec_read
+        cp      'W'
+        jp      z, ec_write
+        cp      'F'
+        jp      z, ec_files
+        cp      'U'
+        jp      z, ec_usedrv
+        cp      'B'
+        jp      z, ec_build
+        cp      'Q'
+        jp      z, ec_quit
+        ld      hl, msg_err
+        call    C_PRTMSG
+        jp      ed_loop
+
+ec_quit:
+        ret                             ; back to the shell
+
+ec_help:
+        ld      hl, msg_help
+        call    C_PRTMSG
+        jp      ed_loop
+
+ec_new:
+        call    txt_clear
+        ld      hl, msg_new
+        call    C_PRTMSG
+        jp      ed_loop
+
+; ---------------------------------------------------------------
+; Small console / parsing helpers (all output via IOCS)
+; ---------------------------------------------------------------
+
+; cout: print a (via IOCS CONOUT)
+cout:
+        jp      C_CONOUT
+
+; crlf: print CR+LF (via IOCS)
+crlf:
+        jp      C_CRLF
+
+; prt: print the 0-terminated string at hl (via IOCS PRTMSG)
+prt:
+        jp      C_PRTMSG
+
+; upcase: a -> A-Z if a-z (destroys f)
+upcase:
+        cp      'a'
+        ret     c
+        cp      'z' + 1
+        ret     nc
+        sub     020h
+        ret
+
+; div10: hl = hl / 10, a = remainder (destroys bc, de)
+div10:
+        ld      de, 10
+        ld      bc, 0
+dv_lp:
+        or      a
+        sbc     hl, de
+        jr      c, dv_done
+        inc     bc
+        jr      dv_lp
+dv_done:
+        add     hl, de                  ; hl = remainder
+        ld      a, l
+        ld      h, b
+        ld      l, c                    ; hl = quotient
+        ret
+
+; prt_dec: print hl as unsigned decimal (no leading zeros)
+prt_dec:
+        push    bc
+        push    de
+        xor     a
+        ld      (pd_cnt), a             ; digit count in MEMORY:
+pd_1:                                   ; div10 destroys bc, so a
+        call    div10                   ; register counter in c is
+        add     a, '0'                  ; silently reset by it -
+        push    af                      ; with 2+ digit numbers the
+        ld      a, (pd_cnt)             ; pop loop then under-ran
+        inc     a                       ; and the epilogue ret went
+        ld      (pd_cnt), a             ; wild (found the hard way
+        ld      a, h                    ; in M6: it jumped into the
+        or      l                       ; freshly assembled program)
+        jr      nz, pd_1
+pd_2:
+        pop     af
+        call    cout
+        ld      a, (pd_cnt)
+        dec     a
+        ld      (pd_cnt), a
+        jr      nz, pd_2
+        pop     de
+        pop     bc
+        ret
+
+; prt_dec_sp: print hl as decimal followed by one space
+prt_dec_sp:
+        call    prt_dec
+        ld      a, ' '
+        jp      cout
+
+; skip_sp_a: advance (ed_argp) past spaces/tabs; a = next char
+skip_sp_a:
+        ld      hl, (ed_argp)
+ssa_lp:
+        ld      a, (hl)
+        cp      ' '
+        jr      z, ssa_inc
+        cp      009h
+        jr      nz, ssa_done
+ssa_inc:
+        inc     hl
+        jr      ssa_lp
+ssa_done:
+        ld      (ed_argp), hl
+        ret
+
+; parse_dec_a: parse a decimal number from (ed_argp).
+;   -> de = value, carry set if no digits. (ed_argp) advanced.
+parse_dec_a:
+        call    skip_sp_a
+        ld      hl, (ed_argp)
+        ld      de, 0
+        ld      c, 0                    ; digit count
+pda_lp:
+        ld      a, (hl)
+        sub     '0'
+        jr      c, pda_end
+        cp      10
+        jr      nc, pda_end
+        inc     hl
+        inc     c
+        push    hl
+        push    de                      ; acc
+        pop     hl                      ; hl = acc
+        add     hl, hl                  ; 2x
+        push    hl                      ; save 2x
+        add     hl, hl
+        add     hl, hl                  ; 8x
+        pop     de                      ; de = 2x
+        add     hl, de                  ; 10x
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; + digit
+        ex      de, hl                  ; de = new acc
+        pop     hl
+        jr      pda_lp
+pda_end:
+        ld      (ed_argp), hl
+        ld      a, c
+        or      a
+        jr      z, pda_none
+        or      a                       ; carry = 0
+        ret
+pda_none:
+        scf
+        ret
+
+; parse_name_a: parse a file-name token from (ed_argp) into
+; ed_namebuf (10 chars, space padded, upper-cased).
+;   -> carry set if empty or longer than 10 chars.
+parse_name_a:
+        call    skip_sp_a
+        ld      hl, ed_namebuf
+        ld      b, 10
+        ld      a, ' '
+pna_sp:
+        ld      (hl), a
+        inc     hl
+        djnz    pna_sp
+        ld      hl, (ed_argp)
+        ld      de, ed_namebuf
+        ld      c, 0
+pna_lp:
+        ld      a, (hl)
+        cp      ' '
+        jr      z, pna_end
+        cp      009h
+        jr      z, pna_end
+        or      a
+        jr      z, pna_end
+        ld      a, c
+        cp      10
+        jr      nc, pna_bad
+        ld      a, (hl)
+        call    upcase
+        ld      (de), a
+        inc     hl
+        inc     de
+        inc     c
+        jr      pna_lp
+pna_end:
+        ld      (ed_argp), hl
+        ld      a, c
+        or      a
+        jr      z, pna_bad
+        or      a
+        ret
+pna_bad:
+        scf
+        ret
+
+; prt_name: print ed_namebuf, stopping at the first space
+prt_name:
+        ld      hl, ed_namebuf
+        ld      b, 10
+prtn_lp:
+        ld      a, (hl)
+        cp      ' '
+        ret     z
+        inc     hl
+        push    hl
+        push    bc
+        call    cout
+        pop     bc
+        pop     hl
+        djnz    prtn_lp
+        ret
+
+; err_exit: print "?" and return to the EDAS loop
+err_exit:
+        ld      hl, msg_err
+        call    prt
+        jp      ed_loop
+
+; ---------------------------------------------------------------
+; Text buffer manager.
+;   (txt_lines) = number of lines, (txt_used) = bytes used
+;   including the 0ffh terminator.
+; ---------------------------------------------------------------
+txt_clear:
+        ld      a, 0ffh
+        ld      (ETEXT), a
+        ld      hl, 0
+        ld      (txt_lines), hl
+        ld      hl, 1
+        ld      (txt_used), hl
+        ret
+
+; txt_end_ptr: hl = address of the 0ffh terminator
+txt_end_ptr:
+        ld      hl, (txt_used)
+        dec     hl
+        ld      de, ETEXT
+        add     hl, de
+        ret
+
+; txt_line_ptr: de = line number (1-based)
+;   -> hl = pointer to the line's length byte; carry if out
+;      of range. de = lines+1 returns the terminator pointer.
+txt_line_ptr:
+        ld      a, d
+        or      e
+        jr      z, tlp_bad              ; 0 is invalid
+        ld      hl, (txt_lines)
+        inc     hl                      ; allow lines+1
+        or      a
+        sbc     hl, de
+        jr      c, tlp_bad
+        ld      hl, ETEXT
+        dec     de                      ; lines to skip = n-1
+tlp_lp:
+        ld      a, d
+        or      e
+        ret     z                       ; carry = 0 (or cleared it)
+        ld      a, (hl)                 ; length byte
+        push    de
+        ld      e, a
+        ld      d, 0
+        inc     de                      ; + the length byte itself
+        add     hl, de
+        pop     de
+        dec     de
+        jr      tlp_lp
+tlp_bad:
+        scf
+        ret
+
+; txt_get_line: de = line number -> copies the line into
+; (ed_scratch) as a 0-terminated string, a = length.
+;   carry set if out of range.
+txt_get_line:
+        call    txt_line_ptr
+        ret     c
+        ld      a, (hl)
+        ld      (tgl_len), a
+        inc     hl
+        ld      de, ed_scratch
+        or      a
+        jr      z, tgl_done
+        ld      c, a
+        ld      b, 0
+        ldir
+tgl_done:
+        xor     a
+        ld      (de), a
+        ld      a, (tgl_len)
+        or      a                       ; carry = 0
+        ret
+
+; txt_insert: insert the line in ed_scratch (length in a)
+; before line de (1..lines+1). Updates lines/used.
+;   carry set if the buffer cannot hold it.
+txt_insert:
+        ld      (ti_len), a
+        ld      (ti_pos), de
+        ; capacity: used + len + 1 <= ETEXTSZ ?
+        ld      hl, (txt_used)
+        ld      a, (ti_len)
+        ld      e, a
+        ld      d, 0
+        inc     de                      ; + length byte
+        add     hl, de                  ; hl = new used
+        ld      de, ETEXTSZ + 1
+        or      a
+        sbc     hl, de
+        jr      nc, ti_full             ; new used > ETEXTSZ
+        jr      ti_room
+ti_full:
+        scf
+        ret
+ti_room:
+        ld      de, (ti_pos)
+        call    txt_line_ptr            ; hl = insertion point
+        ret     c
+        ld      (ti_ptr), hl
+        ; shift the tail (from insertion point through the
+        ; terminator) up by len+1 bytes, copying backwards.
+        call    txt_end_ptr             ; hl = terminator addr
+        ld      (ti_src), hl
+        ld      a, (ti_len)
+        ld      e, a
+        ld      d, 0
+        inc     de                      ; shift = len + 1
+        add     hl, de                  ; hl = new terminator addr
+        ld      (ti_dst), hl
+        ld      hl, (ti_src)
+        ld      de, (ti_ptr)
+        or      a
+        sbc     hl, de                  ; bytes before terminator
+        inc     hl                      ; + terminator itself
+        ld      b, h
+        ld      c, l                    ; bc = count
+        ld      hl, (ti_src)
+        ld      de, (ti_dst)
+        lddr
+        ; write the new line at the insertion point
+        ld      hl, (ti_ptr)
+        ld      a, (ti_len)
+        ld      (hl), a
+        inc     hl
+        or      a
+        jr      z, ti_done
+        ld      de, ed_scratch
+        ex      de, hl
+        ld      c, a
+        ld      b, 0
+        ldir
+ti_done:
+        ld      hl, (txt_used)
+        ld      a, (ti_len)
+        ld      e, a
+        ld      d, 0
+        inc     de
+        add     hl, de
+        ld      (txt_used), hl
+        ld      hl, (txt_lines)
+        inc     hl
+        ld      (txt_lines), hl
+        or      a
+        ret
+
+; txt_delete: delete lines de..hl (1-based, inclusive).
+;   Assumes 1 <= de <= hl <= lines.
+txt_delete:
+        ld      (td_from), de
+        ld      (td_to), hl
+        ex      de, hl
+        inc     de                      ; line after the range
+        call    txt_line_ptr            ; hl = ptr past range
+        ld      (td_src), hl
+        ld      de, (td_from)
+        call    txt_line_ptr            ; hl = ptr of first
+        ld      (td_dst), hl
+        call    txt_end_ptr
+        inc     hl                      ; past the terminator
+        ld      de, (td_src)
+        or      a
+        sbc     hl, de                  ; bytes to move
+        ld      b, h
+        ld      c, l
+        ld      hl, (td_src)
+        ld      de, (td_dst)
+        ld      a, b
+        or      c
+        jr      z, td_moved
+        ldir
+td_moved:
+        ld      hl, (td_src)
+        ld      de, (td_dst)
+        or      a
+        sbc     hl, de                  ; bytes removed
+        ld      de, (txt_used)
+        ex      de, hl
+        or      a
+        sbc     hl, de
+        ld      (txt_used), hl
+        ld      hl, (td_to)
+        ld      de, (td_from)
+        or      a
+        sbc     hl, de
+        inc     hl                      ; lines removed
+        ex      de, hl
+        ld      hl, (txt_lines)
+        or      a
+        sbc     hl, de
+        ld      (txt_lines), hl
+        ret
+
+; ---------------------------------------------------------------
+; Editor commands
+; ---------------------------------------------------------------
+
+; P [from [to]] - print lines with decimal numbers.
+; No argument: all lines. One argument: from there to the end.
+ec_print:
+        ld      hl, 1
+        ld      (ep_from), hl
+        ld      hl, (txt_lines)
+        ld      (ep_to), hl
+        call    parse_dec_a
+        jr      c, ep_go
+        ld      (ep_from), de
+        call    parse_dec_a
+        jr      c, ep_go
+        ld      (ep_to), de
+ep_go:
+        ld      hl, (txt_lines)
+        ld      a, h
+        or      l
+        jr      nz, ep_lp
+        ld      hl, msg_empty
+        call    prt
+        jp      ed_loop
+ep_lp:
+        ld      de, (ep_from)
+        ld      hl, (ep_to)
+        or      a
+        sbc     hl, de
+        jp      c, ed_loop              ; from > to: done
+        ld      h, d
+        ld      l, e
+        call    prt_dec
+        ld      a, ':'
+        call    cout
+        ld      a, ' '
+        call    cout
+        ld      de, (ep_from)
+        call    txt_get_line
+        ld      hl, ed_scratch
+        call    prt
+        call    crlf
+        ld      hl, (ep_from)
+        inc     hl
+        ld      (ep_from), hl
+        jr      ep_lp
+
+; copy ed_linebuf -> ed_scratch (a = length; 0 allowed)
+line_to_scratch:
+        or      a
+        ret     z
+        ld      hl, ed_linebuf
+        ld      de, ed_scratch
+        ld      c, a
+        ld      b, 0
+        ldir
+        ret
+
+; read one line for A/I: returns a = length in ed_linebuf,
+; or carry set when the line is exactly "." (end marker).
+input_line:
+        ld      hl, ed_linebuf
+        ld      b, MAXLINE
+        call    C_GETLIN
+        cp      1
+        jr      nz, il_ok
+        push    af
+        ld      a, (ed_linebuf)
+        cp      '.'
+        jr      nz, il_ok1
+        pop     af
+        scf
+        ret
+il_ok1:
+        pop     af
+il_ok:
+        or      a                       ; carry = 0
+        ret
+
+; A - append lines at the end ("." alone ends input)
+ec_append:
+        ld      hl, msg_dot
+        call    prt
+ea_lp:
+        call    input_line
+        jp      c, ed_loop
+        call    line_to_scratch
+        ld      de, (txt_lines)
+        inc     de
+        call    txt_insert
+        jr      nc, ea_lp
+        ld      hl, msg_full
+        call    prt
+        jp      ed_loop
+
+; I n - insert lines before line n ("." alone ends input)
+ec_insert:
+        call    parse_dec_a
+        jp      c, err_exit
+        ld      a, d
+        or      e
+        jp      z, err_exit             ; 0 invalid
+        ld      hl, (txt_lines)
+        inc     hl
+        or      a
+        sbc     hl, de
+        jp      c, err_exit             ; n > lines+1
+        ld      (ei_pos), de
+        ld      hl, msg_dot
+        call    prt
+ei_lp:
+        call    input_line
+        jp      c, ed_loop
+        call    line_to_scratch
+        ld      de, (ei_pos)
+        call    txt_insert
+        jr      c, ei_full
+        ld      hl, (ei_pos)
+        inc     hl
+        ld      (ei_pos), hl
+        jr      ei_lp
+ei_full:
+        ld      hl, msg_full
+        call    prt
+        jp      ed_loop
+
+; D n [m] - delete lines n..m (default m = n)
+ec_delete:
+        call    parse_dec_a
+        jp      c, err_exit
+        ld      (td_from), de
+        ld      (td_to), de
+        call    parse_dec_a
+        jr      c, edd_go
+        ld      (td_to), de
+edd_go:
+        ld      de, (td_from)
+        ld      a, d
+        or      e
+        jp      z, err_exit
+        ld      hl, (td_to)
+        or      a
+        sbc     hl, de
+        jp      c, err_exit             ; to < from
+        ld      hl, (txt_lines)
+        ld      de, (td_to)
+        or      a
+        sbc     hl, de
+        jp      c, err_exit             ; to > lines
+        ld      de, (td_from)
+        ld      hl, (td_to)
+        call    txt_delete
+        jp      ed_loop
+
+; E n - edit line n: shows the old line, reads a replacement.
+; An empty input line keeps the old text.
+ec_edit:
+        call    parse_dec_a
+        jp      c, err_exit
+        ld      a, d
+        or      e
+        jp      z, err_exit
+        ld      hl, (txt_lines)
+        or      a
+        sbc     hl, de
+        jp      c, err_exit             ; n > lines
+        ld      (ee_pos), de
+        call    txt_get_line
+        ld      hl, ed_scratch
+        call    prt
+        call    crlf
+        ld      hl, ed_linebuf
+        ld      b, MAXLINE
+        call    C_GETLIN
+        or      a
+        jp      z, ed_loop              ; empty: keep old line
+        call    line_to_scratch
+        ld      de, (ee_pos)
+        ld      hl, (ee_pos)
+        call    txt_delete              ; remove the old line
+        ld      de, (ee_pos)
+        call    txt_insert
+        jp      nc, ed_loop
+        ld      hl, msg_full
+        call    prt
+        jp      ed_loop
+
+; ---------------------------------------------------------------
+; File layer (EDAS-local, on top of the IOCS block entries).
+; Same TOSD directory format as the shell (see README M4):
+; drive 0 = FD (directory at record 32, data from record 48),
+; drive 1 = RAMDISK (directory at block 0, data from block 1).
+; ---------------------------------------------------------------
+
+; blk_read / blk_write: de = record/block, hl = buffer.
+;   -> carry set on error. Register behaviour as IOCS.
+blk_read:
+        ld      a, (ed_drv)
+        or      a
+        jp      z, C_DREAD
+        jp      C_RREAD
+blk_write:
+        ld      a, (ed_drv)
+        or      a
+        jp      z, C_DWRITE
+        jp      C_RWRITE
+
+; dir_load: EDIRBUF <- directory block of the current drive
+dir_load:
+        ld      de, DIRREC
+        ld      a, (ed_drv)
+        or      a
+        jr      z, dl_1
+        ld      de, 0
+dl_1:
+        ld      hl, EDIRBUF
+        jp      blk_read
+
+; dir_save: EDIRBUF -> directory block of the current drive
+dir_save:
+        ld      de, DIRREC
+        ld      a, (ed_drv)
+        or      a
+        jr      z, ds_1
+        ld      de, 0
+ds_1:
+        ld      hl, EDIRBUF
+        jp      blk_write
+
+; dir_magic_ok: carry set if EDIRBUF lacks the "TOSD" magic
+dir_magic_ok:
+        ld      hl, dir_magic
+        ld      de, EDIRBUF
+        ld      b, 4
+dmo_lp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, dmo_bad
+        inc     hl
+        inc     de
+        djnz    dmo_lp
+        or      a
+        ret
+dmo_bad:
+        scf
+        ret
+
+; dir_init: format EDIRBUF in memory (caller saves it)
+dir_init:
+        ld      hl, EDIRBUF
+        xor     a
+        ld      b, 0                    ; 256 iterations
+di_lp:
+        ld      (hl), a
+        inc     hl
+        djnz    di_lp
+        ld      hl, dir_magic
+        ld      de, EDIRBUF
+        ld      bc, 4
+        ldir
+        ld      a, 1
+        ld      (EDIRBUF + 4), a        ; format version
+        ld      hl, FDDATA0
+        ld      a, (ed_drv)
+        or      a
+        jr      z, di_st
+        ld      hl, RDDATA0
+di_st:
+        ld      (EDIRBUF + 6), hl       ; next free record/block
+        ret
+
+; find_entry: ed_namebuf vs the directory entries.
+;   -> hl = entry address, carry clear; or carry set.
+find_entry:
+        ld      hl, EDIRBUF + 16
+        ld      b, 15
+fe_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, fe_next
+        push    hl
+        push    bc
+        ld      de, ed_namebuf
+        ld      b, 10
+fe_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, fe_dif
+        inc     hl
+        inc     de
+        djnz    fe_cmp
+        pop     bc
+        pop     hl
+        or      a
+        ret
+fe_dif:
+        pop     bc
+        pop     hl
+fe_next:
+        ld      de, 16
+        add     hl, de
+        djnz    fe_lp
+        scf
+        ret
+
+; find_free: -> hl = first free entry, or carry set.
+find_free:
+        ld      hl, EDIRBUF + 16
+        ld      b, 15
+ff_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, ff_ok
+        ld      de, 16
+        add     hl, de
+        djnz    ff_lp
+        scf
+        ret
+ff_ok:
+        or      a
+        ret
+
+; ed_setcap: (e_cap) = capacity (record/block count) of the
+; current drive. FD: FDMAXREC. RAMDISK: RINIT query; a count
+; of 0 (not initialised) leaves (e_cap) = 0.
+ed_setcap:
+        ld      hl, FDMAXREC
+        ld      a, (ed_drv)
+        or      a
+        jr      z, esc_st
+        ld      hl, 0
+        call    C_RINIT                 ; hl = current blocks
+esc_st:
+        ld      (e_cap), hl
+        ret
+
+; write_file: write (wf_len) bytes from (wf_src) as file
+; ed_namebuf with load address (wf_load) on the current
+; drive. Same allocation policy as the shell: reuse the old
+; entry's space when the new data fits, else free it and
+; append at the next-free record. carry set on error.
+write_file:
+        ld      hl, (wf_len)
+        ld      a, h
+        or      l
+        jr      z, wf_len0
+        dec     hl
+        ld      l, h
+        ld      h, 0
+        inc     hl                      ; sectors needed
+        jr      wf_sec_ok
+wf_len0:
+        ld      hl, 0
+wf_sec_ok:
+        ld      (fw_sec), hl
+        call    ed_setcap
+        ld      hl, (e_cap)
+        ld      a, h
+        or      l
+        jr      nz, wf_capok
+        scf
+        ret                             ; drive not ready
+wf_capok:
+        call    dir_load
+        ret     c
+        call    dir_magic_ok
+        jr      c, wf_init
+        jr      wf_have
+wf_init:
+        call    dir_init
+wf_have:
+        call    find_entry
+        jr      c, wf_alloc
+        ld      (fw_entry), hl
+        push    hl
+        ld      de, 12
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; de = old size
+        pop     hl
+        ld      a, d
+        or      e
+        jr      z, wf_oldsec0
+        dec     de
+        ld      e, d
+        ld      d, 0
+        inc     de                      ; de = old sectors
+        jr      wf_cmpsec
+wf_oldsec0:
+        ld      de, 0
+wf_cmpsec:
+        ld      hl, (fw_sec)
+        or      a
+        sbc     hl, de
+        jr      c, wf_reuse
+        jr      z, wf_reuse
+        ld      hl, (fw_entry)
+        ld      (hl), 0                 ; free the old entry
+        jr      wf_alloc
+wf_reuse:
+        ld      hl, (fw_entry)
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (fw_start), de
+        jr      wf_write
+wf_alloc:
+        call    find_free
+        ret     c
+        ld      (fw_entry), hl
+        ld      hl, (EDIRBUF + 6)       ; next free record/block
+        ld      (fw_start), hl
+        ld      de, (fw_sec)
+        add     hl, de
+        ld      (fw_newfree), hl
+        ld      de, (e_cap)
+        inc     de                      ; one past the last block
+        or      a
+        sbc     hl, de
+        jr      nc, wf_full             ; new free > capacity
+        ld      hl, (fw_newfree)
+        ld      (EDIRBUF + 6), hl
+        jr      wf_write
+wf_full:
+        scf
+        ret
+wf_write:
+        ld      hl, (fw_start)
+        ld      (fw_rec), hl
+        ld      hl, (wf_src)
+        ld      (fw_ptr), hl
+        ld      hl, (fw_sec)
+        ld      (fw_cnt), hl
+wf_wlp:
+        ld      a, h
+        or      l
+        jr      z, wf_filled
+        ld      de, (fw_rec)
+        ld      hl, (fw_ptr)
+        call    blk_write
+        ret     c
+        ld      hl, (fw_rec)
+        inc     hl
+        ld      (fw_rec), hl
+        ld      hl, (fw_ptr)
+        ld      de, 256
+        add     hl, de
+        ld      (fw_ptr), hl
+        ld      hl, (fw_cnt)
+        dec     hl
+        ld      (fw_cnt), hl
+        jr      wf_wlp
+wf_filled:
+        ld      hl, ed_namebuf
+        ld      de, (fw_entry)
+        ld      bc, 10
+        ldir
+        ld      hl, (fw_entry)
+        ld      de, 10
+        add     hl, de
+        ld      de, (fw_start)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (wf_len)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (wf_load)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        call    dir_save
+        ret     c
+        ld      a, (ed_drv)
+        or      a
+        ret     nz                      ; RAMDISK: no flush
+        ld      de, 0                   ; FD flush assist:
+        ld      hl, EDIRBUF             ; read record 0 (other
+        call    blk_read                ; track) to force the
+        or      a                       ; core's write-back
+        ret
+
+; ---------------------------------------------------------------
+; Editor file commands: R / W / F / U
+; ---------------------------------------------------------------
+
+; R name - read a text file into the text buffer.
+; On-disk text is CRLF (or LF) separated lines; the buffer is
+; rebuilt from it. Lines longer than MAXLINE are truncated.
+ec_read:
+        call    parse_name_a
+        jp      c, err_exit
+        call    dir_load
+        jp      c, err_exit
+        call    dir_magic_ok
+        jp      c, err_exit
+        call    find_entry
+        jp      c, err_exit
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        ld      (fr_start), de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (fr_size), de
+        ; read the whole file into ERAW
+        ld      hl, (fr_start)
+        ld      (fr_rec), hl
+        ld      hl, ERAW
+        ld      (fr_ptr), hl
+        ld      hl, (fr_size)
+        ld      a, h
+        ld      (fr_full), a
+        ld      a, l
+        ld      (fr_rem), a
+er_flp:
+        ld      a, (fr_full)
+        or      a
+        jr      z, er_remain
+        ld      de, (fr_rec)
+        ld      hl, (fr_ptr)
+        call    blk_read
+        jp      c, err_exit
+        ld      hl, (fr_rec)
+        inc     hl
+        ld      (fr_rec), hl
+        ld      hl, (fr_ptr)
+        ld      de, 256
+        add     hl, de
+        ld      (fr_ptr), hl
+        ld      a, (fr_full)
+        dec     a
+        ld      (fr_full), a
+        jr      er_flp
+er_remain:
+        ld      a, (fr_rem)
+        or      a
+        jr      z, er_parse
+        ld      de, (fr_rec)
+        ld      hl, EDIRBUF             ; scratch (dir consumed)
+        call    blk_read
+        jp      c, err_exit
+        ld      hl, EDIRBUF
+        ld      de, (fr_ptr)
+        ld      a, (fr_rem)
+        ld      c, a
+        ld      b, 0
+        ldir
+er_parse:
+        ; split ERAW[0..fr_size) into lines
+        call    txt_clear
+        ld      hl, ERAW
+        ld      (er_src), hl
+        ld      hl, (fr_size)
+        ld      (er_left), hl
+er_lp:
+        ld      hl, (er_left)
+        ld      a, h
+        or      l
+        jr      z, er_report
+        ld      de, ed_scratch
+        ld      c, 0                    ; collected length
+er_cl:
+        ld      hl, (er_left)
+        ld      a, h
+        or      l
+        jr      z, er_emit              ; EOF ends the line
+        ld      hl, (er_src)
+        ld      a, (hl)
+        inc     hl
+        ld      (er_src), hl
+        ld      hl, (er_left)
+        dec     hl
+        ld      (er_left), hl
+        cp      00ah
+        jr      z, er_emit              ; LF ends the line
+        cp      00dh
+        jr      z, er_cl                ; CR: skip (CRLF)
+        ld      b, a
+        ld      a, c
+        cp      MAXLINE
+        jr      nc, er_cl               ; truncate long lines
+        ld      a, b
+        ld      (de), a
+        inc     de
+        inc     c
+        jr      er_cl
+er_emit:
+        ld      a, c
+        ld      de, (txt_lines)
+        inc     de
+        call    txt_insert
+        jr      nc, er_lp
+        ld      hl, msg_full            ; buffer filled mid-file
+        call    prt
+        jr      er_report
+er_report:
+        call    prt_name
+        ld      a, ' '
+        call    cout
+        ld      hl, (txt_lines)
+        call    prt_dec
+        ld      hl, msg_lines
+        call    prt
+        jp      ed_loop
+
+; W name - write the text buffer as a CRLF text file.
+ec_write:
+        call    parse_name_a
+        jp      c, err_exit
+        ld      hl, (txt_lines)
+        ld      a, h
+        or      l
+        jr      nz, ew_build
+        ld      hl, msg_empty
+        call    prt
+        jp      ed_loop
+ew_build:
+        ld      hl, ERAW
+        ld      (ew_ptr), hl
+        ld      hl, 1
+        ld      (ew_n), hl
+ew_lp:
+        ld      de, (ew_n)
+        ld      hl, (txt_lines)
+        or      a
+        sbc     hl, de
+        jr      c, ew_write             ; n > lines: done
+        ld      de, (ew_n)
+        call    txt_get_line            ; a = length
+        ld      hl, ed_scratch
+        ld      de, (ew_ptr)
+        or      a
+        jr      z, ew_crlf
+        ld      c, a
+        ld      b, 0
+        ldir
+ew_crlf:
+        ld      a, 00dh
+        ld      (de), a
+        inc     de
+        ld      a, 00ah
+        ld      (de), a
+        inc     de
+        ld      (ew_ptr), de
+        ld      hl, (ew_n)
+        inc     hl
+        ld      (ew_n), hl
+        jr      ew_lp
+ew_write:
+        ld      hl, (ew_ptr)
+        ld      de, ERAW
+        or      a
+        sbc     hl, de
+        ld      (wf_len), hl
+        ld      hl, ERAW
+        ld      (wf_src), hl
+        ld      hl, 0
+        ld      (wf_load), hl
+        call    write_file
+        jp      c, err_exit
+        call    prt_name
+        ld      hl, msg_saved
+        call    prt
+        jp      ed_loop
+
+; F - list files on the current drive
+ec_files:
+        call    dir_load
+        jp      c, err_exit
+        call    dir_magic_ok
+        jr      nc, ef_ok
+        ld      hl, msg_nofile
+        call    prt
+        jp      ed_loop
+ef_ok:
+        ld      a, (ed_drv)
+        or      a
+        jr      z, ef_list
+        ld      hl, msg_rdtag
+        call    prt
+ef_list:
+        ld      hl, EDIRBUF + 16
+        ld      b, 15
+ef_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, ef_next
+        push    hl
+        push    bc
+        ld      b, 10
+ef_nm:
+        ld      a, (hl)
+        cp      ' '
+        jr      z, ef_nm_done
+        inc     hl
+        push    hl
+        push    bc
+        call    cout
+        pop     bc
+        pop     hl
+        djnz    ef_nm
+ef_nm_done:
+        ld      a, ' '
+        call    cout
+        pop     bc
+        pop     hl
+        push    hl
+        push    bc
+        ld      de, 12
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        call    C_HEX16
+        ld      a, ' '
+        call    cout
+        pop     bc
+        pop     hl
+        push    hl
+        push    bc
+        ld      de, 14
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        call    C_HEX16
+        call    crlf
+        pop     bc
+        pop     hl
+ef_next:
+        ld      de, 16
+        add     hl, de
+        djnz    ef_lp
+        jp      ed_loop
+
+; U [d] - select the EDAS current drive (0=FD, 1=RAMDISK)
+ec_usedrv:
+        call    parse_dec_a
+        jr      c, eu_show
+        ld      a, d
+        or      a
+        jr      nz, eu_bad
+        ld      a, e
+        cp      2
+        jr      nc, eu_bad
+        ld      (ed_drv), a
+eu_show:
+        ld      a, (ed_drv)
+        or      a
+        jr      nz, eu_rd
+        ld      hl, msg_drv0
+        call    prt
+        jp      ed_loop
+eu_rd:
+        ld      hl, msg_drv1
+        call    prt
+        jp      ed_loop
+eu_bad:
+        jp      err_exit
+
+; B [name] - assemble the text buffer. With a name, the
+; binary is also saved as a file (load address = ORG start).
+ec_build:
+        xor     a
+        ld      (have_name), a
+        call    skip_sp_a
+        or      a
+        jr      z, eb_asm               ; a = next char (0=end)
+        call    parse_name_a
+        jp      c, err_exit
+        ld      a, 1
+        ld      (have_name), a
+eb_asm:
+        call    assemble
+        jp      c, ed_loop              ; error already printed
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ts_mode)
+        or      a
+        call    nz, ts_finish           ; lay stub+bitmap+trailer
+                                        ; over [org, org+total)
+        ENDIF
+        ld      hl, msg_asmok
+        call    prt
+        ld      hl, (asm_org)
+        call    C_HEX16
+        ld      a, '-'
+        call    cout
+        ld      hl, (asm_end)
+        call    C_HEX16
+        ld      a, ' '
+        call    cout
+        ld      hl, (asm_end)
+        ld      de, (asm_org)
+        or      a
+        sbc     hl, de
+        ld      (asm_len), hl
+        call    prt_dec
+        ld      hl, msg_bytes
+        call    prt
+        ld      a, (have_name)
+        or      a
+        jp      z, ed_loop
+        ld      hl, (asm_org)
+        ld      (wf_src), hl
+        ld      hl, (asm_len)
+        ld      (wf_len), hl
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ts_mode)
+        or      a
+        jr      z, eb_nots
+        ld      hl, (ts_total)          ; TOSR file = whole image
+        ld      (wf_len), hl
+eb_nots:
+        ENDIF
+        ld      hl, (asm_org)
+        ld      (wf_load), hl
+        call    write_file
+        jp      c, err_exit
+        call    prt_name
+        ld      hl, msg_saved
+        call    prt
+        jp      ed_loop
+
+; ---------------------------------------------------------------
+; Assembler (two passes over the text buffer)
+; ---------------------------------------------------------------
+
+; assemble: -> carry set on error (message already printed).
+; On success (asm_org)/(asm_end) describe the output range.
+        IF      DEFINED EDAS_TOSR
+; assemble (TOSR build): when the RELOC directive requests
+; TOSR output, pass 1 repeats while symbol attributes are
+; still changing, so EQU chains that reach a label through
+; other EQUs settle before the emitting pass; ts_prep then
+; snapshots the bitmap area. Without RELOC the flow is the
+; same two passes as the standard build.
+assemble:
+        ld      (asm_sp), sp
+        call    sym_clear
+        xor     a
+        ld      (ts_mode), a
+        ld      (ts_heap), a
+        ld      (ts_iter), a
+asm_p1:
+        ld      a, 1
+        ld      (asm_pass), a
+        xor     a
+        ld      (attr_dirty), a
+        call    asm_pass_run
+        ret     c
+        ld      a, (ts_mode)
+        or      a
+        jr      z, asm_p2
+        ld      a, (attr_dirty)
+        or      a
+        jr      z, asm_prep
+        ld      a, (ts_iter)
+        inc     a
+        ld      (ts_iter), a
+        cp      8
+        jr      c, asm_p1
+asm_prep:
+        call    ts_prep                 ; errors jp asm_fail
+asm_p2:
+        ld      a, 2
+        ld      (asm_pass), a
+        call    asm_pass_run
+        ret     c
+        or      a
+        ret
+        ELSE
+assemble:
+        ld      (asm_sp), sp
+        call    sym_clear
+        ld      a, 1
+        ld      (asm_pass), a
+        call    asm_pass_run
+        ret     c
+        ld      a, 2
+        ld      (asm_pass), a
+        call    asm_pass_run
+        ret     c
+        or      a
+        ret
+        ENDIF
+
+asm_pass_run:
+        ld      hl, ORGDEF
+        ld      (asm_pc), hl
+        ld      (asm_org), hl
+        xor     a
+        ld      (asm_done), a
+        ld      (org_seen), a
+        ld      hl, 1
+        ld      (asm_line), hl
+apr_lp:
+        ld      a, (asm_done)
+        or      a
+        jr      nz, apr_done
+        ld      hl, (txt_lines)
+        ld      de, (asm_line)
+        or      a
+        sbc     hl, de
+        jr      c, apr_done             ; line > lines: finished
+        call    get_asm_line
+        call    parse_line              ; may jp asm_fail
+        ld      a, (asm_pass)           ; pass 2: any symbol
+        cp      2                       ; left undefined is an
+        jr      nz, apr_next            ; error on this line
+        ld      a, (eval_undef)
+        or      a
+        jr      z, apr_next
+        ld      hl, em_undef
+        jp      asm_fail
+apr_next:
+        ld      hl, (asm_line)
+        inc     hl
+        ld      (asm_line), hl
+        jr      apr_lp
+apr_done:
+        ld      hl, (asm_pc)
+        ld      (asm_end), hl
+        or      a
+        ret
+
+; asm_fail: print "ERR LINE n: <msg>" + the source line, then
+; abort the assembly with carry set. Error sites load hl with
+; the message and jp here (the stack is reset, so this is a
+; safe long jump out of any parser depth).
+asm_fail:
+        ld      (err_ptr), hl
+        ld      sp, (asm_sp)
+        ld      hl, msg_errpre
+        call    prt
+        ld      hl, (asm_line)
+        call    prt_dec
+        ld      a, ':'
+        call    cout
+        ld      a, ' '
+        call    cout
+        ld      hl, (err_ptr)
+        call    prt
+        call    crlf
+        ld      hl, asm_linebuf
+        call    prt
+        call    crlf
+        scf
+        ret
+
+; get_asm_line: copy line (asm_line) into asm_linebuf
+get_asm_line:
+        ld      de, (asm_line)
+        call    txt_line_ptr            ; hl = length byte
+        ld      a, (hl)
+        inc     hl
+        ld      de, asm_linebuf
+        or      a
+        jr      z, gal_done
+        ld      c, a
+        ld      b, 0
+        ldir
+gal_done:
+        xor     a
+        ld      (de), a
+        ret
+
+; ---- symbol table: 128 entries x 16 bytes at ESYMTAB ----
+; entry: +0..11 name (upper-case, 0 padded), +12..13 value,
+;        +14 defined flag (1), +15 unused.
+sym_clear:
+        ld      hl, ESYMTAB
+        ld      de, ESYMTAB + 1
+        ld      bc, SYMMAX * 16 - 1
+        xor     a
+        ld      (hl), a
+        ldir
+        ret
+
+; sym_find: tok_buf vs the table.
+;   -> hl = entry, de = value, carry clear; or carry set.
+sym_find:
+        ld      hl, ESYMTAB
+        ld      b, SYMMAX
+sf_lp:
+        ld      a, (hl)
+        push    hl
+        push    bc
+        ld      de, 14
+        add     hl, de
+        ld      a, (hl)                 ; defined flag
+        or      a
+        jr      z, sf_dif
+        pop     bc
+        pop     hl
+        push    hl
+        push    bc
+        ld      de, tok_buf
+        ld      b, 12
+sf_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, sf_dif
+        inc     hl
+        inc     de
+        djnz    sf_cmp
+        pop     bc
+        pop     hl
+        push    hl
+        ld      de, 12
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        or      a
+        ret                             ; found: hl=entry de=value
+sf_dif:
+        pop     bc
+        pop     hl
+        ld      de, 16
+        add     hl, de
+        djnz    sf_lp
+        scf
+        ret
+
+; sym_define: define tok_buf = de. Redefinition updates the
+; value (pass 2 relies on this). Full table is an error.
+sym_define:
+        ld      (sd_val), de
+        call    sym_find
+        jr      nc, sd_set
+        ld      hl, ESYMTAB
+        ld      b, SYMMAX
+sd_lp:
+        push    hl
+        ld      de, 14
+        add     hl, de
+        ld      a, (hl)
+        or      a
+        jr      z, sd_free
+        pop     hl
+        ld      de, 16
+        add     hl, de
+        djnz    sd_lp
+        ld      hl, em_symfull
+        jp      asm_fail
+sd_free:
+        pop     hl
+        push    hl
+        ld      de, tok_buf
+        ex      de, hl
+        ld      bc, 12
+        ldir                            ; name (tok is 0-padded
+        pop     hl                      ;  by construction? no:
+        ; tok_buf holds a 0-terminated string; pad the rest.
+        push    hl
+        ld      de, 12
+        add     hl, de
+        ld      de, (sd_val)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      a, 1
+        ld      (hl), a                 ; defined flag at +14
+        IF      DEFINED EDAS_TOSR
+        inc     hl                      ; +15: reloc attribute
+        ld      a, (def_attr)
+        ld      (hl), a
+        or      a
+        jr      z, sdf_nodirty
+        ld      a, 1
+        ld      (attr_dirty), a
+sdf_nodirty:
+        ENDIF
+        pop     hl
+        ret
+sd_set:
+        ld      de, 12
+        add     hl, de
+        ld      de, (sd_val)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        IF      DEFINED EDAS_TOSR
+        inc     hl                      ; +14 (flag, unchanged)
+        inc     hl                      ; +15: reloc attribute
+        ld      a, (def_attr)
+        cp      (hl)
+        jr      z, sds_nodirty
+        ld      (hl), a
+        ld      a, 1
+        ld      (attr_dirty), a
+sds_nodirty:
+        ENDIF
+        ret
+
+; ---- token / expression scanning ----
+; The scan pointer is (asm_ptr). Identifiers are upper-cased
+; into tok_buf (0-terminated, at most 12 chars stored).
+
+; skip_sp_p: advance (asm_ptr) past spaces and tabs
+skip_sp_p:
+        ld      hl, (asm_ptr)
+ssp_lp:
+        ld      a, (hl)
+        cp      ' '
+        jr      z, ssp_inc
+        cp      009h
+        jr      nz, ssp_done
+ssp_inc:
+        inc     hl
+        jr      ssp_lp
+ssp_done:
+        ld      (asm_ptr), hl
+        ret
+
+; peek_ch: a = char at (asm_ptr) (no advance). Preserves hl.
+peek_ch:
+        push    hl
+        ld      hl, (asm_ptr)
+        ld      a, (hl)
+        pop     hl
+        ret
+
+; adv_ptr: advance (asm_ptr) by one char
+adv_ptr:
+        push    hl
+        ld      hl, (asm_ptr)
+        inc     hl
+        ld      (asm_ptr), hl
+        pop     hl
+        ret
+
+; is_ident1: a = char -> carry clear if [A-Za-z_]
+is_ident1:
+        cp      '_'
+        jr      z, ii_yes
+        cp      'A'
+        ret     c
+        cp      'Z' + 1
+        jr      c, ii_yes
+        cp      'a'
+        ret     c
+        cp      'z' + 1
+        jr      c, ii_yes
+        scf
+        ret
+ii_yes:
+        or      a
+        ret
+
+; is_identc: a = char -> carry clear if [A-Za-z0-9_]
+is_identc:
+        cp      '0'
+        jr      c, is_ident1
+        cp      '9' + 1
+        jr      nc, is_ident1
+        or      a
+        ret
+
+; read_ident: read an identifier at (asm_ptr) into tok_buf.
+;   -> carry set if the next char cannot start an identifier.
+read_ident:
+        ld      hl, (asm_ptr)
+        ld      a, (hl)
+        call    is_ident1
+        ret     c
+        ld      de, tok_buf
+        ld      b, 0                    ; stored count
+ri_lp:
+        ld      a, (hl)
+        call    is_identc
+        jr      c, ri_done
+        inc     hl
+        call    upcase
+        ld      c, a
+        ld      a, b
+        cp      12
+        jr      nc, ri_skip             ; consume but don't store
+        ld      a, c
+        ld      (de), a
+        inc     de
+        inc     b
+ri_skip:
+        jr      ri_lp
+ri_done:
+        xor     a
+        ld      (de), a                 ; 0-terminate
+        ld      a, b
+        ld      (tok_len), a
+        ld      a, 12
+        sub     b                       ; pad count (0..12)
+        jr      z, ri_pd
+        ld      b, a
+        xor     a
+ri_pl:
+        inc     de                      ; zero-pad tok_buf to a
+        ld      (de), a                 ; canonical 12-byte name
+        djnz    ri_pl
+ri_pd:
+        ld      (asm_ptr), hl
+        or      a
+        ret
+
+; tok_eq: compare tok_buf with the 0-terminated string at hl.
+;   -> zero flag set if equal. Preserves hl.
+tok_eq:
+        push    hl
+        push    de
+        ld      de, tok_buf
+te_lp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, te_dif
+        or      a
+        jr      z, te_same
+        inc     hl
+        inc     de
+        jr      te_lp
+te_same:
+        xor     a                       ; z set
+        jr      te_ret
+te_dif:
+        or      001h                    ; z clear
+te_ret:
+        pop     de
+        pop     hl
+        ret
+
+; parse_number: parse a numeric token at (asm_ptr).
+;   Forms: decimal (123), hex with H suffix (0e400h - must
+;   start with a digit), 0x hex (0x1234), binary with B
+;   suffix (1010b). -> de = value, asm_ptr advanced.
+;   Errors jump to asm_fail.
+parse_number:
+        ld      hl, (asm_ptr)
+        ld      a, (hl)
+        cp      '0'
+        jr      nz, pn_collect
+        inc     hl
+        ld      a, (hl)
+        call    upcase
+        cp      'X'
+        jp      z, pn_hex0x
+        dec     hl
+pn_collect:
+        ; collect [0-9A-Fa-f] into num_buf
+        ld      de, num_buf
+        ld      b, 0
+pnc_lp:
+        ld      a, (hl)
+        call    hexval_ed
+        jr      c, pnc_done
+        inc     hl
+        ld      c, a
+        ld      a, b
+        cp      10
+        jr      nc, pnc_skip
+        ld      a, c
+        ld      (de), a                 ; store digit VALUE
+        inc     de
+        inc     b
+pnc_skip:
+        jr      pnc_lp
+pnc_done:
+        ld      (asm_ptr), hl
+        ld      a, b
+        ld      (num_len), a
+        or      a
+        jp      z, pn_badnum
+        ; suffix: H -> hex, B -> binary (if all digits <= 1)
+        ld      a, (hl)
+        call    upcase
+        cp      'H'
+        jp      z, pn_hexsuf
+        cp      'B'
+        jp      z, pn_binsuf
+        jp      pn_decimal
+pn_hexsuf:
+        inc     hl
+        ld      (asm_ptr), hl
+        jr      pn_hexconv
+pn_binsuf:
+        ; all collected digits must be 0/1
+        ld      hl, num_buf
+        ld      a, (num_len)
+        ld      b, a
+pnb_chk:
+        ld      a, (hl)
+        cp      2
+        jr      nc, pn_decimal          ; not binary: decimal
+        inc     hl
+        djnz    pnb_chk
+        ld      hl, (asm_ptr)
+        inc     hl                      ; consume the B
+        ld      (asm_ptr), hl
+        ; value = fold base 2
+        ld      hl, num_buf
+        ld      a, (num_len)
+        ld      c, a                    ; c = digit counter
+        ld      de, 0
+pnb_lp:
+        ld      a, (hl)
+        inc     hl
+        ex      de, hl                  ; hl = accumulator
+        add     hl, hl                  ; acc * 2
+        push    bc
+        ld      c, a
+        ld      b, 0
+        add     hl, bc                  ; + digit
+        pop     bc
+        ex      de, hl
+        dec     c
+        jr      nz, pnb_lp
+        ret
+pn_decimal:
+        ld      hl, num_buf
+        ld      a, (num_len)
+        ld      b, a
+        ld      de, 0
+pnd_lp:
+        ld      a, (hl)
+        cp      10
+        jr      nc, pn_badnum           ; A-F in a decimal number
+        inc     hl
+        push    hl
+        push    de
+        pop     hl
+        add     hl, hl
+        push    hl
+        add     hl, hl
+        add     hl, hl
+        pop     de
+        add     hl, de
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ex      de, hl
+        pop     hl
+        djnz    pnd_lp
+        ret
+pn_hex0x:
+        inc     hl                      ; past the X
+        ld      (asm_ptr), hl
+        ld      de, num_buf
+        ld      b, 0
+pnx_lp:
+        ld      a, (hl)
+        call    hexval_ed
+        jr      c, pnx_done
+        inc     hl
+        ld      c, a
+        ld      a, b
+        cp      10
+        jr      nc, pnx_skip
+        ld      a, c
+        ld      (de), a
+        inc     de
+        inc     b
+pnx_skip:
+        jr      pnx_lp
+pnx_done:
+        ld      (asm_ptr), hl
+        ld      a, b
+        ld      (num_len), a
+        or      a
+        jr      z, pn_badnum
+pn_hexconv:
+        ld      hl, num_buf
+        ld      a, (num_len)
+        ld      c, a                    ; c = digit counter
+        ld      de, 0
+pnh_lp:
+        ld      a, (hl)
+        inc     hl
+        ex      de, hl                  ; hl = accumulator
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; acc * 16
+        push    bc
+        ld      c, a
+        ld      b, 0
+        add     hl, bc                  ; + digit
+        pop     bc
+        ex      de, hl
+        dec     c
+        jr      nz, pnh_lp
+        ret
+pn_badnum:
+        ld      hl, em_number
+        jp      asm_fail
+
+; hexval_ed: a = char -> a = 0..15, or carry set (EDAS-local
+; copy of the shell's hexval; the shell's is not callable).
+hexval_ed:
+        cp      '0'
+        ret     c
+        cp      '9' + 1
+        jr      nc, hv_letter
+        sub     '0'
+        ret
+hv_letter:
+        call    upcase
+        cp      'A'
+        ret     c
+        cp      'F' + 1
+        jr      c, hv_ok
+        scf
+        ret
+hv_ok:
+        sub     'A' - 10
+        ret
+
+; eval_term: -> de = term value. Sets (eval_undef) when a
+; symbol is not defined (value 0 is used; pass 2 turns this
+; into an error at the end of the line, pass 1 tolerates it
+; except where a handler checks the flag itself).
+eval_term:
+        call    skip_sp_p
+        call    peek_ch
+        cp      '-'
+        jr      z, evt_neg
+        cp      '+'
+        jr      z, evt_pos
+        cp      '('
+        jr      z, evt_paren
+        cp      027h                    ; '
+        jr      z, evt_char
+        cp      '$'
+        jr      z, evt_pc
+        cp      '0'
+        jr      c, evt_ident
+        cp      '9' + 1
+        jr      c, evt_number
+evt_ident:
+        call    read_ident
+        jr      nc, evt_sym
+        ld      hl, em_expr
+        jp      asm_fail
+evt_sym:
+        call    sym_find
+        IF      DEFINED EDAS_TOSR
+        call    ts_symattr              ; term_attr := the
+                                        ; symbol's attribute
+        ENDIF
+        ret     nc                      ; de = value
+        ld      a, 1
+        ld      (eval_undef), a
+        ld      de, 0
+        ret
+evt_number:
+        IF      DEFINED EDAS_TOSR
+        xor     a
+        ld      (term_attr), a
+        ENDIF
+        jp      parse_number
+evt_pos:
+        call    adv_ptr
+        jr      eval_term
+evt_neg:
+        call    adv_ptr
+        call    eval_term
+        ld      hl, 0
+        or      a
+        sbc     hl, de
+        ex      de, hl
+        IF      DEFINED EDAS_TOSR
+        xor     a
+        ld      (term_attr), a          ; -expr is no address
+        ENDIF
+        ret
+evt_paren:
+        call    adv_ptr
+        call    eval_expr
+        call    skip_sp_p
+        call    peek_ch
+        cp      ')'
+        jr      nz, evt_syn
+        call    adv_ptr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (term_attr), a          ; (expr) keeps the
+                                        ; inner attribute
+        ENDIF
+        ret
+evt_syn:
+        ld      hl, em_syntax
+        jp      asm_fail
+evt_char:
+        call    adv_ptr                 ; opening quote
+        call    peek_ch
+        or      a
+        jr      z, evt_syn
+        ld      e, a
+        ld      d, 0
+        call    adv_ptr                 ; the char itself
+        call    peek_ch
+        cp      027h
+        jr      nz, evt_syn
+        call    adv_ptr                 ; closing quote
+        IF      DEFINED EDAS_TOSR
+        xor     a
+        ld      (term_attr), a
+        ENDIF
+        ret
+evt_pc:
+        call    adv_ptr
+        ld      de, (asm_pc)
+        IF      DEFINED EDAS_TOSR
+        ld      a, 1
+        ld      (term_attr), a          ; $ is internal
+        ENDIF
+        ret
+
+; eval_expr: expr := term { ('+'|'-') term }
+;   -> de = value.
+eval_expr:
+        call    eval_term
+        IF      DEFINED EDAS_TOSR
+        ld      a, (term_attr)
+        ld      (ev_attr), a
+        ENDIF
+ev_lp:
+        push    de                      ; acc
+        call    skip_sp_p
+        call    peek_ch
+        cp      '+'
+        jr      z, ev_add
+        cp      '-'
+        jr      z, ev_sub
+        pop     de
+        ret
+ev_add:
+        call    adv_ptr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        push    af                      ; running attribute
+        ENDIF
+        call    eval_term
+        IF      DEFINED EDAS_TOSR
+        pop     af
+        ld      b, a
+        ld      a, (term_attr)
+        xor     b                       ; attr: 1+0 = 0+1 = 1,
+        ld      (ev_attr), a            ; 0+0 = 1+1 = 0
+        ENDIF
+        pop     hl
+        add     hl, de
+        ex      de, hl
+        jr      ev_lp
+ev_sub:
+        call    adv_ptr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        push    af                      ; running attribute
+        ENDIF
+        call    eval_term
+        IF      DEFINED EDAS_TOSR
+        pop     af
+        ld      b, a
+        ld      a, (term_attr)
+        cpl
+        and     b                       ; attr: 1-0 = 1, else 0
+        ld      (ev_attr), a
+        ENDIF
+        pop     hl
+        or      a
+        sbc     hl, de
+        ex      de, hl
+        jr      ev_lp
+
+; ---------------------------------------------------------------
+; parse_line: parse asm_linebuf (via (asm_ptr)).
+; Grammar: [label:] [statement] [; comment]
+;          [label] MNEMONIC [operands]
+;          NAME EQU expr
+; ---------------------------------------------------------------
+parse_line:
+        xor     a
+        ld      (eval_undef), a
+        ld      hl, asm_linebuf
+        ld      (asm_ptr), hl
+        call    skip_sp_p
+        call    peek_ch
+        or      a
+        ret     z                       ; empty line
+        cp      ';'
+        ret     z                       ; comment line
+        call    read_ident
+        jp      c, pl_syntax
+        ; tok_buf = first token. Colon? -> label.
+        call    skip_sp_p
+        call    peek_ch
+        cp      ':'
+        jr      z, pl_label1
+        ; save the pointer after token1 (+spaces) and try
+        ; reading a second token.
+        ld      hl, (asm_ptr)
+        ld      (pl_savep), hl
+        ld      hl, tok_buf
+        ld      de, tok1_buf
+        ld      bc, 17
+        ldir
+        call    read_ident
+        jr      c, pl_stmt1             ; no 2nd token: stmt=tok1
+        ld      hl, tok_buf
+        ld      de, tok2_buf
+        ld      bc, 17
+        ldir
+        ld      hl, str_equ
+        call    tok_eq2                 ; tok2 == "EQU" ?
+        jr      z, pl_equ
+        ; is tok1 itself a mnemonic / fixed op?
+        ld      hl, tok1_buf
+        ld      de, tok_buf
+        ld      bc, 17
+        ldir
+        call    lookup_stmt
+        jr      nc, pl_found1           ; tok1 is the statement
+        ; tok1 is a label; tok2 is the statement.
+        ld      hl, tok1_buf
+        ld      de, tok_buf
+        ld      bc, 17
+        ldir
+        call    define_label
+        ld      hl, tok2_buf
+        ld      de, tok_buf
+        ld      bc, 17
+        ldir
+        jp      pl_stmt
+pl_found1:
+        ld      hl, (pl_savep)          ; operands follow tok1
+        ld      (asm_ptr), hl
+        jp      pl_exec
+pl_stmt1:
+        ld      hl, tok1_buf
+        ld      de, tok_buf
+        ld      bc, 17
+        ldir
+        jp      pl_stmt
+pl_label1:
+        call    adv_ptr                 ; consume ':'
+        call    define_label            ; tok_buf = label name
+        call    skip_sp_p
+        call    peek_ch
+        or      a
+        ret     z
+        cp      ';'
+        ret     z
+        call    read_ident
+        jr      c, pl_syntax
+        jp      pl_stmt
+pl_equ:
+        ; NAME EQU expr : tok1 = name, rest of line = expr
+        ld      hl, tok1_buf
+        ld      de, tok_buf
+        ld      bc, 17
+        ldir
+        call    eval_expr               ; de = value
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (def_attr), a           ; EQU inherits the
+                                        ; attribute of its
+                                        ; defining expression
+        ENDIF
+        ex      de, hl
+        ld      (pl_eqval), hl
+        ex      de, hl
+        call    sym_define
+        jp      pl_trail
+pl_syntax:
+        ld      hl, em_syntax
+        jp      asm_fail
+
+; pl_stmt: tok_buf = statement name; dispatch it.
+pl_stmt:
+        call    lookup_stmt
+        jr      c, pl_mnem_err
+pl_exec:
+        ; (stmt_handler) was set by lookup_stmt; for a fixed
+        ; opcode it points at emit_fixed with (fx_*) loaded.
+        ld      hl, (stmt_handler)
+        call    call_hl
+        ; END stops the pass; skip the trailing check then.
+        ld      a, (asm_done)
+        or      a
+        ret     nz
+pl_trail:
+        call    skip_sp_p
+        call    peek_ch
+        or      a
+        ret     z
+        cp      ';'
+        ret     z
+        ld      hl, em_trail
+        jp      asm_fail
+
+pl_mnem_err:
+        ld      hl, em_mnem
+        jp      asm_fail
+
+; call_hl: trampoline - the handler's RET returns to the
+; instruction after the call to call_hl.
+call_hl:
+        jp      (hl)
+
+; define_label: define tok_buf = current asm_pc
+define_label:
+        IF      DEFINED EDAS_TOSR
+        ld      a, 1
+        ld      (def_attr), a           ; a label is a module-
+                                        ; internal address
+        ENDIF
+        ld      de, (asm_pc)
+        jp      sym_define
+
+; tok_eq2: zero flag set if tok2_buf == string at hl.
+tok_eq2:
+        push    hl
+        push    de
+        ld      de, tok2_buf
+te2_lp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, te2_dif
+        or      a
+        jr      z, te2_same
+        inc     hl
+        inc     de
+        jr      te2_lp
+te2_same:
+        xor     a
+        jr      te2_ret
+te2_dif:
+        or      001h
+te2_ret:
+        pop     de
+        pop     hl
+        ret
+
+; ---------------------------------------------------------------
+; Emit (pass 2 writes memory; both passes advance asm_pc)
+; ---------------------------------------------------------------
+
+; emit8: a = byte. Range-guarded in pass 2. Preserves bc, de.
+emit8:
+        push    bc
+        push    de
+        push    af
+        ld      a, (asm_pass)
+        cp      2
+        jr      nz, em_no
+        ld      hl, (asm_pc)
+        ld      de, OUTMIN
+        or      a
+        sbc     hl, de
+        jr      c, em_rg
+        ld      hl, (asm_pc)
+        ld      de, OUTMAX
+        or      a
+        sbc     hl, de
+        jr      nc, em_rg
+        pop     af
+        push    af
+        ld      hl, (asm_pc)
+        ld      (hl), a
+em_no:
+        pop     af
+        ld      hl, (asm_pc)
+        inc     hl
+        ld      (asm_pc), hl
+        pop     de
+        pop     bc
+        ret
+em_rg:
+        ld      hl, em_range
+        jp      asm_fail
+
+; emit16: emit de, low byte first
+emit16:
+        ld      a, e
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        call    ts_mark                 ; mark the high byte if
+                                        ; em16_attr says internal
+        ENDIF
+        ld      a, d
+        jp      emit8
+
+; emit8v: emit de as an 8-bit immediate. In pass 2 the value
+; must fit in a byte (0..255 or -128..-1), else RANGE error.
+emit8v:
+        ld      a, (asm_pass)
+        cp      2
+        jr      nz, e8v_go
+        ld      a, d
+        or      a
+        jr      z, e8v_go               ; 0..255
+        cp      0ffh
+        jr      nz, e8v_bad
+        ld      a, e
+        cp      080h
+        jr      c, e8v_bad              ; below -128
+e8v_go:
+        ld      a, e
+        jp      emit8
+e8v_bad:
+        ld      hl, em_range
+        jp      asm_fail
+
+; emit_pre: a = index-register selector (0 = IX, 1 = IY):
+; emit the 0ddh / 0fdh prefix.
+emit_pre:
+        or      a
+        jr      nz, ep_iy
+        ld      a, 0ddh
+        jp      emit8
+ep_iy:
+        ld      a, 0fdh
+        jp      emit8
+
+; expect_comma: consume a ',' at (asm_ptr) (after spaces)
+expect_comma:
+        call    skip_sp_p
+        call    peek_ch
+        cp      ','
+        jr      nz, exc_syn
+        jp      adv_ptr
+exc_syn:
+        ld      hl, em_syntax
+        jp      asm_fail
+
+err_operand:
+        ld      hl, em_operand
+        jp      asm_fail
+
+; ---------------------------------------------------------------
+; Operand parser. Fills the co_* block:
+;   co_type, co_val (word), co_aux (displacement), co_ixy
+;   (0 = IX, 1 = IY; set for OT_IX and OT_IXD).
+; ---------------------------------------------------------------
+parse_op:
+        xor     a
+        ld      (co_type), a
+        ld      (co_aux), a
+        ld      (co_ixy), a
+        IF      DEFINED EDAS_TOSR
+        ld      (co_reloc), a
+        ENDIF
+        call    skip_sp_p
+        ld      hl, (asm_ptr)
+        ld      (op_start), hl
+        ld      a, (hl)
+        cp      '('
+        jp      z, po_paren
+        cp      '0'
+        jr      c, po_notnum
+        cp      '9' + 1
+        jr      c, po_expr
+po_notnum:
+        cp      '$'
+        jr      z, po_expr
+        cp      '-'
+        jr      z, po_expr
+        cp      '+'
+        jr      z, po_expr
+        cp      027h
+        jr      z, po_expr
+        call    is_ident1
+        jr      c, po_none
+        call    read_ident
+        ld      hl, regtab
+po_reglp:
+        ld      a, (hl)
+        or      a
+        jr      z, po_expr_rew          ; not a register name
+        ld      (po_ep), hl
+        inc     hl                      ; name follows type/val?
+        ; regtab entry: name(0-term), type, val - name first:
+        dec     hl
+        call    tok_eq
+        jr      z, po_reghit
+        ld      hl, (po_ep)
+po_rsk:
+        ld      a, (hl)
+        inc     hl
+        or      a
+        jr      nz, po_rsk
+        inc     hl                      ; type
+        inc     hl                      ; val
+        jr      po_reglp
+po_reghit:
+        ld      hl, (po_ep)
+po_rh2:
+        ld      a, (hl)
+        inc     hl
+        or      a
+        jr      nz, po_rh2
+        ld      a, (hl)                 ; type
+        ld      (co_type), a
+        inc     hl
+        ld      a, (hl)                 ; val
+        ld      (co_val), a
+        xor     a
+        ld      (co_val + 1), a
+        ld      a, (co_type)
+        cp      OT_IX
+        ret     nz
+        ld      a, (co_val)             ; IX: val doubles as ixy
+        ld      (co_ixy), a
+        ret
+po_expr_rew:
+        ld      hl, (op_start)
+        ld      (asm_ptr), hl
+po_expr:
+        call    eval_expr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (co_reloc), a
+        ENDIF
+        ld      a, OT_IMM
+        ld      (co_type), a
+        ld      (co_val), de
+        ret
+po_none:
+        xor     a
+        ld      (co_type), a
+        ret
+
+po_paren:
+        call    adv_ptr                 ; consume '('
+        call    skip_sp_p
+        ld      hl, (asm_ptr)
+        ld      (op_pstart), hl
+        call    peek_ch
+        call    is_ident1
+        jr      c, po_ind_expr
+        call    read_ident
+        ; (HL) ?
+        ld      hl, str_hl
+        call    tok_eq
+        jr      z, po_phl
+        ld      hl, str_bc
+        call    tok_eq
+        jr      z, po_pbc
+        ld      hl, str_de
+        call    tok_eq
+        jr      z, po_pde
+        ld      hl, str_sp
+        call    tok_eq
+        jr      z, po_psp
+        ld      hl, str_c
+        call    tok_eq
+        jr      z, po_pc
+        ld      hl, str_ix
+        call    tok_eq
+        jr      z, po_pix
+        ld      hl, str_iy
+        call    tok_eq
+        jr      z, po_piy
+        ; not a register form: (expression)
+        ld      hl, (op_pstart)
+        ld      (asm_ptr), hl
+po_ind_expr:
+        call    eval_expr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (co_reloc), a
+        ENDIF
+        ld      (co_val), de
+        call    skip_sp_p
+        call    peek_ch
+        cp      ')'
+        jp      nz, exc_syn
+        call    adv_ptr
+        ld      a, OT_IND
+        ld      (co_type), a
+        ret
+po_phl:
+        call    po_expect_rp
+        ld      a, OT_R8
+        ld      (co_type), a
+        ld      a, 6
+        ld      (co_val), a
+        xor     a
+        ld      (co_val + 1), a
+        ret
+po_pbc:
+        call    po_expect_rp
+        ld      a, OT_IBC
+        jr      po_settype
+po_pde:
+        call    po_expect_rp
+        ld      a, OT_IDE
+        jr      po_settype
+po_psp:
+        call    po_expect_rp
+        ld      a, OT_ISP
+        jr      po_settype
+po_pc:
+        call    po_expect_rp
+        ld      a, OT_IC
+po_settype:
+        ld      (co_type), a
+        ret
+po_pix:
+        xor     a
+        jr      po_pixy
+po_piy:
+        ld      a, 1
+po_pixy:
+        ld      (co_ixy), a
+        call    skip_sp_p
+        call    peek_ch
+        cp      ')'
+        jr      z, po_ixd0
+        cp      '+'
+        jr      z, po_ixdnum
+        cp      '-'
+        jr      z, po_ixdnum
+        jp      exc_syn
+po_ixd0:
+        call    adv_ptr
+        xor     a
+        ld      (co_aux), a
+        jr      po_ixd_set
+po_ixdnum:
+        ld      (po_sign), a            ; '+' or '-'
+        call    adv_ptr
+        call    parse_number            ; de = magnitude
+        ld      a, (po_sign)
+        cp      '-'
+        jr      nz, po_ixdp
+        ld      hl, 0
+        or      a
+        sbc     hl, de
+        ex      de, hl
+po_ixdp:
+        ld      a, e
+        ld      (co_aux), a
+        call    skip_sp_p
+        call    peek_ch
+        cp      ')'
+        jp      nz, exc_syn
+        call    adv_ptr
+po_ixd_set:
+        ld      a, OT_IXD
+        ld      (co_type), a
+        ret
+
+; po_expect_rp: consume ')' (after spaces)
+po_expect_rp:
+        call    skip_sp_p
+        call    peek_ch
+        cp      ')'
+        jp      nz, exc_syn
+        jp      adv_ptr
+
+; latch_op1 / latch_op2: copy the co_* block to op1_* / op2_*
+latch_op1:
+        ld      hl, co_type
+        ld      de, op1_type
+        ld      bc, 5
+        ldir
+        IF      DEFINED EDAS_TOSR
+        ld      a, (co_reloc)
+        ld      (op1_reloc), a
+        ENDIF
+        ret
+latch_op2:
+        ld      hl, co_type
+        ld      de, op2_type
+        ld      bc, 5
+        ldir
+        IF      DEFINED EDAS_TOSR
+        ld      a, (co_reloc)
+        ld      (op2_reloc), a
+        ENDIF
+        ret
+op1_to_co:
+        ld      hl, op1_type
+        ld      de, co_type
+        ld      bc, 5
+        ldir
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op1_reloc)
+        ld      (co_reloc), a
+        ENDIF
+        ret
+op2_to_co:
+        ld      hl, op2_type
+        ld      de, co_type
+        ld      bc, 5
+        ldir
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op2_reloc)
+        ld      (co_reloc), a
+        ENDIF
+        ret
+
+; ---------------------------------------------------------------
+; Condition codes. cctab entries: code byte, name, 0. The
+; table ends with a 0ffh code byte.
+; ---------------------------------------------------------------
+
+; try_cc_comma: if the next token is a condition followed by
+; a comma, consume both and return a = code (carry clear).
+; Otherwise restore (asm_ptr) and return carry set.
+try_cc_comma:
+        call    skip_sp_p
+        ld      hl, (asm_ptr)
+        ld      (cc_save), hl
+        call    read_ident
+        jr      c, cc_no
+        call    cc_lookup
+        jr      c, cc_no
+        ld      (cc_code), a
+        call    skip_sp_p
+        call    peek_ch
+        cp      ','
+        jr      nz, cc_no
+        call    adv_ptr
+        ld      a, (cc_code)
+        or      a
+        ret
+cc_no:
+        ld      hl, (cc_save)
+        ld      (asm_ptr), hl
+        scf
+        ret
+
+; try_cc_eol: like try_cc_comma, but the condition must be
+; followed by end-of-line or a comment.
+try_cc_eol:
+        call    skip_sp_p
+        ld      hl, (asm_ptr)
+        ld      (cc_save), hl
+        call    read_ident
+        jr      c, cc_no
+        call    cc_lookup
+        jr      c, cc_no
+        ld      (cc_code), a
+        call    skip_sp_p
+        call    peek_ch
+        or      a
+        jr      z, cce_ok
+        cp      ';'
+        jr      nz, cc_no
+cce_ok:
+        ld      a, (cc_code)
+        or      a
+        ret
+
+; cc_lookup: tok_buf -> a = code, or carry set.
+cc_lookup:
+        ld      hl, cctab
+ccl_lp:
+        ld      a, (hl)
+        cp      0ffh
+        jr      z, ccl_no
+        ld      (cc_ep), hl
+        inc     hl
+        call    tok_eq
+        jr      z, ccl_hit
+        ld      hl, (cc_ep)
+        inc     hl
+ccl_sk:
+        ld      a, (hl)
+        inc     hl
+        or      a
+        jr      nz, ccl_sk
+        jr      ccl_lp
+ccl_hit:
+        ld      hl, (cc_ep)
+        ld      a, (hl)
+        or      a
+        ret
+ccl_no:
+        scf
+        ret
+
+; ---------------------------------------------------------------
+; Statement lookup. fixtab entries: name(0), count, b1, b2.
+; mntab entries: name(0), handler address (dw). On a hit,
+; (stmt_handler) is set (emit_fixed for fixtab, with the
+; opcode bytes in fx_n/fx_b1/fx_b2) and carry is clear.
+; ---------------------------------------------------------------
+lookup_stmt:
+        ld      hl, fixtab
+ls_fx:
+        ld      a, (hl)
+        or      a
+        jr      z, ls_mn
+        ld      (ls_ep), hl
+        call    tok_eq
+        jr      z, ls_fxhit
+        ld      hl, (ls_ep)
+ls_fxsk:
+        ld      a, (hl)
+        inc     hl
+        or      a
+        jr      nz, ls_fxsk
+        inc     hl
+        inc     hl
+        inc     hl                      ; count + b1 + b2
+        jr      ls_fx
+ls_fxhit:
+        ld      hl, (ls_ep)
+ls_fh2:
+        ld      a, (hl)
+        inc     hl
+        or      a
+        jr      nz, ls_fh2
+        ld      a, (hl)
+        ld      (fx_n), a
+        inc     hl
+        ld      a, (hl)
+        ld      (fx_b1), a
+        inc     hl
+        ld      a, (hl)
+        ld      (fx_b2), a
+        ld      hl, emit_fixed
+        ld      (stmt_handler), hl
+        or      a
+        ret
+ls_mn:
+        ld      hl, mntab
+ls_mlp:
+        ld      a, (hl)
+        or      a
+        jr      z, ls_no
+        ld      (ls_ep), hl
+        call    tok_eq
+        jr      z, ls_mhit
+        ld      hl, (ls_ep)
+ls_msk:
+        ld      a, (hl)
+        inc     hl
+        or      a
+        jr      nz, ls_msk
+        inc     hl
+        inc     hl                      ; handler address
+        jr      ls_mlp
+ls_mhit:
+        ld      hl, (ls_ep)
+ls_mh2:
+        ld      a, (hl)
+        inc     hl
+        or      a
+        jr      nz, ls_mh2
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        ld      (stmt_handler), hl
+        or      a
+        ret
+ls_no:
+        scf
+        ret
+
+; emit_fixed: handler for fixtab statements
+emit_fixed:
+        ld      a, (fx_b1)
+        call    emit8
+        ld      a, (fx_n)
+        cp      2
+        ret     nz
+        ld      a, (fx_b2)
+        jp      emit8
+
+; ---------------------------------------------------------------
+; Instruction handlers. Each is entered with (asm_ptr) at the
+; operand text and returns when its operands are consumed.
+; ---------------------------------------------------------------
+
+; ---- LD ----
+h_ld:
+        call    parse_op
+        call    latch_op1
+        call    expect_comma
+        call    parse_op
+        call    latch_op2
+        ld      a, (op1_type)
+        cp      OT_R8
+        jp      z, ld_r8
+        cp      OT_IXD
+        jp      z, ld_ixd
+        cp      OT_RR
+        jp      z, ld_rr
+        cp      OT_IX
+        jp      z, ld_ix
+        cp      OT_IND
+        jp      z, ld_ind
+        cp      OT_IBC
+        jp      z, ld_ibc
+        cp      OT_IDE
+        jp      z, ld_ide
+        cp      OT_I
+        jp      z, ld_oi
+        cp      OT_R
+        jp      z, ld_or
+        jp      err_operand
+
+; op1 = r8
+ld_r8:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      z, ld_r8_r8
+        cp      OT_IMM
+        jp      z, ld_r8_imm
+        cp      OT_IXD
+        jp      z, ld_r8_ixd
+        cp      OT_IBC
+        jp      z, ld_r8_ibc
+        cp      OT_IDE
+        jp      z, ld_r8_ide
+        cp      OT_IND
+        jp      z, ld_r8_ind
+        cp      OT_I
+        jp      z, ld_r8_i
+        cp      OT_R
+        jp      z, ld_r8_r
+        jp      err_operand
+ld_r8_r8:
+        ld      a, (op1_val)
+        cp      6
+        jp      nz, ld_r8r8_go
+        ld      a, (op2_val)
+        cp      6
+        jp      z, err_operand          ; (HL),(HL) is HALT
+ld_r8r8_go:
+        ld      a, (op1_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (op2_val)
+        add     a, b
+        add     a, 040h
+        jp      emit8
+ld_r8_imm:
+        ld      a, (op1_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 006h
+        call    emit8
+        ld      de, (op2_val)
+        jp      emit8v
+ld_r8_ixd:
+        ld      a, (op1_val)
+        cp      6
+        jp      z, err_operand
+        ld      a, (op2_ixy)
+        call    emit_pre
+        ld      a, (op1_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 046h
+        call    emit8
+        ld      a, (op2_aux)
+        jp      emit8
+ld_r8_ibc:
+        ld      a, (op1_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 00ah
+        jp      emit8
+ld_r8_ide:
+        ld      a, (op1_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 01ah
+        jp      emit8
+ld_r8_ind:
+        ld      a, (op1_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 03ah
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op2_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op2_val)
+        jp      emit16
+ld_r8_i:
+        ld      a, (op1_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 0edh
+        call    emit8
+        ld      a, 057h
+        jp      emit8
+ld_r8_r:
+        ld      a, (op1_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 0edh
+        call    emit8
+        ld      a, 05fh
+        jp      emit8
+
+; op1 = (IX+d) / (IY+d)
+ld_ixd:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      z, ld_ixd_r8
+        cp      OT_IMM
+        jp      z, ld_ixd_imm
+        jp      err_operand
+ld_ixd_r8:
+        ld      a, (op2_val)
+        cp      6
+        jp      z, err_operand
+        ld      a, (op1_ixy)
+        call    emit_pre
+        ld      a, (op2_val)
+        add     a, 070h
+        call    emit8
+        ld      a, (op1_aux)
+        jp      emit8
+ld_ixd_imm:
+        ld      a, (op1_ixy)
+        call    emit_pre
+        ld      a, 036h
+        call    emit8
+        ld      a, (op1_aux)
+        call    emit8
+        ld      de, (op2_val)
+        jp      emit8v
+
+; op1 = rr (BC/DE/HL/SP)
+ld_rr:
+        ld      a, (op2_type)
+        cp      OT_IMM
+        jp      z, ld_rr_imm
+        cp      OT_IND
+        jp      z, ld_rr_ind
+        cp      OT_RR
+        jp      z, ld_rr_rr
+        cp      OT_IX
+        jp      z, ld_rr_ix
+        jp      err_operand
+ld_rr_imm:
+        ld      a, (op1_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 001h
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op2_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op2_val)
+        jp      emit16
+ld_rr_ind:
+        ld      a, (op1_val)
+        cp      2
+        jp      z, ld_hl_ind
+        ld      a, 0edh
+        call    emit8
+        ld      a, (op1_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 04bh
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op2_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op2_val)
+        jp      emit16
+ld_hl_ind:
+        ld      a, 02ah
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op2_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op2_val)
+        jp      emit16
+ld_rr_rr:
+        ld      a, (op1_val)
+        cp      3                       ; SP
+        jp      nz, err_operand
+        ld      a, (op2_val)
+        cp      2                       ; HL
+        jp      nz, err_operand
+        ld      a, 0f9h
+        jp      emit8
+ld_rr_ix:
+        ld      a, (op1_val)
+        cp      3                       ; SP,IX / SP,IY
+        jp      nz, err_operand
+        ld      a, (op2_ixy)
+        call    emit_pre
+        ld      a, 0f9h
+        jp      emit8
+
+; op1 = IX / IY
+ld_ix:
+        ld      a, (op2_type)
+        cp      OT_IMM
+        jp      z, ld_ix_imm
+        cp      OT_IND
+        jp      z, ld_ix_ind
+        jp      err_operand
+ld_ix_imm:
+        ld      a, (op1_ixy)
+        call    emit_pre
+        ld      a, 021h
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op2_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op2_val)
+        jp      emit16
+ld_ix_ind:
+        ld      a, (op1_ixy)
+        call    emit_pre
+        ld      a, 02ah
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op2_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op2_val)
+        jp      emit16
+
+; op1 = (nn)
+ld_ind:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      z, ld_ind_r8
+        cp      OT_RR
+        jp      z, ld_ind_rr
+        cp      OT_IX
+        jp      z, ld_ind_ix
+        jp      err_operand
+ld_ind_r8:
+        ld      a, (op2_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 032h
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op1_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op1_val)
+        jp      emit16
+ld_ind_rr:
+        ld      a, 0edh
+        call    emit8
+        ld      a, (op2_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 043h
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op1_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op1_val)
+        jp      emit16
+ld_ind_ix:
+        ld      a, (op2_ixy)
+        call    emit_pre
+        ld      a, 022h
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (op1_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (op1_val)
+        jp      emit16
+
+; op1 = (BC) / (DE): only A as source
+ld_ibc:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, (op2_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 002h
+        jp      emit8
+ld_ide:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, (op2_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 012h
+        jp      emit8
+
+; op1 = I / R: only A as source
+ld_oi:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, (op2_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 0edh
+        call    emit8
+        ld      a, 047h
+        jp      emit8
+ld_or:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, (op2_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 0edh
+        call    emit8
+        ld      a, 04fh
+        jp      emit8
+
+; ---- PUSH / POP ----
+h_push:
+        ld      a, 0c5h
+        jr      pp_go
+h_pop:
+        ld      a, 0c1h
+pp_go:
+        ld      (pp_base), a
+        call    parse_op
+        ld      a, (co_type)
+        cp      OT_RR
+        jr      z, pp_rr
+        cp      OT_RR2
+        jr      z, pp_rr
+        cp      OT_IX
+        jr      z, pp_ix
+        jp      err_operand
+pp_rr:
+        ld      a, (co_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (pp_base)
+        add     a, b
+        jp      emit8
+pp_ix:
+        ld      a, (co_ixy)
+        call    emit_pre
+        ld      a, (pp_base)
+        add     a, 020h                 ; C5->E5, C1->E1
+        jp      emit8
+
+; ---- INC / DEC ----
+h_inc:
+        xor     a
+        jr      id_go
+h_dec:
+        ld      a, 1
+id_go:
+        ld      (id_f), a
+        call    parse_op
+        ld      a, (co_type)
+        cp      OT_R8
+        jr      z, id_r8
+        cp      OT_IXD
+        jr      z, id_ixd
+        cp      OT_RR
+        jr      z, id_rr
+        cp      OT_IX
+        jr      z, id_ix
+        jp      err_operand
+id_r8:
+        ld      a, (co_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 004h
+        ld      b, a
+        ld      a, (id_f)
+        add     a, b
+        jp      emit8
+id_ixd:
+        ld      a, (co_ixy)
+        call    emit_pre
+        ld      a, (id_f)
+        add     a, 034h
+        call    emit8
+        ld      a, (co_aux)
+        jp      emit8
+id_rr:
+        ld      a, (co_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 003h
+        ld      b, a
+        ld      a, (id_f)
+        add     a, a
+        add     a, a
+        add     a, a                    ; f * 8
+        add     a, b
+        jp      emit8
+id_ix:
+        ld      a, (co_ixy)
+        call    emit_pre
+        ld      a, (id_f)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 023h
+        jp      emit8
+
+; ---- ALU (ADD/ADC/SUB/SBC/AND/XOR/OR/CP) ----
+h_add:
+        xor     a
+        jr      alu_entry
+h_adc:
+        ld      a, 1
+        jr      alu_entry
+h_sub:
+        ld      a, 2
+        jr      alu_entry
+h_sbc:
+        ld      a, 3
+        jr      alu_entry
+h_and:
+        ld      a, 4
+        jr      alu_entry
+h_xor:
+        ld      a, 5
+        jr      alu_entry
+h_or:
+        ld      a, 6
+        jr      alu_entry
+h_cp:
+        ld      a, 7
+alu_entry:
+        ld      (alu_idx), a
+        call    parse_op
+        call    latch_op1
+        call    skip_sp_p
+        call    peek_ch
+        cp      ','
+        jr      z, alu_two
+        call    op1_to_co               ; single operand (A implied)
+        jp      alu8_common
+alu_two:
+        call    adv_ptr                 ; consume ','
+        ld      a, (op1_type)
+        cp      OT_RR
+        jp      z, alu16_rr
+        cp      OT_IX
+        jp      z, alu16_ix
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, (op1_val)
+        cp      7                       ; first operand must be A
+        jp      nz, err_operand
+        call    parse_op
+        call    latch_op2
+        call    op2_to_co
+        jp      alu8_common
+alu16_rr:
+        ld      a, (op1_val)
+        cp      2                       ; HL only
+        jp      nz, err_operand
+        call    parse_op
+        call    latch_op2
+        ld      a, (op2_type)
+        cp      OT_RR
+        jp      nz, err_operand
+        ld      a, (alu_idx)
+        or      a
+        jr      z, a16_add
+        cp      1
+        jr      z, a16_adc
+        cp      3
+        jr      z, a16_sbc
+        jp      err_operand
+a16_add:
+        ld      a, (op2_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 009h
+        jp      emit8
+a16_adc:
+        ld      a, 0edh
+        call    emit8
+        ld      a, (op2_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 04ah
+        jp      emit8
+a16_sbc:
+        ld      a, 0edh
+        call    emit8
+        ld      a, (op2_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 042h
+        jp      emit8
+alu16_ix:
+        ld      a, (alu_idx)
+        or      a
+        jp      nz, err_operand         ; only ADD IX,rr
+        call    parse_op
+        call    latch_op2
+        ld      a, (op2_type)
+        cp      OT_RR
+        jr      z, a16ix_rr
+        cp      OT_IX
+        jr      z, a16ix_ix
+        jp      err_operand
+a16ix_rr:
+        ld      a, (op2_val)
+        cp      2
+        jp      z, err_operand          ; HL is not a source here
+        ld      (a16_code), a
+        ld      a, (op1_ixy)
+        call    emit_pre
+        ld      a, (a16_code)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 009h
+        jp      emit8
+a16ix_ix:
+        ld      a, (op2_ixy)
+        ld      b, a
+        ld      a, (op1_ixy)
+        cp      b
+        jp      nz, err_operand         ; IX with IX, IY with IY
+        call    emit_pre
+        ld      a, 029h
+        jp      emit8
+
+; alu8_common: co_* = the 8-bit operand, (alu_idx) = 0..7
+alu8_common:
+        ld      a, (co_type)
+        cp      OT_R8
+        jr      z, a8_r8
+        cp      OT_IMM
+        jr      z, a8_imm
+        cp      OT_IXD
+        jr      z, a8_ixd
+        jp      err_operand
+a8_r8:
+        ld      a, (alu_idx)
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (co_val)
+        add     a, b
+        add     a, 080h
+        jp      emit8
+a8_imm:
+        ld      a, (alu_idx)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c6h
+        call    emit8
+        ld      de, (co_val)
+        jp      emit8v
+a8_ixd:
+        ld      a, (co_ixy)
+        call    emit_pre
+        ld      a, (alu_idx)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 086h
+        call    emit8
+        ld      a, (co_aux)
+        jp      emit8
+
+; ---- JP / CALL / JR / DJNZ / RET / RST ----
+h_jp:
+        call    try_cc_comma
+        jr      c, jp_nocc
+        ld      (jp_cc), a
+        call    eval_expr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (em16_attr), a
+        ENDIF
+        ld      a, (jp_cc)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c2h
+        call    emit8
+        jp      emit16
+jp_nocc:
+        call    parse_op
+        ld      a, (co_type)
+        cp      OT_R8
+        jr      z, jp_hl
+        cp      OT_IXD
+        jr      z, jp_ix
+        cp      OT_IMM
+        jr      z, jp_imm
+        jp      err_operand
+jp_hl:
+        ld      a, (co_val)
+        cp      6
+        jp      nz, err_operand
+        ld      a, 0e9h
+        jp      emit8
+jp_ix:
+        ld      a, (co_ixy)
+        call    emit_pre
+        ld      a, 0e9h
+        jp      emit8
+jp_imm:
+        ld      a, 0c3h
+        call    emit8
+        IF      DEFINED EDAS_TOSR
+        ld      a, (co_reloc)
+        ld      (em16_attr), a
+        ENDIF
+        ld      de, (co_val)
+        jp      emit16
+
+h_call:
+        call    try_cc_comma
+        jr      c, call_nocc
+        ld      (jp_cc), a
+        call    eval_expr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (em16_attr), a
+        ENDIF
+        ld      a, (jp_cc)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c4h
+        call    emit8
+        jp      emit16
+call_nocc:
+        call    eval_expr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (em16_attr), a
+        ENDIF
+        ld      a, 0cdh
+        call    emit8
+        jp      emit16
+
+h_jr:
+        call    try_cc_comma
+        jr      c, jr_nocc
+        ld      (jp_cc), a
+        cp      4
+        jp      nc, err_operand         ; only NZ Z NC C
+        call    eval_expr
+        ld      a, (jp_cc)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 020h
+        call    emit8
+        jp      emit_rel
+jr_nocc:
+        call    eval_expr
+        ld      a, 018h
+        call    emit8
+        jp      emit_rel
+
+h_djnz:
+        call    eval_expr
+        ld      a, 010h
+        call    emit8
+        jp      emit_rel
+
+; emit_rel: de = absolute target. The opcode has already
+; been emitted, so asm_pc points at the displacement byte.
+emit_rel:
+        ld      hl, (asm_pc)
+        inc     hl                      ; instruction end
+        ex      de, hl
+        or      a
+        sbc     hl, de
+        ex      de, hl                  ; de = displacement
+        ld      a, (asm_pass)
+        cp      2
+        jr      nz, er_go
+        ld      a, d
+        or      a
+        jr      z, er_pos
+        cp      0ffh
+        jr      nz, er_bad
+        ld      a, e
+        cp      080h
+        jr      c, er_bad
+        jr      er_go
+er_pos:
+        ld      a, e
+        cp      080h
+        jr      nc, er_bad
+er_go:
+        ld      a, e
+        jp      emit8
+er_bad:
+        ld      hl, em_range
+        jp      asm_fail
+
+h_ret:
+        call    skip_sp_p
+        call    peek_ch
+        or      a
+        jr      z, ret_plain
+        cp      ';'
+        jr      z, ret_plain
+        call    try_cc_eol
+        jp      c, err_operand
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c0h
+        jp      emit8
+ret_plain:
+        ld      a, 0c9h
+        jp      emit8
+
+h_rst:
+        call    eval_expr
+        ld      a, d
+        or      a
+        jp      nz, err_operand
+        ld      a, e
+        and     0c7h
+        jp      nz, err_operand
+        ld      a, e
+        add     a, 0c7h
+        jp      emit8
+
+; ---- IN / OUT ----
+h_in:
+        call    parse_op
+        call    latch_op1
+        call    expect_comma
+        call    parse_op
+        call    latch_op2
+        ld      a, (op2_type)
+        cp      OT_IND
+        jr      z, in_ind
+        cp      OT_IC
+        jr      z, in_ic
+        jp      err_operand
+in_ind:
+        ld      a, (op1_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, (op1_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 0dbh
+        call    emit8
+        ld      de, (op2_val)
+        jp      emit8v
+in_ic:
+        ld      a, (op1_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, 0edh
+        call    emit8
+        ld      a, (op1_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 040h
+        jp      emit8
+
+h_out:
+        call    parse_op
+        call    latch_op1
+        call    expect_comma
+        call    parse_op
+        call    latch_op2
+        ld      a, (op1_type)
+        cp      OT_IND
+        jr      z, out_ind
+        cp      OT_IC
+        jr      z, out_ic
+        jp      err_operand
+out_ind:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, (op2_val)
+        cp      7
+        jp      nz, err_operand
+        ld      a, 0d3h
+        call    emit8
+        ld      de, (op1_val)
+        jp      emit8v
+out_ic:
+        ld      a, (op2_type)
+        cp      OT_R8
+        jp      nz, err_operand
+        ld      a, 0edh
+        call    emit8
+        ld      a, (op2_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 041h
+        jp      emit8
+
+; ---- EX ----
+h_ex:
+        call    parse_op
+        call    latch_op1
+        call    expect_comma
+        call    parse_op
+        call    latch_op2
+        ld      a, (op1_type)
+        cp      OT_RR
+        jr      z, ex_rr
+        cp      OT_RR2
+        jr      z, ex_af
+        cp      OT_ISP
+        jr      z, ex_sp
+        jp      err_operand
+ex_rr:
+        ld      a, (op1_val)
+        cp      1                       ; DE
+        jp      nz, err_operand
+        ld      a, (op2_type)
+        cp      OT_RR
+        jp      nz, err_operand
+        ld      a, (op2_val)
+        cp      2                       ; HL
+        jp      nz, err_operand
+        ld      a, 0ebh
+        jp      emit8
+ex_af:
+        ld      a, (op2_type)
+        cp      OT_RR2
+        jp      nz, err_operand
+        call    peek_ch                 ; the ' of AF'
+        cp      027h
+        jp      nz, err_operand
+        call    adv_ptr
+        ld      a, 008h
+        jp      emit8
+ex_sp:
+        ld      a, (op2_type)
+        cp      OT_RR
+        jr      z, ex_sp_hl
+        cp      OT_IX
+        jr      z, ex_sp_ix
+        jp      err_operand
+ex_sp_hl:
+        ld      a, (op2_val)
+        cp      2
+        jp      nz, err_operand
+        ld      a, 0e3h
+        jp      emit8
+ex_sp_ix:
+        ld      a, (op2_ixy)
+        call    emit_pre
+        ld      a, 0e3h
+        jp      emit8
+
+; ---- IM ----
+h_im:
+        call    eval_expr
+        ld      a, d
+        or      a
+        jp      nz, err_operand
+        ld      a, e
+        cp      3
+        jp      nc, err_operand
+        ld      hl, imtab
+        ld      c, a
+        ld      b, 0
+        add     hl, bc
+        ld      a, 0edh
+        call    emit8
+        ld      a, (hl)
+        jp      emit8
+
+; ---- CB group: shifts and BIT/RES/SET ----
+h_rlc:
+        ld      a, 000h
+        jr      cb_shift
+h_rrc:
+        ld      a, 008h
+        jr      cb_shift
+h_rl:
+        ld      a, 010h
+        jr      cb_shift
+h_rr:
+        ld      a, 018h
+        jr      cb_shift
+h_sla:
+        ld      a, 020h
+        jr      cb_shift
+h_sra:
+        ld      a, 028h
+        jr      cb_shift
+h_srl:
+        ld      a, 038h
+cb_shift:
+        ld      (cb_base), a
+        call    parse_op
+        ld      a, (co_type)
+        cp      OT_R8
+        jr      z, cbs_r8
+        cp      OT_IXD
+        jr      z, cbs_ixd
+        jp      err_operand
+cbs_r8:
+        ld      a, 0cbh
+        call    emit8
+        ld      a, (co_val)
+        ld      b, a
+        ld      a, (cb_base)
+        add     a, b
+        jp      emit8
+cbs_ixd:
+        ld      a, (co_ixy)
+        call    emit_pre
+        ld      a, 0cbh
+        call    emit8
+        ld      a, (co_aux)
+        call    emit8
+        ld      a, (cb_base)
+        add     a, 006h
+        jp      emit8
+
+h_bit:
+        ld      a, 040h
+        jr      cb_bit
+h_res:
+        ld      a, 080h
+        jr      cb_bit
+h_set:
+        ld      a, 0c0h
+cb_bit:
+        ld      (cb_base), a
+        call    eval_expr               ; bit number
+        ld      a, d
+        or      a
+        jp      nz, err_operand
+        ld      a, e
+        cp      8
+        jp      nc, err_operand
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      (cb_bitn), a
+        call    expect_comma
+        call    parse_op
+        ld      a, (co_type)
+        cp      OT_R8
+        jr      z, cbb_r8
+        cp      OT_IXD
+        jr      z, cbb_ixd
+        jp      err_operand
+cbb_r8:
+        ld      a, 0cbh
+        call    emit8
+        ld      a, (cb_base)
+        ld      b, a
+        ld      a, (cb_bitn)
+        add     a, b
+        ld      b, a
+        ld      a, (co_val)
+        add     a, b
+        jp      emit8
+cbb_ixd:
+        ld      a, (co_ixy)
+        call    emit_pre
+        ld      a, 0cbh
+        call    emit8
+        ld      a, (co_aux)
+        call    emit8
+        ld      a, (cb_base)
+        ld      b, a
+        ld      a, (cb_bitn)
+        add     a, b
+        add     a, 006h
+        jp      emit8
+
+; ---- Directives: ORG / END / DB / DW / DS ----
+h_org:
+        call    eval_expr
+        ld      a, (asm_pass)
+        cp      1
+        jr      nz, org_set
+        ld      a, (eval_undef)
+        or      a
+        jr      nz, org_fwd
+org_set:
+        ld      (asm_pc), de
+        ld      a, (org_seen)
+        or      a
+        ret     nz                      ; only the first ORG
+        ld      a, 1
+        ld      (org_seen), a
+        ld      (asm_org), de
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ts_mode)
+        or      a
+        jr      z, org_nots
+        ld      hl, (asm_pc)            ; TOSR: user code starts
+        ld      bc, TS_STUB_LEN         ; after the stub area
+        add     hl, bc
+        ld      (asm_pc), hl
+org_nots:
+        ENDIF
+        ret
+org_fwd:
+        ld      hl, em_org
+        jp      asm_fail
+
+h_end:
+        ld      a, 1
+        ld      (asm_done), a
+        ret
+
+h_db:
+db_lp:
+        call    skip_sp_p
+        call    peek_ch
+        cp      '"'
+        jr      z, db_str
+        cp      027h
+        jr      z, db_str
+        call    eval_expr
+        call    emit8v
+        jr      db_next
+db_str:
+        ld      (db_quote), a
+        call    adv_ptr                 ; opening quote
+db_slp:
+        call    peek_ch
+        or      a
+        jr      z, db_unterm
+        ld      b, a
+        ld      a, (db_quote)
+        cp      b
+        jr      z, db_send
+        ld      a, b
+        call    adv_ptr
+        call    emit8
+        jr      db_slp
+db_send:
+        call    adv_ptr                 ; closing quote
+db_next:
+        call    skip_sp_p
+        call    peek_ch
+        cp      ','
+        ret     nz
+        call    adv_ptr
+        jr      db_lp
+db_unterm:
+        ld      hl, em_string
+        jp      asm_fail
+
+h_dw:
+dw_lp:
+        call    eval_expr
+        IF      DEFINED EDAS_TOSR
+        ld      a, (ev_attr)
+        ld      (em16_attr), a
+        ENDIF
+        call    emit16
+        call    skip_sp_p
+        call    peek_ch
+        cp      ','
+        ret     nz
+        call    adv_ptr
+        jr      dw_lp
+
+h_ds:
+        call    eval_expr               ; de = count
+        ld      a, (asm_pass)
+        cp      1
+        jr      nz, ds_go
+        ld      a, (eval_undef)
+        or      a
+        jr      nz, ds_fwd
+ds_go:
+        ld      b, d
+        ld      c, e
+ds_lp:
+        ld      a, b
+        or      c
+        ret     z
+        xor     a
+        call    emit8
+        dec     bc
+        jr      ds_lp
+ds_fwd:
+        ld      hl, em_ds
+        jp      asm_fail
+
+; ---------------------------------------------------------------
+; TOSR (relocatable) output - EDAS_TOSR builds only.
+;
+; The RELOC directive (which must head the source) switches
+; the build to TOSR mode: TS_STUB_LEN bytes are reserved at
+; the origin, every expression carries an attribute - the
+; coefficient of the module origin in its value (1 when the
+; value derives from a label or $, 0 otherwise; symbol
+; entries keep it at +15, EQU inherits it) - and emit16
+; marks the HIGH byte of each internal 16-bit operand in a
+; bitmap held just past the emitted body. After assembly,
+; ts_finish lays the stage-1 self-relocation stub, the
+; bitmap and the 16-byte trailer over the reserved areas,
+; so the saved file is a complete TOSR v1 image.
+; ---------------------------------------------------------------
+        IF      DEFINED EDAS_TOSR
+
+; RELOC [heap-blocks]
+h_reloc:
+        ld      a, (org_seen)
+        or      a
+        jr      nz, hr_late
+        ld      hl, (asm_pc)
+        ld      de, ORGDEF
+        or      a
+        sbc     hl, de
+        jr      nz, hr_late             ; something emitted
+        ld      a, 1
+        ld      (ts_mode), a
+        ld      hl, (asm_pc)
+        ld      bc, TS_STUB_LEN
+        add     hl, bc                  ; reserve the stub area
+        ld      (asm_pc), hl
+        call    skip_sp_p
+        call    peek_ch
+        or      a
+        ret     z                       ; no operand: heap = 0
+        cp      ';'
+        ret     z
+        call    eval_expr               ; de = heap blocks
+        ld      a, d
+        or      a
+        jp      nz, em_rg               ; must fit in a byte
+        ld      a, e
+        ld      (ts_heap), a
+        ret
+hr_late:
+        ld      hl, em_reloclate
+        jp      asm_fail
+
+; ts_symattr: called from evt_sym just after sym_find.
+; Found (carry clear, hl = entry): term_attr := the byte
+; at entry+15. Not found: term_attr := 0. The carry out
+; reproduces sym_find's (clear = found). Preserves de.
+ts_symattr:
+        jr      c, tsa_undef
+        push    bc
+        ld      bc, 15
+        add     hl, bc
+        ld      a, (hl)
+        ld      (term_attr), a
+        pop     bc
+        or      a                       ; carry clear: found
+        ret
+tsa_undef:
+        xor     a
+        ld      (term_attr), a
+        scf                             ; carry set: not found
+        ret
+
+; ts_mark: called from emit16 between the low and the high
+; byte; asm_pc then addresses the high byte. Sets its bit
+; in the bitmap when em16_attr says the operand value is
+; module-internal. Consumes em16_attr. Preserves bc, de.
+ts_mark:
+        ld      a, (asm_pass)
+        cp      2
+        ret     nz
+        ld      a, (ts_mode)
+        or      a
+        ret     z
+        ld      a, (em16_attr)
+        or      a
+        ret     z
+        xor     a
+        ld      (em16_attr), a
+        push    bc
+        push    de
+        ld      hl, (asm_pc)
+        ld      de, (asm_org)
+        or      a
+        sbc     hl, de                  ; hl = offset of the
+                                        ; high byte in body
+        ld      a, l
+        and     7
+        ld      b, a                    ; b = offset mod 8
+        srl     h
+        rr      l
+        srl     h
+        rr      l
+        srl     h
+        rr      l                       ; hl = offset div 8
+        ld      de, (ts_bmbase)
+        add     hl, de                  ; hl = bitmap byte
+        ld      a, 080h                 ; bit 7 - (offset mod 8)
+        inc     b
+tsm_sh:
+        dec     b
+        jr      z, tsm_or
+        rrca
+        jr      tsm_sh
+tsm_or:
+        ld      c, a
+        ld      a, (hl)
+        or      c
+        ld      (hl), a
+        pop     de
+        pop     bc
+        ret
+
+; ts_prep: called once after the final pass 1 with ts_mode
+; set. Validates the image geometry and zeroes the bitmap
+; area at (asm_end). Errors jp asm_fail.
+ts_prep:
+        ld      a, (asm_org)            ; origin page aligned?
+        or      a
+        jr      z, tsp_alok
+        ld      hl, em_tsal
+        jp      asm_fail
+tsp_alok:
+        ld      hl, (asm_end)
+        ld      de, (asm_org)
+        or      a
+        sbc     hl, de
+        ld      (ts_body), hl           ; body size
+        ld      de, 7
+        add     hl, de
+        srl     h
+        rr      l
+        srl     h
+        rr      l
+        srl     h
+        rr      l
+        ld      (ts_bmsize), hl         ; bitmap = (body+7)/8
+        ld      de, (ts_body)
+        add     hl, de
+        ld      de, 16
+        add     hl, de
+        ld      (ts_total), hl          ; total image size
+        ld      de, 257                 ; must exceed 256
+        or      a
+        sbc     hl, de
+        jr      nc, tsp_bigok
+        ld      hl, em_tssmall
+        jp      asm_fail
+tsp_bigok:
+        ld      hl, (ts_total)
+        ld      de, (asm_org)
+        add     hl, de                  ; exclusive end address
+        ld      de, OUTMAX
+        or      a
+        sbc     hl, de
+        jr      c, tsp_roomok
+        jr      z, tsp_roomok
+        ld      hl, em_tsbig
+        jp      asm_fail
+tsp_roomok:
+        ld      hl, (asm_end)
+        ld      (ts_bmbase), hl
+        ld      bc, (ts_bmsize)
+tsp_zl:
+        ld      a, b
+        or      c
+        ret     z
+        ld      (hl), 0
+        inc     hl
+        dec     bc
+        jr      tsp_zl
+
+; ts_finish: called from ec_build after a successful TOSR
+; assembly. Copies the stub template over the reserved
+; area, patches its five size/origin immediates, writes
+; the trailer after the bitmap and stores the checksum.
+ts_finish:
+        ld      hl, ts_stub
+        ld      de, (asm_org)
+        ld      bc, TS_STUB_LEN
+        ldir
+        ld      hl, (ts_total)          ; stub +7: total - 16
+        ld      de, 16
+        or      a
+        sbc     hl, de
+        ex      de, hl
+        ld      hl, (asm_org)
+        ld      bc, 7
+        add     hl, bc
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, (ts_total)          ; stub +24: total - 2
+        dec     hl
+        dec     hl
+        ex      de, hl
+        ld      hl, (asm_org)
+        ld      bc, 24
+        add     hl, bc
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, (asm_org)           ; stub +62: origin page
+        ld      bc, 62
+        add     hl, bc
+        ld      a, (asm_org + 1)
+        ld      (hl), a
+        ld      de, (ts_body)           ; stub +70: body size
+        ld      hl, (asm_org)
+        ld      bc, 70
+        add     hl, bc
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, (asm_org)           ; stub +77: body size
+        ld      bc, 77
+        add     hl, bc
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, (ts_bmbase)         ; trailer after bitmap
+        ld      de, (ts_bmsize)
+        add     hl, de
+        ld      (hl), 'T'
+        inc     hl
+        ld      (hl), 'R'
+        inc     hl
+        ld      (hl), 1                 ; format version
+        inc     hl
+        ld      (hl), 006h              ; flags: self-relocating
+        inc     hl
+        ld      a, (asm_org + 1)        ; origin page
+        ld      (hl), a
+        inc     hl
+        ld      (hl), TS_STUB_LEN       ; entry offset = 109
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      a, (ts_heap)            ; heap blocks
+        ld      (hl), a
+        inc     hl
+        ld      de, (ts_body)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (ts_bmsize)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      (hl), 0                 ; ext size = 0 (v1)
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        push    hl                      ; checksum field
+        ld      hl, (ts_total)          ; sum over total-2 bytes
+        dec     hl
+        dec     hl
+        ld      b, h
+        ld      c, l
+        ld      hl, (asm_org)
+        ld      de, 0
+tsf_cl:
+        ld      a, b
+        or      c
+        jr      z, tsf_cd
+        ld      a, (hl)
+        inc     hl
+        add     a, e
+        ld      e, a
+        jr      nc, tsf_nc
+        inc     d
+tsf_nc:
+        dec     bc
+        jr      tsf_cl
+tsf_cd:
+        pop     hl
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ret
+
+; The stage-1 self-relocation stub, verbatim (109 bytes).
+; Its five immediates are placeholders here; ts_finish
+; patches every one of them for the actual image.
+ts_stub:
+        db      006h, 000h, 021h, 000h, 000h, 0e5h, 011h, 007h
+        db      001h, 019h, 07eh, 0feh, 054h, 020h, 026h, 023h
+        db      07eh, 0feh, 052h, 020h, 020h, 0e1h, 0e5h, 001h
+        db      015h, 001h, 011h, 000h, 000h, 07eh, 023h, 083h
+        db      05fh, 030h, 001h, 014h, 00bh, 078h, 0b1h, 020h
+        db      0f4h, 07eh, 0bbh, 020h, 008h, 023h, 07eh, 0bah
+        db      020h, 003h, 0e1h, 018h, 007h, 0e1h, 024h, 004h
+        db      020h, 0cbh, 018h, 031h, 07ch, 0d6h, 080h, 028h
+        db      02ch, 04fh, 0e5h, 0ddh, 0e1h, 011h, 0e9h, 000h
+        db      019h, 0e5h, 0fdh, 0e1h, 011h, 0e9h, 000h, 0fdh
+        db      07eh, 000h, 0fdh, 023h, 067h, 006h, 008h, 0cbh
+        db      024h, 030h, 007h, 0ddh, 07eh, 000h, 081h, 0ddh
+        db      077h, 000h, 0ddh, 023h, 01bh, 07ah, 0b3h, 028h
+        db      004h, 010h, 0ech, 018h, 0e2h
+        ENDIF
+
+; ---------------------------------------------------------------
+; Tables
+; ---------------------------------------------------------------
+
+; register names for parse_op: name(0), type, val
+regtab:
+        db      "A", 0, OT_R8, 7
+        db      "B", 0, OT_R8, 0
+        db      "C", 0, OT_R8, 1
+        db      "D", 0, OT_R8, 2
+        db      "E", 0, OT_R8, 3
+        db      "H", 0, OT_R8, 4
+        db      "L", 0, OT_R8, 5
+        db      "I", 0, OT_I, 0
+        db      "R", 0, OT_R, 0
+        db      "BC", 0, OT_RR, 0
+        db      "DE", 0, OT_RR, 1
+        db      "HL", 0, OT_RR, 2
+        db      "SP", 0, OT_RR, 3
+        db      "AF", 0, OT_RR2, 3
+        db      "IX", 0, OT_IX, 0
+        db      "IY", 0, OT_IX, 1
+        db      0
+
+; condition codes: code, name(0) ... 0ffh ends the table
+cctab:
+        db      0, "NZ", 0
+        db      1, "Z", 0
+        db      2, "NC", 0
+        db      3, "C", 0
+        db      4, "PO", 0
+        db      5, "PE", 0
+        db      6, "P", 0
+        db      7, "M", 0
+        db      0ffh
+
+; fixed-opcode statements: name(0), count, byte1, byte2
+fixtab:
+        db      "NOP", 0, 1, 000h, 0
+        db      "HALT", 0, 1, 076h, 0
+        db      "DI", 0, 1, 0f3h, 0
+        db      "EI", 0, 1, 0fbh, 0
+        db      "SCF", 0, 1, 037h, 0
+        db      "CCF", 0, 1, 03fh, 0
+        db      "CPL", 0, 1, 02fh, 0
+        db      "DAA", 0, 1, 027h, 0
+        db      "EXX", 0, 1, 0d9h, 0
+        db      "RLCA", 0, 1, 007h, 0
+        db      "RRCA", 0, 1, 00fh, 0
+        db      "RLA", 0, 1, 017h, 0
+        db      "RRA", 0, 1, 01fh, 0
+        db      "NEG", 0, 2, 0edh, 044h
+        db      "RETI", 0, 2, 0edh, 04dh
+        db      "RETN", 0, 2, 0edh, 045h
+        db      "LDI", 0, 2, 0edh, 0a0h
+        db      "LDD", 0, 2, 0edh, 0a8h
+        db      "LDIR", 0, 2, 0edh, 0b0h
+        db      "LDDR", 0, 2, 0edh, 0b8h
+        db      "CPI", 0, 2, 0edh, 0a1h
+        db      "CPD", 0, 2, 0edh, 0a9h
+        db      "CPIR", 0, 2, 0edh, 0b1h
+        db      "CPDR", 0, 2, 0edh, 0b9h
+        db      0
+
+; statements with handlers: name(0), handler (dw)
+mntab:
+        db      "LD", 0
+        dw      h_ld
+        db      "PUSH", 0
+        dw      h_push
+        db      "POP", 0
+        dw      h_pop
+        db      "INC", 0
+        dw      h_inc
+        db      "DEC", 0
+        dw      h_dec
+        db      "ADD", 0
+        dw      h_add
+        db      "ADC", 0
+        dw      h_adc
+        db      "SUB", 0
+        dw      h_sub
+        db      "SBC", 0
+        dw      h_sbc
+        db      "AND", 0
+        dw      h_and
+        db      "XOR", 0
+        dw      h_xor
+        db      "OR", 0
+        dw      h_or
+        db      "CP", 0
+        dw      h_cp
+        db      "JP", 0
+        dw      h_jp
+        db      "JR", 0
+        dw      h_jr
+        db      "DJNZ", 0
+        dw      h_djnz
+        db      "CALL", 0
+        dw      h_call
+        db      "RET", 0
+        dw      h_ret
+        db      "RST", 0
+        dw      h_rst
+        db      "IN", 0
+        dw      h_in
+        db      "OUT", 0
+        dw      h_out
+        db      "EX", 0
+        dw      h_ex
+        db      "IM", 0
+        dw      h_im
+        db      "RLC", 0
+        dw      h_rlc
+        db      "RRC", 0
+        dw      h_rrc
+        db      "RL", 0
+        dw      h_rl
+        db      "RR", 0
+        dw      h_rr
+        db      "SLA", 0
+        dw      h_sla
+        db      "SRA", 0
+        dw      h_sra
+        db      "SRL", 0
+        dw      h_srl
+        db      "BIT", 0
+        dw      h_bit
+        db      "RES", 0
+        dw      h_res
+        db      "SET", 0
+        dw      h_set
+        db      "ORG", 0
+        dw      h_org
+        db      "END", 0
+        dw      h_end
+        db      "DB", 0
+        dw      h_db
+        db      "DW", 0
+        dw      h_dw
+        db      "DS", 0
+        dw      h_ds
+        IF      DEFINED EDAS_TOSR
+        db      "RELOC", 0
+        dw      h_reloc
+        ENDIF
+        db      0
+
+imtab:
+        db      046h, 056h, 05eh        ; IM 0 / 1 / 2
+
+str_hl:
+        db      "HL", 0
+str_bc:
+        db      "BC", 0
+str_de:
+        db      "DE", 0
+str_sp:
+        db      "SP", 0
+str_c:
+        db      "C", 0
+str_ix:
+        db      "IX", 0
+str_iy:
+        db      "IY", 0
+str_equ:
+        db      "EQU", 0
+dir_magic:
+        db      "TOSD"
+
+; ---------------------------------------------------------------
+; Messages
+; ---------------------------------------------------------------
+msg_banner:
+        db      "TAPEOS EDAS - EDITOR/ASSEMBLER", 13, 10
+        IF      DEFINED EDAS_MZ
+        db      "ALL I/O VIA IOCS 0C400H - H = HELP", 13, 10, 0
+        ELSE
+        db      "ALL I/O VIA IOCS 0E400H - H = HELP", 13, 10, 0
+        ENDIF
+msg_prompt:
+        db      13, 10, "ED> ", 0
+msg_err:
+        db      "?", 0
+msg_new:
+        db      "TEXT CLEARED", 13, 10, 0
+msg_empty:
+        db      "EMPTY", 13, 10, 0
+msg_full:
+        db      "TEXT BUFFER FULL", 13, 10, 0
+msg_dot:
+        db      "(TYPE LINES, . = END)", 13, 10, 0
+msg_lines:
+        db      " LINES", 13, 10, 0
+msg_saved:
+        db      " SAVED", 13, 10, 0
+msg_nofile:
+        db      "NO FILES", 13, 10, 0
+msg_drv0:
+        db      "DRIVE 0: FD", 13, 10, 0
+msg_drv1:
+        db      "DRIVE 1: RAMDISK", 13, 10, 0
+msg_rdtag:
+        db      "RAMDISK:", 13, 10, 0
+msg_asmok:
+        db      "ASM OK ", 0
+msg_bytes:
+        db      " BYTES", 13, 10, 0
+msg_errpre:
+        db      "ERR LINE ", 0
+msg_help:
+        db      "H: HELP        N: NEW TEXT", 13, 10
+        db      "P [A [B]]: PRINT LINES", 13, 10
+        db      "A: APPEND LINES (. = END)", 13, 10
+        db      "I N: INSERT BEFORE LINE N", 13, 10
+        db      "D N [M]: DELETE LINES N..M", 13, 10
+        db      "E N: EDIT LINE N", 13, 10
+        db      "R NAME: READ TEXT FILE", 13, 10
+        db      "W NAME: WRITE TEXT FILE", 13, 10
+        db      "F: LIST FILES", 13, 10
+        db      "U [D]: DRIVE (0=FD 1=RAMDISK)", 13, 10
+        db      "B [NAME]: ASSEMBLE [AND SAVE]", 13, 10
+        IF      DEFINED EDAS_TOSR
+        db      "  (RELOC FIRST LINE = TOSR OUTPUT)", 13, 10
+        ENDIF
+        db      "Q: QUIT TO SHELL", 0
+
+em_syntax:
+        db      "SYNTAX", 0
+em_mnem:
+        db      "BAD MNEMONIC", 0
+em_operand:
+        db      "BAD OPERAND", 0
+em_expr:
+        db      "BAD EXPRESSION", 0
+em_number:
+        db      "BAD NUMBER", 0
+em_undef:
+        db      "UNDEFINED SYMBOL", 0
+em_range:
+        db      "VALUE OUT OF RANGE", 0
+em_symfull:
+        db      "SYMBOL TABLE FULL", 0
+em_org:
+        db      "ORG NEEDS DEFINED VALUE", 0
+em_ds:
+        db      "DS NEEDS DEFINED COUNT", 0
+em_string:
+        db      "UNTERMINATED STRING", 0
+em_trail:
+        db      "TRAILING TEXT", 0
+        IF      DEFINED EDAS_TOSR
+em_reloclate:
+        db      "RELOC MUST HEAD SOURCE", 0
+em_tsal:
+        db      "TOSR ORG NOT PAGE ALIGNED", 0
+em_tssmall:
+        db      "TOSR IMAGE TOO SMALL", 0
+em_tsbig:
+        db      "TOSR IMAGE TOO BIG", 0
+        ENDIF
+
+; ---------------------------------------------------------------
+; Variables (initialised) - scratch buffers (ds) come last,
+; so nothing emitted follows them in the binary.
+; ---------------------------------------------------------------
+ed_sp:
+        dw      0
+ed_drv:
+        db      0
+ed_argp:
+        dw      0
+txt_lines:
+        dw      0
+txt_used:
+        dw      0
+tgl_len:
+        db      0
+ti_len:
+        db      0
+ti_pos:
+        dw      0
+ti_ptr:
+        dw      0
+ti_src:
+        dw      0
+ti_dst:
+        dw      0
+td_from:
+        dw      0
+td_to:
+        dw      0
+td_src:
+        dw      0
+td_dst:
+        dw      0
+ep_from:
+        dw      0
+ep_to:
+        dw      0
+ei_pos:
+        dw      0
+ee_pos:
+        dw      0
+e_cap:
+        dw      0
+wf_src:
+        dw      0
+wf_len:
+        dw      0
+wf_load:
+        dw      0
+fw_sec:
+        dw      0
+fw_start:
+        dw      0
+fw_entry:
+        dw      0
+fw_rec:
+        dw      0
+fw_ptr:
+        dw      0
+fw_cnt:
+        dw      0
+fw_newfree:
+        dw      0
+fr_start:
+        dw      0
+fr_size:
+        dw      0
+fr_rec:
+        dw      0
+fr_ptr:
+        dw      0
+fr_full:
+        db      0
+fr_rem:
+        db      0
+er_src:
+        dw      0
+er_left:
+        dw      0
+ew_ptr:
+        dw      0
+ew_n:
+        dw      0
+have_name:
+        db      0
+asm_sp:
+        dw      0
+err_ptr:
+        dw      0
+asm_pass:
+        db      0
+asm_pc:
+        dw      0
+asm_org:
+        dw      0
+asm_end:
+        dw      0
+asm_len:
+        dw      0
+asm_line:
+        dw      0
+asm_done:
+        db      0
+org_seen:
+        db      0
+        IF      DEFINED EDAS_TOSR
+ts_mode:
+        db      0
+ts_heap:
+        db      0
+ts_iter:
+        db      0
+attr_dirty:
+        db      0
+def_attr:
+        db      0
+term_attr:
+        db      0
+ev_attr:
+        db      0
+co_reloc:
+        db      0
+op1_reloc:
+        db      0
+op2_reloc:
+        db      0
+em16_attr:
+        db      0
+ts_body:
+        dw      0
+ts_bmsize:
+        dw      0
+ts_total:
+        dw      0
+ts_bmbase:
+        dw      0
+        ENDIF
+asm_ptr:
+        dw      0
+eval_undef:
+        db      0
+tok_len:
+        db      0
+num_len:
+        db      0
+sd_val:
+        dw      0
+pl_savep:
+        dw      0
+pl_eqval:
+        dw      0
+stmt_handler:
+        dw      0
+fx_n:
+        db      0
+fx_b1:
+        db      0
+fx_b2:
+        db      0
+ls_ep:
+        dw      0
+po_ep:
+        dw      0
+op_start:
+        dw      0
+op_pstart:
+        dw      0
+po_sign:
+        db      0
+cc_save:
+        dw      0
+cc_ep:
+        dw      0
+cc_code:
+        db      0
+jp_cc:
+        db      0
+pp_base:
+        db      0
+id_f:
+        db      0
+alu_idx:
+        db      0
+a16_code:
+        db      0
+cb_base:
+        db      0
+cb_bitn:
+        db      0
+db_quote:
+        db      0
+pd_cnt:
+        db      0
+; operand blocks: type, val (2), aux, ixy - 5 bytes each,
+; in this order (the latch routines copy them as a block).
+co_type:
+        db      0
+co_val:
+        dw      0
+co_aux:
+        db      0
+co_ixy:
+        db      0
+op1_type:
+        db      0
+op1_val:
+        dw      0
+op1_aux:
+        db      0
+op1_ixy:
+        db      0
+op2_type:
+        db      0
+op2_val:
+        dw      0
+op2_aux:
+        db      0
+op2_ixy:
+        db      0
+
+; scratch buffers (written before they are read)
+ed_namebuf:
+        ds      10
+tok_buf:
+        ds      17
+tok1_buf:
+        ds      17
+tok2_buf:
+        ds      17
+num_buf:
+        ds      10
+ed_linebuf:
+        ds      96
+ed_scratch:
+        ds      96
+asm_linebuf:
+        ds      96

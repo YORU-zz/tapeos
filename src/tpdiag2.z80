@@ -1,0 +1,234 @@
+; tpdiag2.z80 - M3 diagnostic #2: replicate i_tinf (TapeOS tape
+; reader) standalone and record stage markers in RAM:
+;   0xE2FE: failed stage (1=skip1s 2=skip0 3=skip1 4=readblk)
+;   0xE2FF: progress (0x11 skip1s ok, 0x22 skip0 ok,
+;           0x33 skip1 ok, 0x44 all ok, 0xEE error)
+;   0xE300..: first 64 raw bits read (one byte per bit)
+;   0xE340..: the 34-byte info block as read
+
+        org     02000h
+
+start:
+        di
+        ld      sp, 0e000h
+        ld      hl, sig_text
+        ld      de, 0e100h
+        ld      bc, sig_end - sig_text
+        ldir
+
+        ; record the first 64 raw bits after PLAY
+        ld      a, 2
+        call    tp_ctrl                 ; PLAY
+        ld      hl, 0e300h
+        ld      b, 64
+raw_l:
+        push    bc
+        push    hl
+        call    tp_rdbit
+        pop     hl
+        pop     bc
+        ld      (hl), a
+        inc     hl
+        jr      c, raw_done
+        djnz    raw_l
+raw_done:
+        ld      a, 1
+        call    tp_ctrl                 ; STOP
+
+        ; full info-block read (i_tinf replica)
+        ld      a, 2
+        call    tp_ctrl                 ; PLAY (resumes)
+        call    tp_skip1s
+        jr      c, fail1
+        ld      a, 011h
+        ld      (0e2ffh), a
+        ld      d, 39
+        call    tp_skip0
+        jr      c, fail2
+        ld      a, 022h
+        ld      (0e2ffh), a
+        ld      d, 41
+        call    tp_skip1
+        jr      c, fail3
+        ld      a, 033h
+        ld      (0e2ffh), a
+        ld      hl, 0e340h
+        ld      de, 34
+        call    tp_readblk
+        jr      c, fail4
+        ld      a, 044h
+        ld      (0e2ffh), a
+        ld      a, 1
+        call    tp_ctrl                 ; STOP
+done:
+        jr      done
+
+fail1:
+        ld      a, 1
+        jr      fail
+fail2:
+        ld      a, 2
+        jr      fail
+fail3:
+        ld      a, 3
+        jr      fail
+fail4:
+        ld      a, 4
+fail:
+        ld      (0e2feh), a
+        ld      a, 0eeh
+        ld      (0e2ffh), a
+        ld      a, 1
+        call    tp_ctrl
+        jr      done
+
+; ---- deck control: IPL MT_CTRL replica ----
+tp_waitwr:
+        ld      bc, 01a01h
+tpw_w:
+        in      a, (c)
+        and     040h
+        jr      nz, tpw_w
+        ret
+
+tp_ctrl:
+        push    af
+        ei
+        call    tp_waitwr
+        ld      bc, 01900h
+        ld      a, 0e9h
+        out     (c), a
+        call    tp_waitwr
+        di
+        call    tp_waitwr
+        ld      bc, 01900h
+        pop     af
+        out     (c), a
+        ret
+
+; ---- reader: verbatim copy of the TapeOS routines ----
+tp_edge:
+tpe_wl:
+        in      a, (c)
+        and     002h
+        jr      z, tpe_wr
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, tpe_wl
+        scf
+        ret
+tpe_wr:
+        in      a, (c)
+        and     002h
+        jr      nz, tpe_ok
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, tpe_wr
+        scf
+        ret
+tpe_ok:
+        or      a
+        ret
+
+tp_rdbit:
+        ld      bc, 01a01h
+        ld      hl, 0
+        call    tp_edge
+        ret     c
+        ld      a, 40
+tprd_d:
+        dec     a
+        jr      nz, tprd_d
+        in      a, (c)
+        and     002h
+        jr      nz, tprd_1
+        xor     a
+        ret
+tprd_1:
+        ld      a, 1
+        ret
+
+tp_rdbyte:
+        call    tp_rdbit
+        ret     c
+        or      a
+        jr      nz, tprb_go
+        scf
+        ret
+tprb_go:
+        xor     a
+        ld      (tp_byte), a
+        ld      b, 8
+tprb_l:
+        ld      a, (tp_byte)
+        add     a, a
+        ld      (tp_byte), a
+        push    bc
+        call    tp_rdbit
+        pop     bc
+        ret     c
+        ld      c, a
+        ld      a, (tp_byte)
+        or      c
+        ld      (tp_byte), a
+        djnz    tprb_l
+        ld      a, (tp_byte)
+        and     a
+        ret
+
+tp_skip1s:
+        ld      d, 0ffh
+tps1_l:
+        call    tp_rdbit
+        ret     c
+        or      a
+        jr      z, tp_skip1s
+        dec     d
+        jr      nz, tps1_l
+tps1_r:
+        call    tp_rdbit
+        ret     c
+        or      a
+        jr      nz, tps1_r
+        ret
+
+tp_skip0:
+        call    tp_rdbit
+        ret     c
+        or      a
+        jr      nz, tps_err
+        dec     d
+        jr      nz, tp_skip0
+        ret
+tp_skip1:
+        call    tp_rdbit
+        ret     c
+        or      a
+        jr      z, tps_err
+        dec     d
+        jr      nz, tp_skip1
+        ret
+tps_err:
+        scf
+        ret
+
+tp_readblk:
+        call    tp_rdbyte
+        ret     c
+        ld      (hl), a
+        inc     hl
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, tp_readblk
+        and     a
+        ret
+
+tp_byte:
+        db      0
+
+sig_text:
+        db      "TAPEOS-TPDIAG2"
+sig_end:

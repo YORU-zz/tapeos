@@ -1,0 +1,23 @@
+NOTICE — クレジットとライセンス
+
+TapeOS（本リポジトリのソースコード、ツール、ドキュメント）
+  Copyright (c) 2026 asa2yoru
+  MIT License（LICENSE ファイル参照）
+
+フォントデータ（images/font.d88 内の漢字グリフ）
+  美咲フォント（Misaki Font） by 門真 なむ（Num Kadoma）氏
+  Copyright (C) 2002-2021 Num Kadoma
+  グリフデータは美咲フォント BDF から tools/mkfont.py で変換したもの。
+  フォント自体のライセンス条件は同梱の misaki.txt に従います。
+
+謝辞
+  TapeOS は、カクヨム連載小説『還暦間際のオッサンが8Bit時代に戻って
+  不完全燃焼をやり直す話』（辺根除音 氏）に登場する架空の OS
+  「OUROBO/ROS」の前身「TapeOS」を、実在のレトロ PC 上に再現する
+  プロジェクトの成果物です。原作小説の著作権は原作者に帰属します。
+  本リポジトリに小説本文は含まれていません。
+
+  実行環境として、Yui 氏の xmil（libretro コア）に当プロジェクトの
+  パッチを適用した版（YORU-zz/xmil-libretro）と、meister68k 氏の
+  X1 互換 IPL ROM（CC0）を利用します。各々のライセンスは配布元の
+  リポジトリを参照してください。

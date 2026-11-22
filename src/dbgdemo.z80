@@ -1,0 +1,36 @@
+; dbgdemo.z80 - target program for the resident debug stub
+; (see ../dbg-stub.md). Loaded at 08000h by the shell's R
+; command. Layout is fixed by construction:
+;   08000h bpfunc - the breakpoint target (writes 0A5h to
+;                   09002h on every call)
+;   08006h start  - writes the signature "DBG-TGT-RUN" to
+;                   0E700h, zeroes the counter at 09000h,
+;                   then loops forever: load counter from
+;                   09000h, increment, store back, call
+;                   bpfunc, delay ~0.85 ms (~1170 counts/s).
+; The counter lives in memory on purpose: a post-mortem
+; deposit with the stub's M command then genuinely
+; redirects the count, which is how the verification gate
+; proves the deposit reached the running target.
+        org     08000h
+bpfunc:
+        ld      a, 0a5h
+        ld      (09002h), a
+        ret
+start:
+        ld      hl, sigtxt
+        ld      de, 0e700h
+        ld      bc, 11
+        ldir
+        ld      hl, 0
+        ld      (09000h), hl
+loop:
+        ld      hl, (09000h)
+        inc     hl
+        ld      (09000h), hl
+        call    bpfunc
+        ld      b, 250
+dly:    djnz    dly
+        jr      loop
+sigtxt:
+        db      "DBG-TGT-RUN"

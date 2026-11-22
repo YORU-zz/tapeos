@@ -1,0 +1,26 @@
+; ---------------------------------------------------------------
+; extdemo.z80 - tiny resident-image demo for the extended
+; IOCS (ep.31). Loaded at 0x8000 from FD (R EXTDEMO), stored
+; into the memory pool with N S, and run by name with N R.
+; Prints a line through PRTMSG and writes its signature at
+; 0xE620 so the gate can prove it really ran. Under one
+; pool block (256 bytes), so it occupies a single block.
+; ---------------------------------------------------------------
+
+C_PRTMSG        equ     0e409h          ; IOCS 3 PRTMSG
+
+        org     08000h
+
+start:
+        ld      hl, msg
+        call    C_PRTMSG
+        ld      hl, sig
+        ld      de, 0e620h
+        ld      bc, 8
+        ldir
+        ret
+
+msg:
+        db      "EXTDEMO RUNS", 13, 10, 0
+sig:
+        db      "EXT-RAN!"

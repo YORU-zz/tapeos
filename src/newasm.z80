@@ -1,0 +1,3845 @@
+; newasm.z80 - NEWASM: a from-scratch Z80 assembler for TapeOS
+; OUROBO/ROS reproduction project (P2)
+;
+; In the fiction (ep. 22/26), the protagonist, wanting to
+; escape EDAS, wrote a brand-new assembler whose distinguishing
+; feature is that it outputs relocation information. In the
+; original he wrote it in WICS; this environment has no WICS,
+; so - like every other TapeOS tool here - it is written in
+; Z80 assembly and built with pasmo on the host, then run on
+; the machine as an ordinary TOSD program file ("NEWASM",
+; loaded to 04000h, started with G 4000; RET returns to the
+; shell).
+;
+; NEWASM is an independent implementation, written from the
+; TOSD / TOSR format specifications (see ../../reloc-plan.md).
+; It shares with EDAS only the external contracts: the source
+; language (the EDAS subset documented in the TapeOS README,
+; M6), the TOSD directory format, and the TOSR v1 file format.
+; Its internal architecture deliberately differs from EDAS:
+;
+;   - Assembler only (no editor). It prompts for a source
+;     file name and an output file name on the FD.
+;   - The source file is STREAMED from disk, sector by
+;     sector, once per pass. There is no 4 KB source-text
+;     buffer, so the source size limit is the file size,
+;     not a RAM window (EDAS holds the text in 4 KB RAM).
+;   - The symbol table is a singly-linked list of
+;     variable-length entries in a bump-allocated arena
+;     (EDAS uses a fixed 128 x 16-byte array).
+;   - Pass 1 is repeated over the whole file until the
+;     symbol table stops changing (max 8 scans), so EQU
+;     chains and forward references in DS/ORG settle by
+;     convergence instead of a special-cased inner loop.
+;   - Relocation marks are NOT computed during emission.
+;     Pass 2 appends the body offset of every relocated
+;     high byte to a FIXUP LIST; the TOSR bitmap is built
+;     from that list when the image is composed. (The
+;     reloc plan, section 3.2, explicitly leaves the
+;     assembler's internal representation free - offset
+;     list inside, bitmap in the file.)
+;   - Expressions are evaluated by a recursive-descent
+;     evaluator that returns (value, origin-coefficient)
+;     pairs: labels and $ carry coefficient 1, constants 0,
+;     + is XOR, - is AND-NOT, unary - is 0. A 16-bit
+;     operand emitted with coefficient 1 is what lands in
+;     the fixup list.
+;
+; Source language = the EDAS subset: labels with optional
+; colon, ; comments, ORG/EQU/DB/DW/DS/END, numbers in
+; decimal / H-suffix hex / 0x hex / B-suffix binary, 'c'
+; character literals, $ for the current PC, expressions
+; of terms joined by + and -. Plus the RELOC directive
+; (must head the source; optional operand = heap blocks)
+; selecting TOSR output, with the same semantics as the
+; stage-2 EDAS extension: ORG gives the file origin, user
+; code is assembled at origin+109, the stage-1 self-
+; relocation stub is prepended, entry offset is 109, the
+; trailer flags are 06h and the TOSD load address records
+; the origin.
+;
+; Documented limitations (this implementation):
+;   - FD only (drive 0). EDAS's RAMDISK drive selection
+;     is not carried over.
+;   - No IXH/IXL/IYH/IYL or undocumented opcodes, no
+;     macros or conditional assembly, no * or / in
+;     expressions (same expression limits as EDAS).
+;   - (IX+d) displacements are numeric literals only
+;     (same as EDAS).
+;   - Source lines up to 159 characters; symbol names up
+;     to 16 characters.
+;
+; Memory map:
+;   04000h..        this program (code + strings + vars)
+;   06800h          NDIRBUF: TOSD directory sector (256 B)
+;   06900h          NSECBUF: source sector buffer (256 B)
+;   06c00h..07bffh  symbol arena (bump allocated)
+;   07c00h..07fffh  fixup list (up to 1024 LE16 entries)
+;   output staging is the target memory itself, guarded
+;   to [08000h, OUTMAX) exactly as in EDAS.
+
+; ---- IOCS table (3 bytes per entry) ----
+; The one machine-dependent constant, as in EDAS: the
+; table sits at 0e400h on X1 and PC-8801, 0c400h on MZ.
+        IF      DEFINED NEWASM_MZ
+IOCS_BASE       equ     0c400h
+        ELSE
+IOCS_BASE       equ     0e400h
+        ENDIF
+C_CONOUT        equ     IOCS_BASE + 3 * 2
+C_PRTMSG        equ     IOCS_BASE + 3 * 3
+C_CRLF          equ     IOCS_BASE + 3 * 4
+C_GETLIN        equ     IOCS_BASE + 3 * 5
+C_DREAD         equ     IOCS_BASE + 3 * 15
+C_DWRITE        equ     IOCS_BASE + 3 * 16
+
+; ---- fixed work areas (RAM only, not part of the binary) ----
+NDIRBUF         equ     06800h          ; TOSD directory sector
+NSECBUF         equ     06900h          ; source sector buffer
+ARENA           equ     06c00h          ; symbol arena base
+ARENA_END       equ     07c00h          ; symbol arena limit
+FIXB            equ     07c00h          ; fixup list base
+FIXEND          equ     08000h          ; fixup list limit
+
+OUTMIN          equ     08000h          ; emit guard: low
+        IF      DEFINED NEWASM_PC88
+OUTMAX          equ     0c000h          ; emit guard: high (excl)
+        ELSE
+        IF      DEFINED NEWASM_MZ
+OUTMAX          equ     0d000h          ; emit guard: high (excl)
+        ELSE
+OUTMAX          equ     0e000h          ; emit guard: high (excl)
+        ENDIF
+        ENDIF
+ORGDEF          equ     08000h          ; default ORG / origin
+STUB_LEN        equ     109             ; TOSR stub length
+DIRREC          equ     32              ; FD directory record
+FDMAXREC        equ     1280            ; FD records (320 KB)
+FDDATA0         equ     48              ; FD data from record 48
+MAXLINE         equ     159             ; max source line length
+MAXNAME         equ     16              ; max symbol name length
+
+; operand types produced by parse_operand (descriptor:
+; +0 type, +1 code, +2..3 value, +4 attr, +5 disp)
+OT_NONE         equ     0
+OT_R8           equ     1               ; 8-bit reg, (HL) = 6
+OT_RR           equ     2               ; BC/DE/HL/SP = 0/1/2/3
+OT_RR2          equ     3               ; AF (push/pop) = 3
+OT_IMM          equ     4               ; expression value
+OT_IND          equ     5               ; (expression)
+OT_IBC          equ     6               ; (BC)
+OT_IDE          equ     7               ; (DE)
+OT_ISP          equ     8               ; (SP)
+OT_IX           equ     9               ; IX itself
+OT_IY           equ     10              ; IY itself
+OT_IXD          equ     11              ; (IX+d) / (IY+d)
+OT_IC           equ     12              ; (C)
+OT_I            equ     13              ; I register
+OT_R            equ     14              ; R register
+
+        org     04000h
+
+; ---------------------------------------------------------------
+; Entry. The shell's G command calls here; RET returns.
+; ---------------------------------------------------------------
+na_start:
+        ld      (na_sp), sp             ; for error recovery
+        ld      hl, msg_banner
+        call    C_PRTMSG
+        ld      hl, msg_srcp
+        call    C_PRTMSG
+        ld      hl, linebuf
+        ld      b, 80
+        call    C_GETLIN
+        or      a
+        ret     z                       ; empty: back to shell
+        ld      hl, linebuf
+        ld      de, name_src
+        call    name_copy
+        ld      hl, msg_outp
+        call    C_PRTMSG
+        ld      hl, linebuf
+        ld      b, 80
+        call    C_GETLIN
+        ld      (out_flag), a           ; 0 = assemble only
+        or      a
+        jr      z, na_go
+        ld      hl, linebuf
+        ld      de, name_out
+        call    name_copy
+na_go:
+        call    assemble
+        ld      hl, msg_ok
+        call    C_PRTMSG
+        ret
+
+; name_copy: copy the GETLIN input at HL into the 11-byte
+; name field at DE: upper-case, truncate to 10 chars,
+; pad with spaces, NUL after char 10.
+name_copy:
+        ld      b, 10
+nc_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, nc_pad
+        cp      'a'
+        jr      c, nc_st
+        cp      'z' + 1
+        jr      nc, nc_st
+        sub     020h
+nc_st:
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    nc_lp
+        jr      nc_dn
+nc_pad:
+        ld      a, ' '
+nc_pl:
+        ld      (de), a
+        inc     de
+        djnz    nc_pl
+nc_dn:
+        xor     a
+        ld      (de), a
+        ret
+
+; ---------------------------------------------------------------
+; Error exit: print "ERR LINE n: msg" and return to shell.
+; Enter with HL = message. Never returns.
+; ---------------------------------------------------------------
+err_exit:
+        ld      (err_msg), hl
+        ld      hl, msg_err
+        call    C_PRTMSG
+        ld      hl, (lineno)
+        call    prt_dec
+        ld      a, ':'
+        call    C_CONOUT
+        ld      a, ' '
+        call    C_CONOUT
+        ld      hl, (err_msg)
+        call    C_PRTMSG
+        call    C_CRLF
+        ld      sp, (na_sp)
+        ret
+
+; prt_dec: print HL as unsigned decimal via CONOUT.
+prt_dec:
+        xor     a
+        ld      (pd_lead), a
+        ld      de, 10000
+        call    pd_dig
+        ld      de, 1000
+        call    pd_dig
+        ld      de, 100
+        call    pd_dig
+        ld      de, 10
+        call    pd_dig
+        ld      a, l
+        add     a, '0'
+        jp      C_CONOUT
+pd_dig:
+        ld      c, 0                    ; digit count
+pd_lp:
+        ld      a, h
+        cp      d
+        jr      c, pd_lt
+        jr      nz, pd_sub
+        ld      a, l
+        cp      e
+        jr      c, pd_lt
+pd_sub:
+        or      a
+        sbc     hl, de
+        inc     c
+        jr      pd_lp
+pd_lt:
+        ld      a, c
+        or      a
+        jr      nz, pd_out
+        ld      a, (pd_lead)            ; suppress leading 0
+        or      a
+        ret     z
+        ld      c, 0
+pd_out:
+        ld      a, 1
+        ld      (pd_lead), a
+        ld      a, c
+        add     a, '0'
+        jp      C_CONOUT
+
+; ---------------------------------------------------------------
+; TOSD file layer (FD only). Format per reloc-plan section
+; 2.3: directory sector at record 32, entries of 16 bytes
+; from +16 (name 10 space-padded, +10 start record LE16,
+; +12 size LE16, +14 load address LE16), +6 = next free
+; record. Data records are contiguous from record 48.
+; ---------------------------------------------------------------
+
+; dir_load: NDIRBUF <- directory; errors if no TOSD magic.
+dir_load:
+        ld      de, DIRREC
+        ld      hl, NDIRBUF
+        call    C_DREAD
+        jr      c, dl_bad
+        ld      hl, NDIRBUF
+        ld      a, (hl)
+        cp      'T'
+        jr      nz, dl_bad
+        inc     hl
+        ld      a, (hl)
+        cp      'O'
+        jr      nz, dl_bad
+        inc     hl
+        ld      a, (hl)
+        cp      'S'
+        jr      nz, dl_bad
+        inc     hl
+        ld      a, (hl)
+        cp      'D'
+        ret     z
+dl_bad:
+        ld      hl, msg_notosd
+        jp      err_exit
+
+; dir_save: NDIRBUF -> directory record.
+dir_save:
+        ld      de, DIRREC
+        ld      hl, NDIRBUF
+        jp      C_DWRITE
+
+; find_entry: name at (find_name) vs directory entries.
+;   -> HL = entry address, carry clear; or carry set.
+find_entry:
+        ld      hl, NDIRBUF + 16
+        ld      b, 15
+fe_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, fe_next
+        push    hl
+        push    bc
+        ld      de, (find_name)
+        ld      b, 10
+fe_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, fe_dif
+        inc     hl
+        inc     de
+        djnz    fe_cmp
+        pop     bc
+        pop     hl
+        or      a
+        ret
+fe_dif:
+        pop     bc
+        pop     hl
+fe_next:
+        ld      de, 16
+        add     hl, de
+        djnz    fe_lp
+        scf
+        ret
+
+; find_free: -> HL = first free entry, or carry set.
+find_free:
+        ld      hl, NDIRBUF + 16
+        ld      b, 15
+ff_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, ff_ok
+        ld      de, 16
+        add     hl, de
+        djnz    ff_lp
+        scf
+        ret
+ff_ok:
+        or      a
+        ret
+
+; save_file: write (sv_len) bytes from (sv_addr) to the
+; file named (find_name), recording load address (sv_load).
+; Reuses an existing entry when the new image fits the old
+; record count, else frees it and appends at next-free
+; (the shell/EDAS allocation policy).
+save_file:
+        call    dir_load
+        ; records needed = ceil(len / 256)
+        ld      hl, (sv_len)
+        ld      de, 255
+        add     hl, de
+        ld      l, h
+        ld      h, 0                    ; HL = records needed
+        ld      (sv_need), hl
+        ld      hl, name_out
+        ld      (find_name), hl
+        call    find_entry
+        jr      c, sv_new
+        ; existing entry: HL = entry; reuse if it fits
+        ld      (sv_entry), hl
+        ld      de, 12
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = old size
+        ld      hl, 255
+        add     hl, de
+        ld      l, h
+        ld      h, 0                    ; HL = old record count
+        ld      de, (sv_need)
+        or      a
+        sbc     hl, de
+        jr      c, sv_grow              ; old < needed: append
+        ld      hl, (sv_entry)
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (sv_rec), de            ; reuse old start
+        jr      sv_write
+sv_grow:
+        ld      hl, (sv_entry)
+        ld      (hl), 0                 ; free the old entry
+        call    find_free
+        jp      c, sv_dirfull
+        ld      (sv_entry), hl
+        jp      sv_alloc
+sv_new:
+        call    find_free
+        jp      c, sv_dirfull
+        ld      (sv_entry), hl
+sv_alloc:
+        ld      hl, (NDIRBUF + 6)       ; next free record
+        ld      (sv_rec), hl
+        ld      de, (sv_need)
+        add     hl, de
+        ld      de, FDMAXREC
+        or      a
+        sbc     hl, de
+        jp      nc, sv_diskfull         ; beyond the medium
+        ld      hl, (sv_rec)
+        ld      de, (sv_need)
+        add     hl, de
+        ld      (NDIRBUF + 6), hl       ; advance next-free
+sv_write:
+        ; write the data records from memory
+        ld      hl, (sv_addr)
+        ld      (sv_ptr), hl
+        ld      de, (sv_rec)
+        ld      (sv_cur), de
+        ld      hl, (sv_need)
+        ld      (sv_left), hl
+sv_wlp:
+        ld      hl, (sv_left)
+        ld      a, h
+        or      l
+        jr      z, sv_filled
+        ld      de, (sv_cur)
+        ld      hl, (sv_ptr)
+        call    C_DWRITE
+        jp      c, sv_ioerr
+        ld      hl, (sv_ptr)
+        ld      de, 256
+        add     hl, de
+        ld      (sv_ptr), hl
+        ld      hl, (sv_cur)
+        inc     hl
+        ld      (sv_cur), hl
+        ld      hl, (sv_left)
+        dec     hl
+        ld      (sv_left), hl
+        jr      sv_wlp
+sv_filled:
+        ; fill the entry: name, start, size, load address
+        ld      hl, (sv_entry)
+        push    hl
+        ld      de, name_out
+        ld      b, 10
+sv_nm:
+        ld      a, (de)
+        ld      (hl), a
+        inc     hl
+        inc     de
+        djnz    sv_nm
+        ld      de, (sv_rec)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (sv_len)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (sv_load)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        pop     hl
+        call    dir_save
+        jp      c, sv_ioerr
+        ; force the D88 driver to flush the directory track
+        ; (same trick as the shell's W: read record 0)
+        ld      de, 0
+        ld      hl, NSECBUF
+        call    C_DREAD
+        ret
+sv_dirfull:
+        ld      hl, msg_diskfull
+        jp      err_exit
+sv_diskfull:
+        ld      hl, msg_diskfull
+        jp      err_exit
+sv_ioerr:
+        ld      hl, msg_ioerr
+        jp      err_exit
+
+; ---------------------------------------------------------------
+; Source stream: reads the source file sector by sector.
+; State: src_rec (next record to fetch), sec_ptr/sec_left
+; (bytes left in NSECBUF), file_left (bytes left overall).
+; ---------------------------------------------------------------
+
+; src_open: (re)initialise the stream from the saved entry
+; info (src_start, src_size).
+src_open:
+        ld      hl, (src_start)
+        ld      (src_rec), hl
+        ld      hl, (src_size)
+        ld      (file_left), hl
+        ld      hl, 0
+        ld      (sec_left), hl
+        ret
+
+; rd_char: -> A = next char; carry set at end of file.
+rd_char:
+        ld      hl, (file_left)
+        ld      a, h
+        or      l
+        jr      z, rc_eof
+        ld      hl, (sec_left)
+        ld      a, h
+        or      l
+        jr      nz, rc_have
+        ; refill the sector buffer
+        ld      de, (src_rec)
+        ld      hl, NSECBUF
+        call    C_DREAD
+        jr      c, rc_eof               ; read error: as EOF
+        ld      hl, (src_rec)
+        inc     hl
+        ld      (src_rec), hl
+        ld      hl, NSECBUF
+        ld      (sec_ptr), hl
+        ld      hl, (file_left)
+        ld      de, 256
+        or      a
+        sbc     hl, de
+        jr      nc, rc_full             ; >= 256 left: full
+        ld      hl, (file_left)
+        ld      (sec_left), hl
+        jr      rc_have
+rc_full:
+        ld      hl, 256
+        ld      (sec_left), hl
+rc_have:
+        ld      hl, (file_left)
+        dec     hl
+        ld      (file_left), hl
+        ld      hl, (sec_left)
+        dec     hl
+        ld      (sec_left), hl
+        ld      hl, (sec_ptr)
+        ld      a, (hl)
+        inc     hl
+        ld      (sec_ptr), hl
+        or      a                       ; clear carry
+        ret
+rc_eof:
+        scf
+        ret
+
+; rd_line: read one line into linebuf (LF-terminated,
+; CR stripped, NUL-terminated). Sets line_len. Carry set
+; if the file ended before any character of a new line.
+rd_line:
+        ld      hl, linebuf
+        ld      (rl_ptr), hl
+        ld      a, 0
+        ld      (rl_len), a
+        ld      (rl_any), a
+rl_lp:
+        call    rd_char
+        jr      c, rl_eof
+        cp      00ah                    ; LF ends the line
+        jr      z, rl_done
+        ld      c, a                    ; C = the character
+        ld      a, 1
+        ld      (rl_any), a
+        ld      a, (rl_len)
+        cp      MAXLINE
+        jr      nc, rl_long
+        inc     a
+        ld      (rl_len), a
+        ld      hl, (rl_ptr)
+        ld      (hl), c
+        inc     hl
+        ld      (rl_ptr), hl
+        jr      rl_lp
+rl_eof:
+        ld      a, (rl_any)
+        or      a
+        jr      z, rl_none
+rl_done:
+        ; strip a trailing CR, NUL-terminate
+        ld      hl, (rl_ptr)
+        ld      (hl), 0
+        ld      a, (rl_len)
+        or      a
+        jr      z, rl_ok
+        ld      hl, linebuf
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        dec     hl
+        ld      a, (hl)
+        cp      00dh
+        jr      nz, rl_ok
+        ld      (hl), 0
+rl_ok:
+        or      a
+        ret
+rl_none:
+        scf
+        ret
+rl_long:
+        ld      hl, msg_longline
+        jp      err_exit
+
+; ---------------------------------------------------------------
+; Symbol table: singly-linked list of variable-length
+; entries in a bump-allocated arena.
+;   entry: +0 link (LE16, 0 = end), +2 value (LE16),
+;          +4 attr (origin coefficient 0/1),
+;          +5 flags (bit0 defined, bit1 defined this scan),
+;          +6 name (NUL-terminated, upper-cased)
+; ---------------------------------------------------------------
+
+; sym_lookup: tokbuf -> HL = entry, carry clear; or carry
+; set when absent. Does not create.
+sym_lookup:
+        ld      hl, (sym_head)
+sl_lp:
+        ld      a, h
+        or      l
+        jr      z, sl_none
+        push    hl
+        ld      de, 6
+        add     hl, de                  ; HL -> stored name
+        ld      de, tokbuf
+sl_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, sl_dif
+        or      a
+        jr      z, sl_hit
+        inc     hl
+        inc     de
+        jr      sl_cmp
+sl_hit:
+        pop     hl
+        or      a
+        ret
+sl_dif:
+        pop     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl                  ; HL = link
+        jr      sl_lp
+sl_none:
+        scf
+        ret
+
+; sym_create: create an undefined entry for tokbuf.
+;   -> HL = entry.
+sym_create:
+        ld      hl, (arena_ptr)
+        push    hl                      ; entry address
+        ld      de, (sym_head)
+        ld      (hl), e                 ; link = old head
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        xor     a
+        ld      (hl), a                 ; value = 0
+        inc     hl
+        ld      (hl), a
+        inc     hl
+        ld      (hl), a                 ; attr = 0
+        inc     hl
+        ld      (hl), a                 ; flags = 0
+        inc     hl
+        ld      de, tokbuf              ; copy the name
+sc_cp:
+        ld      a, (de)
+        ld      (hl), a
+        inc     hl
+        inc     de
+        or      a
+        jr      nz, sc_cp
+        ; HL = new arena pointer; check the limit
+        ld      (arena_ptr), hl
+        ld      de, ARENA_END
+        or      a
+        sbc     hl, de
+        jr      nc, sc_full
+        pop     hl                      ; HL = entry
+        ld      (sym_head), hl          ; push onto the list
+        ret
+sc_full:
+        ld      hl, msg_symfull
+        jp      err_exit
+
+; sym_find: lookup or create. -> HL = entry.
+sym_find:
+        call    sym_lookup
+        ret     nc
+        jp      sym_create
+
+; sym_define: define tokbuf = HL value, A attr, in the
+; current pass-1 scan. Duplicate definition within one
+; scan is an error; a changed value/attr sets (changed).
+sym_define:
+        ld      (sd_val), hl
+        ld      (sd_attr), a
+        call    sym_find                ; HL = entry
+        ld      a, (hl)                 ; (walk to flags)
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl                      ; HL -> flags (+5)
+        ld      a, (hl)
+        and     002h
+        jr      nz, sd_dup
+        ld      a, (hl)
+        or      003h                    ; defined + this scan
+        ld      (hl), a
+        dec     hl                      ; -> attr (+4)
+        ld      a, (sd_attr)
+        cp      (hl)
+        jr      z, sd_v
+        ld      (hl), a
+        ld      a, 1
+        ld      (changed), a
+sd_v:
+        dec     hl                      ; -> value high (+3)
+        ld      de, (sd_val)
+        ld      a, (hl)
+        cp      d
+        jr      z, sd_vl
+        ld      (hl), d
+        ld      a, 1
+        ld      (changed), a
+sd_vl:
+        dec     hl                      ; -> value low (+2)
+        ld      a, (hl)
+        cp      e
+        ret     z
+        ld      (hl), e
+        ld      a, 1
+        ld      (changed), a
+        ret
+sd_dup:
+        ld      hl, msg_duplabel
+        jp      err_exit
+
+; sym_clear_scan: clear the "defined this scan" bit of
+; every entry (start of a pass-1 scan).
+sym_clear_scan:
+        ld      hl, (sym_head)
+scs_lp:
+        ld      a, h
+        or      l
+        ret     z
+        push    hl
+        ld      de, 5
+        add     hl, de
+        ld      a, (hl)
+        and     001h                    ; keep "defined"
+        ld      (hl), a
+        pop     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        jr      scs_lp
+
+; ---------------------------------------------------------------
+; Line cursor helpers. The cursor (lptr) walks linebuf.
+; ---------------------------------------------------------------
+
+; peekch: -> A = current char (no advance).
+peekch:
+        ld      hl, (lptr)
+        ld      a, (hl)
+        ret
+
+; getch: -> A = current char, advance.
+getch:
+        ld      hl, (lptr)
+        ld      a, (hl)
+        inc     hl
+        ld      (lptr), hl
+        ret
+
+; skipsp: advance past spaces and tabs.
+skipsp:
+        ld      hl, (lptr)
+ss_lp:
+        ld      a, (hl)
+        cp      ' '
+        jr      z, ss_nx
+        cp      009h
+        jr      nz, ss_dn
+ss_nx:
+        inc     hl
+        jr      ss_lp
+ss_dn:
+        ld      (lptr), hl
+        ret
+
+; is_ident_start: A -> carry set if [A-Za-z_].
+is_ident_start:
+        cp      '_'
+        jr      z, ii_yes
+        cp      'A'
+        jr      c, ii_no
+        cp      'Z' + 1
+        jr      c, ii_yes
+        cp      'a'
+        jr      c, ii_no
+        cp      'z' + 1
+        jr      c, ii_yes
+ii_no:
+        or      a
+        ret
+ii_yes:
+        scf
+        ret
+
+; is_ident_char: A -> carry set if [A-Za-z0-9_].
+is_ident_char:
+        cp      '0'
+        jr      c, is_ident_start
+        cp      '9' + 1
+        jr      c, ii_yes
+        jr      is_ident_start
+
+; upcase_a: A = upper-cased A.
+upcase_a:
+        cp      'a'
+        ret     c
+        cp      'z' + 1
+        ret     nc
+        sub     020h
+        ret
+
+; read_ident: read an identifier at the cursor into
+; tokbuf (upper-cased, NUL-terminated, max MAXNAME chars;
+; longer names are truncated). Carry set if the cursor
+; is not at an identifier start.
+read_ident:
+        call    peekch
+        call    is_ident_start
+        jr      nc, ri_no
+        ld      de, tokbuf
+        ld      b, MAXNAME
+ri_lp:
+        call    peekch
+        call    is_ident_char
+        jr      nc, ri_dn
+        call    getch
+        call    upcase_a
+        ld      (de), a
+        inc     de
+        djnz    ri_lp
+        ; swallow the rest of an over-long name
+ri_sw:
+        call    peekch
+        call    is_ident_char
+        jr      nc, ri_dn
+        call    getch
+        jr      ri_sw
+ri_dn:
+        xor     a
+        ld      (de), a
+        or      a
+        ret
+ri_no:
+        scf
+        ret
+
+; tok_eq: compare tokbuf with the NUL-terminated string
+; at HL. -> Z set when equal.
+tok_eq:
+        ld      de, tokbuf
+te_lp:
+        ld      a, (de)
+        cp      (hl)
+        ret     nz
+        or      a
+        ret     z
+        inc     hl
+        inc     de
+        jr      te_lp
+
+; ---------------------------------------------------------------
+; Expression evaluator (recursive descent).
+;   expr := term { ('+'|'-') term }
+;   term := number | 'c' | '$' | ident | '(' expr ')'
+;           | '-' term | '+' term
+; Returns HL = value and (ev_attr) = origin coefficient.
+; Sets (ev_undef) when an undefined symbol was referenced
+; (value 0, attr 0 in that case).
+; ---------------------------------------------------------------
+
+eval_expr:
+        call    eval_term
+ee_lp:
+        push    hl                      ; preserve the value:
+        call    skipsp                  ; skipsp/peekch set
+        call    peekch                  ; HL = (lptr)
+        cp      '+'
+        jr      z, ee_op
+        cp      '-'
+        jr      z, ee_op
+        pop     hl
+        ret
+ee_op:
+        ld      (ee_opc), a
+        call    getch                   ; consume the operator
+        pop     hl                      ; HL = left value
+        push    hl                      ; left value
+        ld      a, (ev_attr)
+        push    af                      ; left attr
+        call    eval_term               ; HL = right, ev_attr
+        pop     af                      ; A = left attr
+        ld      (ee_lattr), a
+        pop     de                      ; DE = left value
+        ld      a, (ee_opc)
+        cp      '+'
+        jr      z, ee_add
+        ; subtract: HL = DE - HL; attr = lattr AND NOT rattr
+        or      a
+        ex      de, hl
+        sbc     hl, de
+        ld      a, (ev_attr)
+        cpl
+        ld      b, a
+        ld      a, (ee_lattr)
+        and     b
+        ld      (ev_attr), a
+        jr      ee_lp
+ee_add:
+        add     hl, de
+        ld      a, (ev_attr)
+        ld      b, a
+        ld      a, (ee_lattr)
+        xor     b
+        ld      (ev_attr), a
+        jr      ee_lp
+
+eval_term:
+        call    skipsp
+        call    peekch
+        cp      '('
+        jr      z, et_par
+        cp      '-'
+        jr      z, et_neg
+        cp      '+'
+        jr      z, et_pos
+        cp      027h                    ; ' -> char literal
+        jr      z, et_chr
+        cp      '$'
+        jr      z, et_pc
+        cp      '0'
+        jr      c, et_id
+        cp      '9' + 1
+        jp      c, et_num
+et_id:
+        call    is_ident_start
+        jp      nc, et_syn
+        call    read_ident
+        call    sym_find                ; HL = entry
+        ld      a, (ev_pass)
+        inc     hl
+        inc     hl                      ; -> value (+2)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = value
+        inc     hl                      ; -> attr (+4)
+        ld      a, (hl)
+        ld      (ev_attr), a
+        inc     hl                      ; -> flags (+5)
+        ld      a, (hl)
+        and     001h
+        jr      nz, et_idok
+        ld      a, 1
+        ld      (ev_undef), a
+        ld      de, 0
+        xor     a
+        ld      (ev_attr), a
+et_idok:
+        ex      de, hl
+        ret
+et_par:
+        call    getch                   ; consume '('
+        call    eval_expr
+        push    hl                      ; preserve the value
+        call    skipsp
+        call    peekch
+        cp      ')'
+        jr      nz, et_syn              ; (err_exit resets SP)
+        call    getch
+        pop     hl
+        ret
+et_neg:
+        call    getch
+        call    eval_term
+        ; HL = -HL, attr = 0
+        xor     a
+        ld      (ev_attr), a
+        ld      a, l
+        cpl
+        ld      l, a
+        ld      a, h
+        cpl
+        ld      h, a
+        inc     hl
+        ret
+et_pos:
+        call    getch
+        jp      eval_term
+et_chr:
+        call    getch                   ; consume '
+        call    getch                   ; the character
+        ld      l, a
+        ld      h, 0
+        xor     a
+        ld      (ev_attr), a
+        push    hl                      ; preserve: peekch/getch
+        call    peekch                  ; set HL = (lptr)
+        cp      027h
+        jr      nz, et_syn              ; (err_exit resets SP)
+        call    getch                   ; closing '
+        pop     hl
+        ret
+et_pc:
+        call    getch
+        ld      hl, (pc)
+        ld      a, 1
+        ld      (ev_attr), a
+        ret
+et_num:
+        call    parse_number            ; -> HL, attr 0
+        xor     a
+        ld      (ev_attr), a
+        ret
+et_syn:
+        ld      hl, msg_syntax
+        jp      err_exit
+
+; parse_number: at the cursor (first char is a digit).
+; Decimal, H-suffix hex (leading digit), 0x hex, B-suffix
+; binary. -> HL = value. Cursor ends after the token.
+parse_number:
+        ld      hl, (lptr)
+        ld      a, (hl)
+        cp      '0'
+        jr      nz, pn_main
+        inc     hl
+        ld      a, (hl)
+        cp      'x'
+        jp      z, pn_0x
+        cp      'X'
+        jp      z, pn_0x
+        dec     hl
+pn_main:
+        ; collect [0-9A-Za-z] into tokbuf
+        ld      de, tokbuf
+        ld      b, 20
+pn_cl:
+        ld      a, (hl)
+        cp      '0'
+        jr      c, pn_ce
+        cp      '9' + 1
+        jr      c, pn_st
+        cp      'A'
+        jr      c, pn_ce
+        cp      'Z' + 1
+        jr      c, pn_st
+        cp      'a'
+        jr      c, pn_ce
+        cp      'z' + 1
+        jr      nc, pn_ce
+pn_st:
+        call    upcase_a
+        ld      (de), a
+        inc     de
+        inc     hl
+        djnz    pn_cl
+pn_ce:
+        xor     a
+        ld      (de), a
+        ld      (lptr), hl
+        ; classify: last char H -> hex; last char B and the
+        ; rest all 0/1 -> binary; all digits -> decimal;
+        ; otherwise, treat as hex is wrong: error.
+        ld      hl, tokbuf
+        ld      c, 0                    ; C = length
+pn_ll:
+        ld      a, (hl)
+        or      a
+        jr      z, pn_ld
+        inc     hl
+        inc     c
+        jr      pn_ll
+pn_ld:
+        dec     hl                      ; HL -> last char
+        ld      a, (hl)
+        cp      'H'
+        jr      z, pn_hex
+        cp      'B'
+        jr      z, pn_maybe_bin
+        ; decimal: every char must be a digit
+        ld      hl, tokbuf
+        ld      de, 0
+pn_dec:
+        ld      a, (hl)
+        or      a
+        jr      z, pn_dv
+        cp      '0'
+        jp      c, pn_bad
+        cp      '9' + 1
+        jp      nc, pn_bad
+        sub     '0'
+        push    hl
+        ex      de, hl
+        add     hl, hl                  ; *2
+        ld      (pn_tmp), hl
+        add     hl, hl                  ; *4
+        add     hl, hl                  ; *8
+        ld      de, (pn_tmp)
+        add     hl, de                  ; *10
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ex      de, hl
+        pop     hl
+        inc     hl
+        jr      pn_dec
+pn_dv:
+        ex      de, hl
+        ret
+pn_maybe_bin:
+        ; all chars before the B must be 0/1
+        ld      hl, tokbuf
+pn_bk:
+        ld      a, (hl)
+        cp      'B'
+        jr      z, pn_bin
+        cp      '0'
+        jr      z, pn_bn
+        cp      '1'
+        jr      nz, pn_bad
+pn_bn:
+        inc     hl
+        jr      pn_bk
+pn_bin:
+        ld      hl, tokbuf
+        ld      de, 0
+pn_bl:
+        ld      a, (hl)
+        cp      'B'
+        jr      z, pn_dv
+        sub     '0'
+        ld      c, a
+        ld      b, 0
+        ex      de, hl
+        add     hl, hl
+        add     hl, bc
+        ex      de, hl
+        inc     hl
+        jr      pn_bl
+pn_hex:
+        ; hex over tokbuf except the trailing H
+        ld      hl, tokbuf
+        ld      de, 0
+pn_hl:
+        ld      a, (hl)
+        cp      'H'
+        jr      z, pn_dv
+        or      a
+        jr      z, pn_dv
+        call    hex_digit
+        jr      c, pn_bad
+        ld      c, a
+        ld      b, 0
+        ex      de, hl                  ; HL = acc, DE = ptr
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; acc *= 16
+        add     hl, bc                  ; acc += digit
+        ex      de, hl                  ; DE = acc, HL = ptr
+        inc     hl
+        jr      pn_hl
+pn_0x:
+        inc     hl                      ; past the x
+        ld      (lptr), hl
+        ld      de, 0
+pn_xl:
+        call    peekch
+        call    hex_digit
+        jr      c, pn_xd
+        ld      c, a                    ; save the digit value:
+        ld      b, 0                    ; getch would reload A
+        call    getch                   ; with the raw character
+        ex      de, hl                  ; HL = acc
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; acc *= 16
+        add     hl, bc                  ; acc += digit
+        ex      de, hl                  ; DE = acc
+        jr      pn_xl
+pn_xd:
+        ex      de, hl
+        ret
+pn_bad:
+        ld      hl, msg_badnum
+        jp      err_exit
+
+; hex_digit: A = char -> A = value 0..15, carry set if
+; not a hex digit.
+hex_digit:
+        cp      '0'
+        jr      c, hd_no
+        cp      '9' + 1
+        jr      c, hd_d
+        call    upcase_a
+        cp      'A'
+        jr      c, hd_no
+        cp      'F' + 1
+        jr      nc, hd_no
+        sub     'A' - 10
+        or      a
+        ret
+hd_d:
+        sub     '0'
+        or      a
+        ret
+hd_no:
+        scf
+        ret
+
+; ---------------------------------------------------------------
+; Emission. (pc) is the current assembly address. In
+; pass 1 nothing is written; (pc) only advances (sizes
+; are value-independent in this instruction set).
+; ---------------------------------------------------------------
+
+; emit8a: emit the byte in A at (pc), advancing (pc) and
+; the high-water mark (hi_pc). Pass 1 only advances.
+emit8a:
+        ld      (em_byte), a
+        ld      a, 1
+        ld      (emitted), a
+        ld      a, (em_byte)
+        ld      hl, (pc)
+        ld      de, OUTMIN
+        or      a
+        sbc     hl, de
+        jr      c, em_range
+        ld      hl, (pc)
+        ld      de, OUTMAX
+        or      a
+        sbc     hl, de
+        jr      nc, em_range
+        ld      a, (ev_pass)
+        cp      2
+        jr      nz, em_adv
+        ld      hl, (pc)
+        ld      a, (em_byte)
+        ld      (hl), a
+em_adv:
+        ld      hl, (pc)
+        inc     hl
+        ld      (pc), hl
+        ld      de, (hi_pc)
+        or      a
+        sbc     hl, de
+        jr      c, em_ok                ; pc < hi_pc: keep
+        ld      hl, (pc)
+        ld      (hi_pc), hl
+em_ok:
+        ret
+em_range:
+        ld      hl, msg_range
+        jp      err_exit
+
+; emit16: emit the word in HL; (em_attr) must hold its
+; origin coefficient. In pass 2 with RELOC on, a
+; coefficient of 1 records a fixup for the high byte.
+emit16:
+        ld      (em_val), hl
+        ld      a, l
+        call    emit8a
+        ld      a, (ev_pass)
+        cp      2
+        jr      nz, em16_hi
+        ld      a, (reloc)
+        or      a
+        jr      z, em16_hi
+        ld      a, (em_attr)
+        or      a
+        jr      z, em16_hi
+        ; fixup offset = address of the high byte - origin
+        ld      hl, (pc)
+        ld      de, (origin)
+        or      a
+        sbc     hl, de
+        ld      (fx_off), hl
+        ld      hl, (fix_ptr)
+        ld      de, FIXEND
+        or      a
+        sbc     hl, de
+        jr      nc, em16_full
+        ld      hl, (fix_ptr)
+        ld      de, (fx_off)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      (fix_ptr), hl
+em16_hi:
+        ld      hl, (em_val)
+        ld      a, h
+        jp      emit8a
+em16_full:
+        ld      hl, msg_fixfull
+        jp      err_exit
+
+; ---------------------------------------------------------------
+; Operand parser. Descriptor block (7 bytes):
+;   +0 type, +1 code, +2..3 value, +4 attr, +5 disp,
+;   +6 prefix (0ddh = IX, 0fdh = IY, else 0)
+; parse_operand takes DE = descriptor address.
+; ---------------------------------------------------------------
+
+; tok_key: -> HL = tokbuf[0] | tokbuf[1]<<8.
+tok_key:
+        ld      hl, tokbuf
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        ret
+
+; reg_lookup: tokbuf -> A = type, (po_code), (po_pfx);
+; carry set when tokbuf is not a register name.
+reg_lookup:
+        call    tok_key
+        ld      (po_key), hl
+        ld      hl, regtab
+rg_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, rg_no                ; terminator key_lo=0
+        ld      de, (po_key)
+        cp      e
+        jr      nz, rg_nx
+        inc     hl
+        ld      a, (hl)
+        cp      d
+        jr      nz, rg_nx0
+        inc     hl                      ; -> type
+        ld      a, (hl)
+        ld      (po_type), a
+        inc     hl
+        ld      a, (hl)
+        ld      (po_code), a
+        inc     hl
+        ld      a, (hl)
+        ld      (po_pfx), a
+        or      a                       ; clear carry
+        ret
+rg_nx:
+        inc     hl
+rg_nx0:
+        ld      de, 4
+        add     hl, de
+        jr      rg_lp
+rg_no:
+        scf
+        ret
+
+regtab:
+        db      'B', 0, OT_R8, 0, 0
+        db      'C', 0, OT_R8, 1, 0
+        db      'D', 0, OT_R8, 2, 0
+        db      'E', 0, OT_R8, 3, 0
+        db      'H', 0, OT_R8, 4, 0
+        db      'L', 0, OT_R8, 5, 0
+        db      'A', 0, OT_R8, 7, 0
+        db      'I', 0, OT_I, 0, 0
+        db      'R', 0, OT_R, 0, 0
+        db      'B', 'C', OT_RR, 0, 0
+        db      'D', 'E', OT_RR, 1, 0
+        db      'H', 'L', OT_RR, 2, 0
+        db      'S', 'P', OT_RR, 3, 0
+        db      'A', 'F', OT_RR2, 3, 0
+        db      'I', 'X', OT_IX, 0, 0ddh
+        db      'I', 'Y', OT_IY, 0, 0fdh
+        db      0
+
+; cond_lookup: tokbuf -> A = condition code 0..7;
+; carry set when not a condition name.
+cond_lookup:
+        call    tok_key
+        ld      (po_key), hl
+        ld      hl, condtab
+cl_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, cl_no
+        ld      de, (po_key)
+        cp      e
+        jr      nz, cl_nx
+        inc     hl
+        ld      a, (hl)
+        cp      d
+        jr      nz, cl_nx0
+        inc     hl
+        ld      a, (hl)
+        or      a
+        ret
+cl_nx:
+        inc     hl
+cl_nx0:
+        ld      de, 2
+        add     hl, de
+        jr      cl_lp
+cl_no:
+        scf
+        ret
+
+condtab:
+        db      'N', 'Z', 0
+        db      'Z', 0, 1
+        db      'N', 'C', 2
+        db      'C', 0, 3
+        db      'P', 'O', 4
+        db      'P', 'E', 5
+        db      'P', 0, 6
+        db      'M', 0, 7
+        db      0
+
+; parse_operand: DE = descriptor. Parses one operand.
+parse_operand:
+        ld      (po_desc), de
+        push    de
+        xor     a
+        ld      b, 7
+po_z:
+        ld      (de), a
+        inc     de
+        djnz    po_z
+        pop     de
+        call    skipsp
+        call    peekch
+        cp      '('
+        jr      z, po_ind
+        call    is_ident_start
+        jr      nc, po_expr
+        ; identifier-led: register or label expression
+        ld      hl, (lptr)
+        ld      (po_save), hl
+        call    read_ident
+        call    skipsp
+        call    peekch
+        cp      ','
+        jr      z, po_regchk
+        or      a
+        jr      z, po_regchk
+        cp      ';'
+        jr      z, po_regchk
+        cp      ')'
+        jr      nz, po_rew
+po_regchk:
+        call    reg_lookup
+        jr      c, po_rew
+        ld      hl, (po_desc)
+        ld      a, (po_type)
+        ld      (hl), a
+        inc     hl
+        ld      a, (po_code)
+        ld      (hl), a
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl                      ; -> +6 prefix
+        ld      a, (po_pfx)
+        ld      (hl), a
+        ret
+po_rew:
+        ld      hl, (po_save)
+        ld      (lptr), hl
+po_expr:
+        call    eval_expr
+        call    chk_undef
+        ld      de, (po_desc)
+        ld      a, OT_IMM
+        ld      (de), a
+        inc     de
+        inc     de                      ; -> value (+2)
+        ex      de, hl                  ; HL -> slot, DE = value
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl                      ; -> attr (+4)
+        ld      a, (ev_attr)
+        ld      (hl), a
+        ret
+
+; chk_undef: in pass 2, an undefined reference is fatal.
+chk_undef:
+        ld      a, (ev_pass)
+        cp      2
+        ret     nz
+        ld      a, (ev_undef)
+        or      a
+        ret     z
+        ld      hl, msg_undef
+        jp      err_exit
+
+; po_ind: parenthesised operand.
+po_ind:
+        call    getch                   ; consume '('
+        call    skipsp
+        call    peekch
+        call    is_ident_start
+        jr      nc, po_ind_expr
+        ld      hl, (lptr)
+        ld      (po_save), hl
+        call    read_ident
+        ; HL / BC / DE / SP / C / IX / IY have own forms
+        ld      hl, nm_hl
+        call    tok_eq
+        jr      z, po_ind_hl
+        ld      hl, nm_bc
+        call    tok_eq
+        jr      z, po_ind_bc
+        ld      hl, nm_de
+        call    tok_eq
+        jr      z, po_ind_de
+        ld      hl, nm_sp
+        call    tok_eq
+        jr      z, po_ind_sp
+        ld      hl, nm_c
+        call    tok_eq
+        jr      z, po_ind_c
+        ld      hl, nm_ix
+        call    tok_eq
+        jr      z, po_ind_ix
+        ld      hl, nm_iy
+        call    tok_eq
+        jr      z, po_ind_iy
+        ; not a register form: rewind, expression
+        ld      hl, (po_save)
+        ld      (lptr), hl
+po_ind_expr:
+        call    eval_expr
+        call    chk_undef
+        ld      de, (po_desc)
+        ld      a, OT_IND
+        ld      (de), a
+        inc     de
+        inc     de
+        ex      de, hl
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      a, (ev_attr)
+        ld      (hl), a
+        jp      po_rparen
+po_ind_hl:
+        ld      de, (po_desc)
+        ld      a, OT_R8
+        ld      (de), a
+        inc     de
+        ld      a, 6
+        ld      (de), a
+        jp      po_rparen
+po_ind_bc:
+        ld      a, OT_IBC
+        jr      po_ind_t
+po_ind_de:
+        ld      a, OT_IDE
+        jr      po_ind_t
+po_ind_sp:
+        ld      a, OT_ISP
+        jr      po_ind_t
+po_ind_c:
+        ld      a, OT_IC
+po_ind_t:
+        ld      de, (po_desc)
+        ld      (de), a
+        jp      po_rparen
+po_ind_ix:
+        ld      a, 0ddh
+        ld      (po_pfx), a
+        jr      po_ind_ixy
+po_ind_iy:
+        ld      a, 0fdh
+        ld      (po_pfx), a
+po_ind_ixy:
+        ; optional signed numeric displacement
+        ld      de, 0                   ; DE = displacement
+        call    skipsp
+        call    peekch
+        cp      ')'
+        jr      z, po_ixd_fill
+        cp      '+'
+        jr      z, po_ixd_num
+        cp      '-'
+        jr      nz, po_syn
+        ; negative: parse number, negate
+        call    getch
+        call    parse_number            ; HL = magnitude
+        ld      a, l
+        cpl
+        ld      l, a
+        ld      a, h
+        cpl
+        ld      h, a
+        inc     hl
+        ex      de, hl
+        jr      po_ixd_fill
+po_ixd_num:
+        call    getch                   ; consume '+'
+        call    skipsp
+        call    parse_number
+        ex      de, hl
+po_ixd_fill:
+        ld      hl, (po_desc)
+        ld      a, OT_IXD
+        ld      (hl), a
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl                      ; -> +5 disp
+        ld      (hl), e
+        inc     hl                      ; -> +6 prefix
+        ld      a, (po_pfx)
+        ld      (hl), a
+        ; fall into po_rparen
+po_rparen:
+        call    skipsp
+        call    peekch
+        cp      ')'
+        jr      nz, po_syn
+        call    getch
+        ret
+po_syn:
+        ld      hl, msg_syntax
+        jp      err_exit
+
+nm_hl:  db      "HL", 0
+nm_bc:  db      "BC", 0
+nm_de:  db      "DE", 0
+nm_sp:  db      "SP", 0
+nm_c:   db      "C", 0
+nm_ix:  db      "IX", 0
+nm_iy:  db      "IY", 0
+
+; expect_comma: skip blanks, require ','.
+expect_comma:
+        call    skipsp
+        call    peekch
+        cp      ','
+        jr      nz, po_syn
+        call    getch
+        ret
+
+; end_of_stmt: after a statement, only blanks, an
+; optional comment and EOL may follow.
+end_of_stmt:
+        call    skipsp
+        call    peekch
+        or      a
+        ret     z
+        cp      ';'
+        ret     z
+        ld      hl, msg_syntax
+        jp      err_exit
+
+; ---------------------------------------------------------------
+; Mnemonic table: {db len, db name, dw handler, db aux}.
+; mn_lookup: tokbuf -> (mn_hdl), (mn_aux); carry set when
+; the token is not a mnemonic/directive.
+; ---------------------------------------------------------------
+mn_lookup:
+        ld      hl, tokbuf
+        ld      c, 0
+ml_len:
+        ld      a, (hl)
+        or      a
+        jr      z, ml_have
+        inc     hl
+        inc     c
+        jr      ml_len
+ml_have:
+        ld      a, c
+        ld      (mn_len), a
+        ld      hl, mntab
+ml_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, ml_no
+        cp      c
+        jr      nz, ml_skip
+        push    hl
+        inc     hl
+        ld      de, tokbuf
+        ld      b, c
+ml_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, ml_dif
+        inc     hl
+        inc     de
+        djnz    ml_cmp
+        ; HL -> handler
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (mn_hdl), de
+        inc     hl
+        ld      a, (hl)
+        ld      (mn_aux), a
+        pop     hl
+        or      a
+        ret
+ml_dif:
+        pop     hl
+ml_skip:
+        ld      e, (hl)                 ; E = name length
+        ld      d, 0
+        inc     hl
+        add     hl, de                  ; past the name
+        ld      de, 3                   ; handler + aux
+        add     hl, de
+        jr      ml_lp
+ml_no:
+        scf
+        ret
+
+mntab:
+        db      3, "NOP"
+        dw      h_fixed
+        db      000h
+        db      4, "HALT"
+        dw      h_fixed
+        db      076h
+        db      2, "DI"
+        dw      h_fixed
+        db      0f3h
+        db      2, "EI"
+        dw      h_fixed
+        db      0fbh
+        db      3, "SCF"
+        dw      h_fixed
+        db      037h
+        db      3, "CCF"
+        dw      h_fixed
+        db      03fh
+        db      3, "CPL"
+        dw      h_fixed
+        db      02fh
+        db      3, "DAA"
+        dw      h_fixed
+        db      027h
+        db      3, "EXX"
+        dw      h_fixed
+        db      0d9h
+        db      4, "RLCA"
+        dw      h_fixed
+        db      007h
+        db      4, "RRCA"
+        dw      h_fixed
+        db      00fh
+        db      3, "RLA"
+        dw      h_fixed
+        db      017h
+        db      3, "RRA"
+        dw      h_fixed
+        db      01fh
+        db      3, "NEG"
+        dw      h_fixed2
+        db      044h
+        db      4, "RETI"
+        dw      h_fixed2
+        db      04dh
+        db      4, "RETN"
+        dw      h_fixed2
+        db      045h
+        db      3, "LDI"
+        dw      h_fixed2
+        db      0a0h
+        db      3, "LDD"
+        dw      h_fixed2
+        db      0a8h
+        db      4, "LDIR"
+        dw      h_fixed2
+        db      0b0h
+        db      4, "LDDR"
+        dw      h_fixed2
+        db      0b8h
+        db      3, "CPI"
+        dw      h_fixed2
+        db      0a1h
+        db      3, "CPD"
+        dw      h_fixed2
+        db      0a9h
+        db      4, "CPIR"
+        dw      h_fixed2
+        db      0b1h
+        db      4, "CPDR"
+        dw      h_fixed2
+        db      0b9h
+        db      3, "RLD"
+        dw      h_fixed2
+        db      06fh
+        db      3, "RRD"
+        dw      h_fixed2
+        db      067h
+        db      3, "INI"
+        dw      h_fixed2
+        db      0a2h
+        db      4, "INIR"
+        dw      h_fixed2
+        db      0b2h
+        db      3, "IND"
+        dw      h_fixed2
+        db      0aah
+        db      4, "INDR"
+        dw      h_fixed2
+        db      0bah
+        db      4, "OUTI"
+        dw      h_fixed2
+        db      0a3h
+        db      4, "OTIR"
+        dw      h_fixed2
+        db      0b3h
+        db      4, "OUTD"
+        dw      h_fixed2
+        db      0abh
+        db      4, "OTDR"
+        dw      h_fixed2
+        db      0bbh
+        db      2, "LD"
+        dw      h_ld
+        db      0
+        db      4, "PUSH"
+        dw      h_pushpop
+        db      0c5h
+        db      3, "POP"
+        dw      h_pushpop
+        db      0c1h
+        db      3, "INC"
+        dw      h_incdec
+        db      0
+        db      3, "DEC"
+        dw      h_incdec
+        db      1
+        db      3, "ADD"
+        dw      h_alu
+        db      0
+        db      3, "ADC"
+        dw      h_alu
+        db      1
+        db      3, "SUB"
+        dw      h_alu
+        db      2
+        db      3, "SBC"
+        dw      h_alu
+        db      3
+        db      3, "AND"
+        dw      h_alu
+        db      4
+        db      3, "XOR"
+        dw      h_alu
+        db      5
+        db      2, "OR"
+        dw      h_alu
+        db      6
+        db      2, "CP"
+        dw      h_alu
+        db      7
+        db      2, "JP"
+        dw      h_jp
+        db      0
+        db      2, "JR"
+        dw      h_jr
+        db      0
+        db      4, "DJNZ"
+        dw      h_djnz
+        db      0
+        db      4, "CALL"
+        dw      h_call
+        db      0
+        db      3, "RET"
+        dw      h_ret
+        db      0
+        db      3, "RST"
+        dw      h_rst
+        db      0
+        db      2, "IM"
+        dw      h_im
+        db      0
+        db      2, "IN"
+        dw      h_in
+        db      0
+        db      3, "OUT"
+        dw      h_out
+        db      0
+        db      2, "EX"
+        dw      h_ex
+        db      0
+        db      3, "RLC"
+        dw      h_cbrot
+        db      000h
+        db      3, "RRC"
+        dw      h_cbrot
+        db      008h
+        db      2, "RL"
+        dw      h_cbrot
+        db      010h
+        db      2, "RR"
+        dw      h_cbrot
+        db      018h
+        db      3, "SLA"
+        dw      h_cbrot
+        db      020h
+        db      3, "SRA"
+        dw      h_cbrot
+        db      028h
+        db      3, "SRL"
+        dw      h_cbrot
+        db      038h
+        db      3, "BIT"
+        dw      h_bit
+        db      040h
+        db      3, "RES"
+        dw      h_bit
+        db      080h
+        db      3, "SET"
+        dw      h_bit
+        db      0c0h
+        db      3, "ORG"
+        dw      h_org
+        db      0
+        db      3, "EQU"
+        dw      h_equ
+        db      0
+        db      2, "DB"
+        dw      h_db
+        db      0
+        db      2, "DW"
+        dw      h_dw
+        db      0
+        db      2, "DS"
+        dw      h_ds
+        db      0
+        db      3, "END"
+        dw      h_end
+        db      0
+        db      5, "RELOC"
+        dw      h_reloc
+        db      0
+        db      0
+
+; ---------------------------------------------------------------
+; Handlers. Each is called with the cursor after the
+; mnemonic; each returns with the cursor at the end of
+; the statement (parse_line checks the trailing text).
+; ---------------------------------------------------------------
+
+h_fixed:                        ; emit (mn_aux)
+        ld      a, (mn_aux)
+        jp      emit8a
+
+h_fixed2:                       ; emit 0edh, (mn_aux)
+        ld      a, 0edh
+        call    emit8a
+        ld      a, (mn_aux)
+        jp      emit8a
+
+; bad_operand / bad_syntax exits
+bad_op:
+        ld      hl, msg_badop
+        jp      err_exit
+
+; copy_desc: copy the 7-byte descriptor at HL into the
+; field variables o1_* (HL = opd1) or o2_* (HL = opd2),
+; selected by A (1 or 2).
+copy_desc:
+        cp      1
+        jr      z, cd_1
+        ld      de, o2t
+        jr      cd_go
+cd_1:
+        ld      de, o1t
+cd_go:
+        ld      bc, 7
+        ldir
+        ret
+
+; emit16_o1 / emit16_o2: emit the descriptor's value
+; with its attr.
+emit16_o1:
+        ld      hl, (o1v)
+        ld      a, (o1a)
+        ld      (em_attr), a
+        jp      emit16
+emit16_o2:
+        ld      hl, (o2v)
+        ld      a, (o2a)
+        ld      (em_attr), a
+        jp      emit16
+
+; ---------------------------------------------------------------
+; LD - the full form tree.
+; ---------------------------------------------------------------
+h_ld:
+        ld      de, opd1
+        call    parse_operand
+        call    expect_comma
+        ld      de, opd2
+        call    parse_operand
+        ld      hl, opd1
+        ld      a, 1
+        call    copy_desc
+        ld      hl, opd2
+        ld      a, 2
+        call    copy_desc
+        ; dispatch on destination type
+        ld      a, (o1t)
+        cp      OT_R8
+        jr      z, ld_r8
+        cp      OT_IXD
+        jp      z, ld_ixd
+        cp      OT_RR
+        jp      z, ld_rr
+        cp      OT_IX
+        jp      z, ld_ixy
+        cp      OT_IY
+        jp      z, ld_ixy
+        cp      OT_IND
+        jp      z, ld_ind
+        cp      OT_IBC
+        jp      z, ld_ibc
+        cp      OT_IDE
+        jp      z, ld_ide
+        cp      OT_I
+        jp      z, ld_i
+        cp      OT_R
+        jp      z, ld_r
+        jp      bad_op
+
+; destination is an 8-bit register (or (HL), code 6)
+ld_r8:
+        ld      a, (o2t)
+        cp      OT_R8
+        jr      z, ld_r8_r8
+        cp      OT_IXD
+        jr      z, ld_r8_ixd
+        cp      OT_IMM
+        jr      z, ld_r8_imm
+        ; A-only sources
+        ld      a, (o1c)
+        cp      7
+        jp      nz, bad_op
+        ld      a, (o2t)
+        cp      OT_IBC
+        jr      z, ld_a_ibc
+        cp      OT_IDE
+        jr      z, ld_a_ide
+        cp      OT_IND
+        jr      z, ld_a_ind
+        cp      OT_I
+        jr      z, ld_a_i
+        cp      OT_R
+        jr      z, ld_a_r
+        jp      bad_op
+ld_r8_r8:
+        ld      a, (o1c)
+        cp      6
+        jr      nz, ld_g1
+        ld      a, (o2c)
+        cp      6
+        jp      z, bad_op               ; LD (HL),(HL) = HALT
+ld_g1:
+        ld      a, (o1c)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 040h
+        ld      b, a
+        ld      a, (o2c)
+        add     a, b
+        jp      emit8a
+ld_r8_ixd:
+        ld      a, (o1c)
+        cp      6
+        jp      z, bad_op
+        ld      a, (o2p)
+        call    emit8a
+        ld      a, (o1c)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 046h
+        call    emit8a
+        ld      a, (o2d)
+        jp      emit8a
+ld_r8_imm:
+        ld      a, (o1c)
+        cp      6
+        jr      z, ld_hl_imm
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 006h
+        call    emit8a
+        ld      a, (o2v)                ; low byte
+        jp      emit8a
+ld_hl_imm:
+        ld      a, 036h
+        call    emit8a
+        ld      a, (o2v)
+        jp      emit8a
+ld_a_ibc:
+        ld      a, 00ah
+        jp      emit8a
+ld_a_ide:
+        ld      a, 01ah
+        jp      emit8a
+ld_a_ind:
+        ld      a, 03ah
+        call    emit8a
+        jp      emit16_o2
+ld_a_i:
+        ld      a, 0edh
+        call    emit8a
+        ld      a, 057h
+        jp      emit8a
+ld_a_r:
+        ld      a, 0edh
+        call    emit8a
+        ld      a, 05fh
+        jp      emit8a
+
+; destination is (IX+d) / (IY+d)
+ld_ixd:
+        ld      a, (o2t)
+        cp      OT_R8
+        jr      z, ld_ixd_r8
+        cp      OT_IMM
+        jr      z, ld_ixd_imm
+        jp      bad_op
+ld_ixd_r8:
+        ld      a, (o2c)
+        cp      6
+        jp      z, bad_op
+        ld      a, (o1p)
+        call    emit8a
+        ld      a, (o2c)
+        add     a, 070h
+        call    emit8a
+        ld      a, (o1d)
+        jp      emit8a
+ld_ixd_imm:
+        ld      a, (o1p)
+        call    emit8a
+        ld      a, 036h
+        call    emit8a
+        ld      a, (o1d)
+        call    emit8a
+        ld      a, (o2v)
+        jp      emit8a
+
+; destination is a 16-bit register pair
+ld_rr:
+        ld      a, (o2t)
+        cp      OT_IMM
+        jr      z, ld_rr_imm
+        cp      OT_IND
+        jr      z, ld_rr_ind
+        ; LD SP,HL / LD SP,IX / LD SP,IY
+        ld      a, (o1c)
+        cp      3
+        jp      nz, bad_op
+        ld      a, (o2t)
+        cp      OT_RR
+        jr      z, ld_sp_hl
+        cp      OT_IX
+        jr      z, ld_sp_ixy
+        cp      OT_IY
+        jr      z, ld_sp_ixy
+        jp      bad_op
+ld_sp_hl:
+        ld      a, (o2c)
+        cp      2
+        jp      nz, bad_op
+        ld      a, 0f9h
+        jp      emit8a
+ld_sp_ixy:
+        ld      a, (o2p)
+        call    emit8a
+        ld      a, 0f9h
+        jp      emit8a
+ld_rr_imm:
+        ld      a, (o1c)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 001h
+        call    emit8a
+        jp      emit16_o2
+ld_rr_ind:
+        ld      a, (o1c)
+        cp      2
+        jr      z, ld_hl_ind
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 04bh
+        ld      b, a
+        ld      a, 0edh
+        call    emit8a
+        ld      a, b
+        call    emit8a
+        jp      emit16_o2
+ld_hl_ind:
+        ld      a, 02ah
+        call    emit8a
+        jp      emit16_o2
+
+; destination is IX / IY itself
+ld_ixy:
+        ld      a, (o2t)
+        cp      OT_IMM
+        jr      z, ld_ixy_imm
+        cp      OT_IND
+        jr      z, ld_ixy_ind
+        jp      bad_op
+ld_ixy_imm:
+        ld      a, (o1p)
+        call    emit8a
+        ld      a, 021h
+        call    emit8a
+        jp      emit16_o2
+ld_ixy_ind:
+        ld      a, (o1p)
+        call    emit8a
+        ld      a, 02ah
+        call    emit8a
+        jp      emit16_o2
+
+; destination is (nn)
+ld_ind:
+        ld      a, (o2t)
+        cp      OT_R8
+        jr      z, ld_ind_a
+        cp      OT_RR
+        jr      z, ld_ind_rr
+        cp      OT_IX
+        jr      z, ld_ind_ixy
+        cp      OT_IY
+        jr      z, ld_ind_ixy
+        jp      bad_op
+ld_ind_a:
+        ld      a, (o2c)
+        cp      7
+        jp      nz, bad_op
+        ld      a, 032h
+        call    emit8a
+        jp      emit16_o1
+ld_ind_rr:
+        ld      a, (o2c)
+        cp      2
+        jr      z, ld_ind_hl
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 043h
+        ld      b, a
+        ld      a, 0edh
+        call    emit8a
+        ld      a, b
+        call    emit8a
+        jp      emit16_o1
+ld_ind_hl:
+        ld      a, 022h
+        call    emit8a
+        jp      emit16_o1
+ld_ind_ixy:
+        ld      a, (o2p)
+        call    emit8a
+        ld      a, 022h
+        call    emit8a
+        jp      emit16_o1
+
+; destination is (BC) / (DE): only A as source
+ld_ibc:
+        ld      a, (o2t)
+        cp      OT_R8
+        jp      nz, bad_op
+        ld      a, (o2c)
+        cp      7
+        jp      nz, bad_op
+        ld      a, 002h
+        jp      emit8a
+ld_ide:
+        ld      a, (o2t)
+        cp      OT_R8
+        jp      nz, bad_op
+        ld      a, (o2c)
+        cp      7
+        jp      nz, bad_op
+        ld      a, 012h
+        jp      emit8a
+
+; destination is I / R: only A as source
+ld_i:
+        ld      a, (o2t)
+        cp      OT_R8
+        jp      nz, bad_op
+        ld      a, (o2c)
+        cp      7
+        jp      nz, bad_op
+        ld      a, 0edh
+        call    emit8a
+        ld      a, 047h
+        jp      emit8a
+ld_r:
+        ld      a, (o2t)
+        cp      OT_R8
+        jp      nz, bad_op
+        ld      a, (o2c)
+        cp      7
+        jp      nz, bad_op
+        ld      a, 0edh
+        call    emit8a
+        ld      a, 04fh
+        jp      emit8a
+
+; ---------------------------------------------------------------
+; PUSH / POP: (mn_aux) = 0c5h / 0c1h.
+; ---------------------------------------------------------------
+h_pushpop:
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (opd1)
+        cp      OT_IX
+        jr      z, pp_ixy
+        cp      OT_IY
+        jr      z, pp_ixy
+        cp      OT_RR
+        jr      z, pp_rr
+        cp      OT_RR2
+        jr      z, pp_rr
+        jp      bad_op
+pp_ixy:
+        ld      a, (opd1 + 6)
+        call    emit8a
+        ld      a, (mn_aux)
+        add     a, 020h                 ; c5->e5, c1->e1
+        jp      emit8a
+pp_rr:
+        ld      a, (opd1 + 1)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (mn_aux)
+        add     a, b
+        jp      emit8a
+
+; ---------------------------------------------------------------
+; INC / DEC: (mn_aux) = 0 (INC) or 1 (DEC).
+; ---------------------------------------------------------------
+h_incdec:
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (opd1)
+        cp      OT_R8
+        jr      z, id_r8
+        cp      OT_IXD
+        jr      z, id_ixd
+        cp      OT_RR
+        jr      z, id_rr
+        cp      OT_IX
+        jr      z, id_ixy
+        cp      OT_IY
+        jr      z, id_ixy
+        jp      bad_op
+id_r8:
+        ld      a, (opd1 + 1)
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (mn_aux)
+        add     a, 004h
+        add     a, b
+        jp      emit8a
+id_ixd:
+        ld      a, (opd1 + 6)
+        call    emit8a
+        ld      a, (mn_aux)
+        add     a, 034h
+        call    emit8a
+        ld      a, (opd1 + 5)
+        jp      emit8a
+id_rr:
+        ld      a, (opd1 + 1)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (mn_aux)
+        or      a
+        ld      a, 003h
+        jr      z, id_rr2
+        ld      a, 00bh
+id_rr2:
+        add     a, b
+        jp      emit8a
+id_ixy:
+        ld      a, (opd1 + 6)
+        call    emit8a
+        ld      a, (mn_aux)
+        or      a
+        ld      a, 023h
+        jr      z, id_ixy2
+        ld      a, 02bh
+id_ixy2:
+        jp      emit8a
+
+; ---------------------------------------------------------------
+; ALU group: (mn_aux) = operation 0..7 (ADD ADC SUB SBC
+; AND XOR OR CP). 16-bit forms exist for ADD/ADC/SBC
+; with HL, and ADD with IX/IY.
+; ---------------------------------------------------------------
+h_alu:
+        ld      de, opd1
+        call    parse_operand
+        ld      hl, opd1
+        ld      a, 1
+        call    copy_desc
+        ; 16-bit forms?
+        ld      a, (mn_aux)
+        cp      2                       ; SUB: no 16-bit form
+        jp      z, alu_8
+        cp      4
+        jp      nc, alu_8               ; AND..CP: none
+        ld      a, (o1t)
+        cp      OT_RR
+        jr      nz, alu_ixy16
+        ld      a, (o1c)
+        cp      2                       ; HL?
+        jp      nz, alu_8
+        ; ADD/ADC/SBC HL,rr
+        call    expect_comma
+        ld      de, opd2
+        call    parse_operand
+        ld      a, (opd2)
+        cp      OT_RR
+        jp      nz, bad_op
+        ld      a, (opd2 + 1)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (mn_aux)
+        cp      0
+        jr      z, alu_hl_add
+        cp      1
+        jr      z, alu_hl_adc
+        ; SBC HL,rr
+        ld      a, 0edh
+        call    emit8a
+        ld      a, b
+        add     a, 042h
+        jp      emit8a
+alu_hl_add:
+        ld      a, b
+        add     a, 009h
+        jp      emit8a
+alu_hl_adc:
+        ld      a, 0edh
+        call    emit8a
+        ld      a, b
+        add     a, 04ah
+        jp      emit8a
+alu_ixy16:
+        ld      a, (mn_aux)
+        or      a
+        jr      nz, alu_8               ; only ADD has IX/IY
+        ld      a, (o1t)
+        cp      OT_IX
+        jr      z, alu_ixy_add
+        cp      OT_IY
+        jr      z, alu_ixy_add
+        jr      alu_8
+alu_ixy_add:
+        call    expect_comma
+        ld      de, opd2
+        call    parse_operand
+        ld      a, (opd2)
+        cp      OT_RR
+        jr      z, alu_ixy_rr
+        cp      OT_IX
+        jr      z, alu_ixy_self
+        cp      OT_IY
+        jr      z, alu_ixy_self
+        jp      bad_op
+alu_ixy_self:
+        ld      a, (o1p)
+        ld      b, a
+        ld      a, (opd2 + 6)
+        cp      b                       ; same register only
+        jp      nz, bad_op
+        ld      b, 020h                 ; rr code 2 (self)
+        jr      alu_ixy_emit
+alu_ixy_rr:
+        ld      a, (opd2 + 1)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+alu_ixy_emit:
+        ld      a, (o1p)
+        call    emit8a
+        ld      a, b
+        add     a, 009h
+        jp      emit8a
+alu_8:
+        ; source operand: opd1, unless opd1 is A followed
+        ; by a comma (explicit accumulator form)
+        ld      a, (o1t)
+        cp      OT_R8
+        jr      nz, alu_src1
+        ld      a, (o1c)
+        cp      7
+        jr      nz, alu_src1
+        call    skipsp
+        call    peekch
+        cp      ','
+        jr      nz, alu_src1
+        call    expect_comma
+        ld      de, opd1
+        call    parse_operand
+        ld      hl, opd1
+        ld      a, 1
+        call    copy_desc
+alu_src1:
+        ld      a, (o1t)
+        cp      OT_R8
+        jr      z, alu_src_r8
+        cp      OT_IXD
+        jr      z, alu_src_ixd
+        cp      OT_IMM
+        jr      z, alu_src_imm
+        jp      bad_op
+alu_src_r8:
+        ld      a, (mn_aux)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 080h
+        ld      b, a
+        ld      a, (o1c)
+        add     a, b
+        jp      emit8a
+alu_src_ixd:
+        ld      a, (o1p)
+        call    emit8a
+        ld      a, (mn_aux)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 086h
+        call    emit8a
+        ld      a, (o1d)
+        jp      emit8a
+alu_src_imm:
+        ld      a, (mn_aux)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c6h
+        call    emit8a
+        ld      a, (o1v)
+        jp      emit8a
+
+; ---------------------------------------------------------------
+; scan_cond: if the cursor is at "CC," (condition name +
+; comma), consume both and return the code in A (carry
+; clear). Otherwise restore the cursor, carry set.
+; ---------------------------------------------------------------
+scan_cond:
+        ld      hl, (lptr)
+        ld      (po_save), hl
+        call    skipsp
+        call    read_ident
+        jr      c, sc_no2
+        call    cond_lookup
+        jr      c, sc_no2
+        ld      (sc_cc), a
+        call    skipsp
+        call    peekch
+        cp      ','
+        jr      nz, sc_no2
+        call    getch
+        ld      a, (sc_cc)
+        or      a
+        ret
+sc_no2:
+        ld      hl, (po_save)
+        ld      (lptr), hl
+        scf
+        ret
+
+; ---------------------------------------------------------------
+; JP / CALL / JR / DJNZ / RET / RST / IM
+; ---------------------------------------------------------------
+h_jp:
+        call    skipsp
+        call    peekch
+        cp      '('
+        jr      z, jp_ind
+        call    scan_cond
+        jr      c, jp_abs
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c2h
+        call    emit8a
+        call    eval_expr
+        call    chk_undef
+        ld      a, (ev_attr)
+        ld      (em_attr), a
+        jp      emit16
+jp_abs:
+        ld      a, 0c3h
+        call    emit8a
+        call    eval_expr
+        call    chk_undef
+        ld      a, (ev_attr)
+        ld      (em_attr), a
+        jp      emit16
+jp_ind:
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (opd1)
+        cp      OT_R8
+        jr      z, jp_hl
+        cp      OT_IXD
+        jr      z, jp_ixd
+        jp      bad_op
+jp_hl:
+        ld      a, (opd1 + 1)
+        cp      6
+        jp      nz, bad_op
+        ld      a, 0e9h
+        jp      emit8a
+jp_ixd:
+        ld      a, (opd1 + 6)
+        call    emit8a
+        ld      a, 0e9h
+        jp      emit8a
+
+h_call:
+        call    scan_cond
+        jr      c, call_abs
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c4h
+        call    emit8a
+        call    eval_expr
+        call    chk_undef
+        ld      a, (ev_attr)
+        ld      (em_attr), a
+        jp      emit16
+call_abs:
+        ld      a, 0cdh
+        call    emit8a
+        call    eval_expr
+        call    chk_undef
+        ld      a, (ev_attr)
+        ld      (em_attr), a
+        jp      emit16
+
+; jr_common: opcode in A already emitted; evaluate the
+; target and emit the displacement byte.
+jr_common:
+        call    eval_expr
+        call    chk_undef
+        ; disp = target - (pc + 1)
+        ld      de, (pc)
+        inc     de
+        or      a
+        sbc     hl, de                  ; HL = disp (signed)
+        ld      a, (ev_pass)
+        cp      2
+        jr      nz, jr_emit
+        ; range check: HL in -128..127
+        ld      a, h
+        or      a
+        jr      z, jr_pos
+        cp      0ffh
+        jr      nz, jr_range
+        ld      a, l
+        cp      080h
+        jr      c, jr_range             ; < -128
+        jr      jr_emit
+jr_pos:
+        ld      a, l
+        cp      080h
+        jr      nc, jr_range            ; > 127
+jr_emit:
+        ld      a, l
+        jp      emit8a
+jr_range:
+        ld      hl, msg_jrrange
+        jp      err_exit
+
+h_jr:
+        call    scan_cond
+        jr      c, jr_abs
+        cp      4
+        jr      nc, jr_badcc
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 020h
+        call    emit8a
+        jr      jr_common
+jr_abs:
+        ld      a, 018h
+        call    emit8a
+        jr      jr_common
+jr_badcc:
+        jp      bad_op
+
+h_djnz:
+        ld      a, 010h
+        call    emit8a
+        jr      jr_common
+
+h_ret:
+        call    skipsp
+        call    peekch
+        or      a
+        jr      z, ret_plain
+        cp      ';'
+        jr      z, ret_plain
+        call    read_ident
+        jr      c, ret_syn
+        call    cond_lookup
+        jr      c, ret_syn
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 0c0h
+        jp      emit8a
+ret_plain:
+        ld      a, 0c9h
+        jp      emit8a
+ret_syn:
+        ld      hl, msg_syntax
+        jp      err_exit
+
+h_rst:
+        call    eval_expr
+        call    chk_undef
+        ld      a, (ev_pass)
+        cp      2
+        jr      nz, rst_emit
+        ld      a, h
+        or      a
+        jr      nz, rst_bad
+        ld      a, l
+        and     0c7h
+        jr      nz, rst_bad
+rst_emit:
+        ld      a, l
+        and     038h
+        add     a, 0c7h
+        jp      emit8a
+rst_bad:
+        jp      bad_op
+
+h_im:
+        call    eval_expr
+        call    chk_undef
+        ld      a, l
+        cp      0
+        jr      z, im_0
+        cp      1
+        jr      z, im_1
+        cp      2
+        jr      z, im_2
+        jp      bad_op
+im_0:
+        ld      a, 0edh
+        call    emit8a
+        ld      a, 046h
+        jp      emit8a
+im_1:
+        ld      a, 0edh
+        call    emit8a
+        ld      a, 056h
+        jp      emit8a
+im_2:
+        ld      a, 0edh
+        call    emit8a
+        ld      a, 05eh
+        jp      emit8a
+
+; ---------------------------------------------------------------
+; IN / OUT
+; ---------------------------------------------------------------
+h_in:
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (opd1)
+        cp      OT_R8
+        jp      nz, bad_op
+        call    expect_comma
+        ld      de, opd2
+        call    parse_operand
+        ld      a, (opd2)
+        cp      OT_IC
+        jr      z, in_c
+        cp      OT_IND
+        jr      z, in_n
+        jp      bad_op
+in_c:
+        ld      a, 0edh
+        call    emit8a
+        ld      a, (opd1 + 1)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 040h
+        jp      emit8a
+in_n:
+        ld      a, (opd1 + 1)
+        cp      7                       ; only IN A,(n)
+        jp      nz, bad_op
+        ld      a, 0dbh
+        call    emit8a
+        ld      a, (opd2 + 2)
+        jp      emit8a
+
+h_out:
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (opd1)
+        cp      OT_IC
+        jr      z, out_c
+        cp      OT_IND
+        jr      z, out_n
+        jp      bad_op
+out_c:
+        call    expect_comma
+        ld      de, opd2
+        call    parse_operand
+        ld      a, (opd2)
+        cp      OT_R8
+        jp      nz, bad_op
+        ld      a, 0edh
+        call    emit8a
+        ld      a, (opd2 + 1)
+        add     a, a
+        add     a, a
+        add     a, a
+        add     a, 041h
+        jp      emit8a
+out_n:
+        call    expect_comma
+        ld      de, opd2
+        call    parse_operand
+        ld      a, (opd2)
+        cp      OT_R8
+        jp      nz, bad_op
+        ld      a, (opd2 + 1)
+        cp      7                       ; only OUT (n),A
+        jp      nz, bad_op
+        ld      a, 0d3h
+        call    emit8a
+        ld      a, (opd1 + 2)
+        jp      emit8a
+
+; ---------------------------------------------------------------
+; EX: DE,HL / AF,AF' / (SP),HL / (SP),IX / (SP),IY
+; ---------------------------------------------------------------
+h_ex:
+        call    skipsp
+        call    peekch
+        cp      '('
+        jr      z, ex_sp
+        call    read_ident
+        jp      c, ex_syn
+        ld      hl, nm_de
+        call    tok_eq
+        jr      z, ex_de
+        ld      hl, nm_af
+        call    tok_eq
+        jr      z, ex_af
+        jr      ex_syn
+ex_de:
+        call    expect_comma
+        call    skipsp
+        call    read_ident
+        jr      c, ex_syn
+        ld      hl, nm_hl
+        call    tok_eq
+        jr      nz, ex_syn
+        ld      a, 0ebh
+        jp      emit8a
+ex_af:
+        call    expect_comma
+        call    skipsp
+        call    read_ident
+        jr      c, ex_syn
+        ld      hl, nm_af
+        call    tok_eq
+        jr      nz, ex_syn
+        call    skipsp
+        call    peekch
+        cp      027h                    ; '
+        jr      nz, ex_syn
+        call    getch
+        ld      a, 008h
+        jp      emit8a
+ex_sp:
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (opd1)
+        cp      OT_ISP
+        jp      nz, bad_op
+        call    expect_comma
+        ld      de, opd2
+        call    parse_operand
+        ld      a, (opd2)
+        cp      OT_RR
+        jr      z, ex_sp_hl
+        cp      OT_IX
+        jr      z, ex_sp_ixy
+        cp      OT_IY
+        jr      z, ex_sp_ixy
+        jp      bad_op
+ex_sp_hl:
+        ld      a, (opd2 + 1)
+        cp      2
+        jp      nz, bad_op
+        ld      a, 0e3h
+        jp      emit8a
+ex_sp_ixy:
+        ld      a, (opd2 + 6)
+        call    emit8a
+        ld      a, 0e3h
+        jp      emit8a
+ex_syn:
+        ld      hl, msg_syntax
+        jp      err_exit
+
+nm_af:  db      "AF", 0
+
+; ---------------------------------------------------------------
+; CB group: rotates (mn_aux = base) and BIT/RES/SET
+; (mn_aux = 040h/080h/0c0h).
+; ---------------------------------------------------------------
+h_cbrot:
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (opd1)
+        cp      OT_R8
+        jr      z, cbr_r8
+        cp      OT_IXD
+        jr      z, cbr_ixd
+        jp      bad_op
+cbr_r8:
+        ld      a, 0cbh
+        call    emit8a
+        ld      a, (mn_aux)
+        ld      b, a
+        ld      a, (opd1 + 1)
+        add     a, b
+        jp      emit8a
+cbr_ixd:
+        ld      a, (opd1 + 6)
+        call    emit8a
+        ld      a, 0cbh
+        call    emit8a
+        ld      a, (opd1 + 5)
+        call    emit8a
+        ld      a, (mn_aux)
+        add     a, 006h
+        jp      emit8a
+
+h_bit:
+        call    eval_expr               ; bit number
+        call    chk_undef
+        ld      (bit_val), hl
+        call    expect_comma
+        ld      de, opd1
+        call    parse_operand
+        ld      a, (ev_pass)
+        cp      2
+        jr      nz, bit_go
+        ld      hl, (bit_val)
+        ld      a, h
+        or      a
+        jr      nz, bit_bad
+        ld      a, l
+        cp      8
+        jr      nc, bit_bad
+bit_go:
+        ld      a, (bit_val)
+        add     a, a
+        add     a, a
+        add     a, a
+        ld      b, a
+        ld      a, (mn_aux)
+        add     a, b
+        ld      (bit_op), a
+        ld      a, (opd1)
+        cp      OT_R8
+        jr      z, bit_r8
+        cp      OT_IXD
+        jr      z, bit_ixd
+        jp      bad_op
+bit_r8:
+        ld      a, 0cbh
+        call    emit8a
+        ld      a, (bit_op)
+        ld      b, a
+        ld      a, (opd1 + 1)
+        add     a, b
+        jp      emit8a
+bit_ixd:
+        ld      a, (opd1 + 6)
+        call    emit8a
+        ld      a, 0cbh
+        call    emit8a
+        ld      a, (opd1 + 5)
+        call    emit8a
+        ld      a, (bit_op)
+        add     a, 006h
+        jp      emit8a
+bit_bad:
+        jp      bad_op
+
+; ---------------------------------------------------------------
+; Directives: ORG / EQU / DB / DW / DS / END / RELOC
+; ---------------------------------------------------------------
+h_org:
+        call    eval_expr
+        call    chk_undef
+        ld      a, 1
+        ld      (started), a
+        ld      a, (reloc)
+        or      a
+        jr      z, org_plain
+        ld      a, (org_seen)
+        or      a
+        jr      nz, org_plain
+        ; first ORG of a RELOC source: it is the origin
+        ld      a, 1
+        ld      (org_seen), a
+        ld      (origin), hl
+        ld      a, (ev_pass)
+        cp      2
+        jr      nz, org_setpc
+        ld      a, l
+        or      a
+        jr      nz, org_align           ; not page aligned
+org_setpc:
+        ld      de, STUB_LEN
+        add     hl, de
+        ld      (pc), hl
+        ret
+org_align:
+        ld      hl, msg_orgalign
+        jp      err_exit
+org_plain:
+        ld      (pc), hl
+        ld      a, (org_seen)
+        or      a
+        ret     nz
+        ld      a, 1
+        ld      (org_seen), a
+        ; first ORG also fixes the plain output base when
+        ; nothing has been emitted yet
+        ld      a, (emitted)
+        or      a
+        ret     nz
+        ld      hl, (pc)
+        ld      (out_base), hl
+        ret
+
+h_equ:
+        ld      a, (lab_flag)
+        or      a
+        jr      z, equ_nolab
+        call    eval_expr
+        call    chk_undef
+        ld      a, (ev_pass)
+        cp      1
+        ret     nz                      ; pass 2: done
+        ; define labbuf with this value/attr
+        push    hl
+        ld      hl, labbuf
+        ld      de, tokbuf
+        ld      bc, MAXNAME + 1
+        ldir
+        pop     hl
+        ld      a, (ev_attr)
+        jp      sym_define
+equ_nolab:
+        ld      hl, msg_syntax
+        jp      err_exit
+
+h_db:
+db_lp:
+        call    skipsp
+        call    peekch
+        cp      '"'
+        jr      z, db_str
+        call    eval_expr
+        call    chk_undef
+        ld      a, l
+        call    emit8a
+        jr      db_more
+db_str:
+        call    getch                   ; opening quote
+db_slp:
+        call    getch
+        or      a
+        jr      z, db_unterm
+        cp      '"'
+        jr      z, db_more
+        call    emit8a
+        jr      db_slp
+db_more:
+        call    skipsp
+        call    peekch
+        cp      ','
+        ret     nz
+        call    getch
+        jr      db_lp
+db_unterm:
+        ld      hl, msg_syntax
+        jp      err_exit
+
+h_dw:
+dw_lp:
+        call    eval_expr
+        call    chk_undef
+        ld      a, (ev_attr)
+        ld      (em_attr), a
+        call    emit16
+        call    skipsp
+        call    peekch
+        cp      ','
+        ret     nz
+        call    getch
+        jr      dw_lp
+
+h_ds:
+        call    eval_expr
+        call    chk_undef
+ds_lp:
+        ld      a, h
+        or      l
+        ret     z
+        dec     hl
+        push    hl
+        xor     a
+        call    emit8a
+        pop     hl
+        jr      ds_lp
+
+h_end:
+        ld      a, 1
+        ld      (end_flag), a
+        ret
+
+h_reloc:
+        ld      a, (started)
+        or      a
+        jr      nz, reloc_late
+        ld      a, 1
+        ld      (reloc), a
+        ld      (started), a
+        ; default origin until an ORG says otherwise
+        ld      hl, ORGDEF
+        ld      (origin), hl
+        ld      hl, ORGDEF + STUB_LEN
+        ld      (pc), hl
+        ; optional heap operand
+        call    skipsp
+        call    peekch
+        or      a
+        jr      z, reloc_dn
+        cp      ';'
+        jr      z, reloc_dn
+        call    eval_expr
+        call    chk_undef
+        ld      a, l
+        ld      (heap), a
+reloc_dn:
+        ret
+reloc_late:
+        ld      hl, msg_relochead
+        jp      err_exit
+
+; ---------------------------------------------------------------
+; Line parser. Grammar (as EDAS): [label[:]] [statement]
+; [; comment]. A first identifier that is not a mnemonic
+; is the label; the statement mnemonic follows it.
+; ---------------------------------------------------------------
+parse_line:
+        ld      hl, (lineno)
+        inc     hl
+        ld      (lineno), hl
+        ld      hl, linebuf
+        ld      (lptr), hl
+        xor     a
+        ld      (lab_flag), a
+        ld      (ev_undef), a
+        call    skipsp
+        call    peekch
+        or      a
+        ret     z                       ; blank line
+        cp      ';'
+        ret     z                       ; comment line
+        call    is_ident_start
+        jp      nc, pl_syn
+        call    read_ident              ; first token
+        call    skipsp
+        call    peekch
+        cp      ':'
+        jr      z, pl_label             ; explicit label
+        call    mn_lookup
+        jr      nc, pl_stmt             ; mnemonic first
+        ; otherwise the first token is the label
+pl_label:
+        ; (cursor is at ':' on the explicit path, or after
+        ; the token on the implicit path)
+        ld      hl, tokbuf
+        ld      de, labbuf
+        ld      bc, MAXNAME + 1
+        ldir
+        ld      a, 1
+        ld      (lab_flag), a
+        call    skipsp
+        call    peekch
+        cp      ':'
+        jr      nz, pl_lab2
+        call    getch                   ; consume ':'
+pl_lab2:
+        call    skipsp
+        call    peekch
+        or      a
+        jr      z, pl_labonly
+        cp      ';'
+        jr      z, pl_labonly
+        call    read_ident              ; statement mnemonic
+        jr      c, pl_syn
+        call    mn_lookup
+        jr      c, pl_badmn
+        jr      pl_have
+pl_labonly:
+        ; define the label at the current pc (pass 1)
+        ld      a, 1
+        ld      (started), a
+        ld      a, (ev_pass)
+        cp      1
+        ret     nz
+        ld      hl, labbuf
+        ld      de, tokbuf
+        ld      bc, MAXNAME + 1
+        ldir
+        ld      hl, (pc)
+        ld      a, 1
+        jp      sym_define
+pl_stmt:
+        ; mnemonic already looked up; no label
+        jr      pl_have
+pl_have:
+        ; EQU is special: the label is its subject, and it
+        ; must not also be defined as an address.
+        ld      hl, (mn_hdl)
+        ld      de, h_equ
+        or      a
+        sbc     hl, de
+        jr      z, pl_equ
+        ; define the label at the current pc (pass 1)
+        ld      a, (lab_flag)
+        or      a
+        jr      z, pl_disp
+        ld      a, (ev_pass)
+        cp      1
+        jr      nz, pl_disp
+        push    hl
+        ld      hl, labbuf
+        ld      de, tokbuf
+        ld      bc, MAXNAME + 1
+        ldir
+        ld      hl, (pc)
+        ld      a, 1
+        call    sym_define
+        pop     hl
+pl_disp:
+        ld      hl, (mn_hdl)
+        call    call_hl
+        ld      a, 1
+        ld      (started), a
+        jp      end_of_stmt
+pl_equ:
+        ld      hl, (mn_hdl)
+        call    call_hl
+        ld      a, 1
+        ld      (started), a
+        jp      end_of_stmt
+pl_syn:
+        ld      hl, msg_syntax
+        jp      err_exit
+pl_badmn:
+        ld      hl, msg_badmn
+        jp      err_exit
+
+; call_hl: call the address in HL.
+call_hl:
+        jp      (hl)
+
+; ---------------------------------------------------------------
+; Pass driver and top-level assembly.
+; ---------------------------------------------------------------
+
+; run_pass: stream the whole source once. (ev_pass) is 1
+; (define symbols, no emission) or 2 (emit).
+run_pass:
+        ld      hl, ORGDEF
+        ld      (pc), hl
+        ld      (origin), hl
+        ld      (out_base), hl
+        ld      hl, 0
+        ld      (hi_pc), hl
+        ld      (lineno), hl
+        xor     a
+        ld      (reloc), a
+        ld      (heap), a
+        ld      (org_seen), a
+        ld      (started), a
+        ld      (end_flag), a
+        ld      (emitted), a
+        ld      hl, FIXB
+        ld      (fix_ptr), hl
+        call    src_open
+rp_lp:
+        call    rd_line
+        ret     c                       ; end of file
+        call    parse_line
+        ld      a, (end_flag)
+        or      a
+        ret     nz
+        jr      rp_lp
+
+; assemble: locate the source, iterate pass 1 to a
+; stable symbol table, run pass 2, compose and save.
+assemble:
+        call    dir_load
+        ld      hl, name_src
+        ld      (find_name), hl
+        call    find_entry
+        jr      c, asm_nosrc
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (src_start), de
+        inc     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (src_size), de
+        ; fresh symbol table
+        ld      hl, 0
+        ld      (sym_head), hl
+        ld      hl, ARENA
+        ld      (arena_ptr), hl
+        ; pass 1, repeated until stable (max 8 scans)
+        xor     a
+        ld      (scan_no), a
+asm_p1:
+        xor     a
+        ld      (changed), a
+        call    sym_clear_scan
+        ld      a, 1
+        ld      (ev_pass), a
+        call    run_pass
+        ld      hl, scan_no
+        inc     (hl)
+        ld      a, (changed)
+        or      a
+        jr      z, asm_p2
+        ld      a, (scan_no)
+        cp      8
+        jr      c, asm_p1
+asm_p2:
+        ld      a, 2
+        ld      (ev_pass), a
+        call    run_pass
+        ; compose and (optionally) save
+        ld      a, (reloc)
+        or      a
+        jr      nz, asm_tosr
+        ; plain image: [out_base, hi_pc)
+        ld      hl, (out_base)
+        ld      (sv_addr), hl
+        ld      (sv_load), hl
+        ld      hl, (hi_pc)
+        ld      de, (out_base)
+        or      a
+        sbc     hl, de
+        ld      (sv_len), hl
+        jr      asm_save
+asm_tosr:
+        call    compose_tosr
+asm_save:
+        ld      a, (out_flag)
+        or      a
+        ret     z
+        jp      save_file
+asm_nosrc:
+        ld      hl, msg_nosrc
+        jp      err_exit
+
+; compose_tosr: build the TOSR v1 image in place around
+; the emitted user code: stub at (origin), bitmap right
+; after the body, trailer after the bitmap. Sets
+; (sv_addr), (sv_len), (sv_load).
+compose_tosr:
+        ; body size = hi_pc - origin (stub + user code)
+        ld      hl, (hi_pc)
+        ld      de, (origin)
+        or      a
+        sbc     hl, de
+        ld      (ct_body), hl
+        ; bitmap size = ceil(body / 8)
+        ld      de, 7
+        add     hl, de
+        srl     h
+        rr      l
+        srl     h
+        rr      l
+        srl     h
+        rr      l
+        ld      (ct_bmsz), hl
+        ; total = body + bitmap + 16
+        ld      de, (ct_body)
+        add     hl, de
+        ld      de, 16
+        add     hl, de
+        ld      (ct_total), hl
+        ld      de, 256
+        or      a
+        sbc     hl, de
+        jp      z, ct_small
+        jp      c, ct_small             ; total <= 256
+        ; end address must stay below OUTMAX
+        ld      hl, (origin)
+        ld      de, (ct_total)
+        add     hl, de
+        ld      de, OUTMAX
+        or      a
+        sbc     hl, de
+        jp      nc, ct_big
+        ; copy the stub template to the origin
+        ld      hl, stub_template
+        ld      de, (origin)
+        ld      bc, STUB_LEN
+        ldir
+        ; patch the five immediates (stage-1 template):
+        ; +7 total-16, +24 total-2, +62 origin page,
+        ; +70 body size, +77 body size (all LE16 but +62)
+        ld      hl, (origin)
+        ld      de, 7
+        add     hl, de
+        ld      de, (ct_total)
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de
+        dec     de                      ; DE = total - 16
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, (origin)
+        ld      de, 24
+        add     hl, de
+        ld      de, (ct_total)
+        dec     de
+        dec     de                      ; DE = total - 2
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, (origin)
+        ld      de, 62
+        add     hl, de
+        ld      de, (origin)
+        ld      (hl), d                 ; origin page
+        ld      hl, (origin)
+        ld      de, 70
+        add     hl, de
+        ld      de, (ct_body)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, (origin)
+        ld      de, 77
+        add     hl, de
+        ld      de, (ct_body)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ; zero the bitmap
+        ld      hl, (hi_pc)
+        ld      (ct_bmptr), hl
+        ld      de, (ct_bmsz)
+ct_zlp:
+        ld      a, d
+        or      e
+        jr      z, ct_zdn
+        xor     a
+        ld      (hl), a
+        inc     hl
+        dec     de
+        jr      ct_zlp
+ct_zdn:
+        ; set the bitmap bits from the fixup list
+        ld      hl, FIXB
+ct_flp:
+        ld      de, (fix_ptr)
+        or      a
+        sbc     hl, de
+        jr      nc, ct_fdn
+        add     hl, de                  ; restore HL
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        push    hl
+        ; bit position = offset & 7; byte index = offset >> 3
+        ld      a, e
+        and     007h
+        ld      (ct_bit), a
+        ld      l, e
+        ld      h, d
+        srl     h
+        rr      l
+        srl     h
+        rr      l
+        srl     h
+        rr      l                       ; HL = index
+        ld      de, (ct_bmptr)
+        add     hl, de                  ; HL -> bitmap byte
+        ld      a, (ct_bit)
+        ld      de, bitmasks
+        push    hl
+        ld      h, 0
+        ld      l, a
+        add     hl, de
+        ld      a, (hl)
+        pop     hl
+        or      (hl)
+        ld      (hl), a
+        pop     hl
+        jr      ct_flp
+ct_fdn:
+        ; trailer at hi_pc + bitmap size
+        ld      hl, (hi_pc)
+        ld      de, (ct_bmsz)
+        add     hl, de
+        ld      (ct_tr), hl
+        ld      (hl), 'T'
+        inc     hl
+        ld      (hl), 'R'
+        inc     hl
+        ld      (hl), 1                 ; version
+        inc     hl
+        ld      (hl), 006h              ; flags: stub + entry
+        inc     hl
+        ld      de, (origin)
+        ld      (hl), d                 ; origin page
+        inc     hl
+        ld      (hl), STUB_LEN          ; entry offset LE16
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      a, (heap)
+        ld      (hl), a
+        inc     hl
+        ld      de, (ct_body)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (ct_bmsz)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      (hl), 0                 ; external size = 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        push    hl                      ; checksum slot
+        ; checksum: byte sum over [origin, trailer+14)
+        ld      hl, (origin)
+        ld      de, (ct_total)
+        dec     de
+        dec     de                      ; count = total - 2
+        ld      bc, 0                   ; BC = sum
+ct_ck:
+        ld      a, d
+        or      e
+        jr      z, ct_ckd
+        ld      a, (hl)
+        inc     hl
+        add     a, c
+        ld      c, a
+        jr      nc, ct_ck2
+        inc     b
+ct_ck2:
+        dec     de
+        jr      ct_ck
+ct_ckd:
+        pop     hl
+        ld      (hl), c
+        inc     hl
+        ld      (hl), b
+        ; save parameters
+        ld      hl, (origin)
+        ld      (sv_addr), hl
+        ld      (sv_load), hl
+        ld      hl, (ct_total)
+        ld      (sv_len), hl
+        ret
+ct_small:
+        ld      hl, msg_tosrsmall
+        jp      err_exit
+ct_big:
+        ld      hl, msg_tosrbig
+        jp      err_exit
+
+bitmasks:
+        db      080h, 040h, 020h, 010h, 008h, 004h, 002h, 001h
+
+; ---------------------------------------------------------------
+; Messages
+; ---------------------------------------------------------------
+msg_banner:     db      "NEWASM - TOSR ASSEMBLER V1", 13, 10, 0
+msg_srcp:       db      "SRC: ", 0
+msg_outp:       db      "OUT: ", 0
+msg_ok:         db      "ASM OK", 13, 10, 0
+msg_err:        db      13, 10, "ERR LINE ", 0
+msg_syntax:     db      "SYNTAX ERROR", 0
+msg_badmn:      db      "BAD MNEMONIC", 0
+msg_badop:      db      "BAD OPERAND", 0
+msg_badnum:     db      "BAD NUMBER", 0
+msg_undef:      db      "UNDEFINED SYMBOL", 0
+msg_duplabel:   db      "DUPLICATE LABEL", 0
+msg_range:      db      "OUT OF RANGE", 0
+msg_jrrange:    db      "JR OUT OF RANGE", 0
+msg_longline:   db      "LINE TOO LONG", 0
+msg_nosrc:      db      "SRC NOT FOUND", 0
+msg_notosd:     db      "NO TOSD DISK", 0
+msg_diskfull:   db      "DISK FULL", 0
+msg_ioerr:      db      "DISK I/O ERROR", 0
+msg_symfull:    db      "SYMBOL TABLE FULL", 0
+msg_fixfull:    db      "FIXUP TABLE FULL", 0
+msg_relochead:  db      "RELOC MUST HEAD SOURCE", 0
+msg_orgalign:   db      "TOSR ORG NOT PAGE ALIGNED", 0
+msg_tosrsmall:  db      "TOSR IMAGE TOO SMALL", 0
+msg_tosrbig:    db      "TOSR IMAGE TOO BIG", 0
+
+; ---------------------------------------------------------------
+; The stage-1 self-relocation stub template (109 bytes).
+; The five immediates are patched at compose time:
+; +7 total-16, +24 total-2, +62 origin page, +70 and
+; +77 body size. The bytes below are the stage-1 stub
+; verbatim (reloc-stage1 src/relocdemo.z80); the values
+; currently in the immediate slots are those of the
+; 279-byte stage-1 demo and are always overwritten.
+; ---------------------------------------------------------------
+stub_template:
+        db      006h,000h,021h,000h,000h,0e5h,011h,007h
+        db      001h,019h,07eh,0feh,054h,020h,026h,023h
+        db      07eh,0feh,052h,020h,020h,0e1h,0e5h,001h
+        db      015h,001h,011h,000h,000h,07eh,023h,083h
+        db      05fh,030h,001h,014h,00bh,078h,0b1h,020h
+        db      0f4h,07eh,0bbh,020h,008h,023h,07eh,0bah
+        db      020h,003h,0e1h,018h,007h,0e1h,024h,004h
+        db      020h,0cbh,018h,031h,07ch,0d6h,080h,028h
+        db      02ch,04fh,0e5h,0ddh,0e1h,011h,0e9h,000h
+        db      019h,0e5h,0fdh,0e1h,011h,0e9h,000h,0fdh
+        db      07eh,000h,0fdh,023h,067h,006h,008h,0cbh
+        db      024h,030h,007h,0ddh,07eh,000h,081h,0ddh
+        db      077h,000h,0ddh,023h,01bh,07ah,0b3h,028h
+        db      004h,010h,0ech,018h,0e2h
+
+; ---------------------------------------------------------------
+; Variables (in-binary work area)
+; ---------------------------------------------------------------
+na_sp:          ds      2
+err_msg:        ds      2
+pd_lead:        ds      1
+find_name:      ds      2
+sv_len:         ds      2
+sv_addr:        ds      2
+sv_load:        ds      2
+sv_need:        ds      2
+sv_entry:       ds      2
+sv_rec:         ds      2
+sv_ptr:         ds      2
+sv_cur:         ds      2
+sv_left:        ds      2
+src_start:      ds      2
+src_size:       ds      2
+src_rec:        ds      2
+sec_ptr:        ds      2
+sec_left:       ds      2
+file_left:      ds      2
+rl_ptr:         ds      2
+rl_len:         ds      1
+rl_any:         ds      1
+sym_head:       ds      2
+arena_ptr:      ds      2
+sd_val:         ds      2
+sd_attr:        ds      1
+changed:        ds      1
+scan_no:        ds      1
+lptr:           ds      2
+tokbuf:         ds      33
+ev_attr:        ds      1
+ev_undef:       ds      1
+ev_pass:        ds      1
+ee_opc:         ds      1
+ee_lattr:       ds      1
+pn_tmp:         ds      2
+pc:             ds      2
+hi_pc:          ds      2
+origin:         ds      2
+out_base:       ds      2
+emitted:        ds      1
+em_byte:        ds      1
+em_val:         ds      2
+em_attr:        ds      1
+fx_off:         ds      2
+fix_ptr:        ds      2
+po_desc:        ds      2
+po_save:        ds      2
+po_key:         ds      2
+po_type:        ds      1
+po_code:        ds      1
+po_pfx:         ds      1
+sc_cc:          ds      1
+mn_hdl:         ds      2
+mn_aux:         ds      1
+mn_len:         ds      1
+labbuf:         ds      33
+lab_flag:       ds      1
+lineno:         ds      2
+reloc:          ds      1
+heap:           ds      1
+org_seen:       ds      1
+started:        ds      1
+end_flag:       ds      1
+out_flag:       ds      1
+bit_val:        ds      2
+bit_op:         ds      1
+ct_body:        ds      2
+ct_bmsz:        ds      2
+ct_total:       ds      2
+ct_bmptr:       ds      2
+ct_tr:          ds      2
+ct_bit:         ds      1
+opd1:           ds      7
+opd2:           ds      7
+; descriptor field copies (layout mirrors the descriptor)
+o1t:            ds      1
+o1c:            ds      1
+o1v:            ds      2
+o1a:            ds      1
+o1d:            ds      1
+o1p:            ds      1
+o2t:            ds      1
+o2c:            ds      1
+o2v:            ds      2
+o2a:            ds      1
+o2d:            ds      1
+o2p:            ds      1
+name_src:       ds      16
+name_out:       ds      16
+linebuf:        ds      168
+
+        end

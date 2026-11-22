@@ -1,0 +1,184 @@
+; fnttest.z80 - M3 diagnostic: which display layer draws the
+; background dash pattern seen on cleared screens?
+;
+; Fills the whole text VRAM with spaces in three attribute bands
+; (all cells also get knj = 0 written explicitly):
+;   rows  0- 7 : atr 0x07 (white)
+;   rows  8-15 : atr 0x02 (red)
+;   rows 16-24 : atr 0x00 (black)
+; If the dash marks follow the band attribute colour, they are
+; produced by the text rendering of the cell itself. If they stay
+; white in every band, they come from another layer (GRAM mix).
+; Afterwards the first 64 cells are read back through the ports
+; (ank -> RAM 0xE200, atr -> 0xE300, knj -> 0xE400) so the harness
+; can dump the actual TRAM contents.
+
+LOADADDR        equ     02000h
+SIGADDR         equ     0e100h
+ANKPORT         equ     03000h
+ATRPORT         equ     02000h
+KNJPORT         equ     03800h
+
+        org     LOADADDR
+
+start:
+        di
+        ld      sp, 0e000h
+
+        ld      hl, sig_text
+        ld      de, SIGADDR
+        ld      bc, sig_end - sig_text
+        ldir
+
+        ; --- fill all 2048 cells: ank=0x20, knj=0x00, atr by band ---
+        ld      de, 0                   ; offset
+        ld      hl, 2048
+fill_loop:
+        ; band select: offset < 320 -> 07, < 640 -> 02, else 00
+        ld      a, d
+        or      a
+        jr      z, band1                ; 0..255
+        cp      01h
+        jr      z, d1                   ; 256..511
+        cp      02h
+        jr      z, d2                   ; 512..767
+        jr      band3                   ; >= 768
+d1:
+        ld      a, e
+        cp      40h
+        jr      c, band1                ; 256..319
+        jr      band2                   ; 320..511
+d2:
+        ld      a, e
+        cp      80h
+        jr      c, band2                ; 512..639
+        jr      band3                   ; 640..767
+band1:
+        ld      a, 07h
+        jr      fill_write
+band2:
+        ld      a, 02h
+        jr      fill_write
+band3:
+        ld      a, 00h
+fill_write:
+        ld      (curatr), a
+        ; knj = 0
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(KNJPORT)
+        ld      b, a
+        xor     a
+        out     (c), a
+        ; ank = 0x20
+        ld      a, d
+        add     a, HIGH(ANKPORT)
+        ld      b, a
+        ld      a, 020h
+        out     (c), a
+        ; atr
+        res     4, b                    ; 0x30 -> 0x20
+        ld      a, (curatr)
+        out     (c), a
+        inc     de
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, fill_loop
+
+        ; --- labels (written with each band's attribute) ---
+        ld      a, 07h
+        ld      (curatr), a
+        ld      hl, msg_b7
+        ld      de, 0
+        call    putstr
+        ld      a, 02h
+        ld      (curatr), a
+        ld      hl, msg_b2
+        ld      de, 40*8
+        call    putstr
+        ld      hl, msg_b0
+        ld      de, 40*16
+        call    putstr
+
+        ; --- read back first 64 cells into RAM ---
+        ld      de, 0
+        ld      hl, 64
+        ld      ix, 0e200h              ; ank dump
+        ld      iy, 0e300h              ; atr dump
+        ld      bc, 0                   ; reuse bc as scratch via stack
+rb_loop:
+        push    hl
+        ; ank
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(ANKPORT)
+        ld      b, a
+        in      a, (c)
+        ld      (ix+0), a
+        inc     ix
+        ; atr
+        res     4, b
+        in      a, (c)
+        ld      (iy+0), a
+        inc     iy
+        ; knj
+        ld      a, d
+        add     a, HIGH(KNJPORT)
+        ld      b, a
+        in      a, (c)
+        push    de
+        push    iy
+        pop     de                      ; not used; keep simple below
+        pop     de
+        ; store knj at 0xE400 + (64 - remaining) -- use a pointer var
+        ld      hl, (knjptr)
+        ld      (hl), a
+        inc     hl
+        ld      (knjptr), hl
+        inc     de
+        pop     hl
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, rb_loop
+
+done:
+        jr      done
+
+; putstr: hl = string (0-term), de = offset, atr from (curatr)
+putstr:
+        ld      a, (hl)
+        or      a
+        ret     z
+        inc     hl
+        push    hl
+        push    af
+        ld      c, e
+        ld      a, d
+        add     a, HIGH(ANKPORT)
+        ld      b, a
+        pop     af
+        out     (c), a
+        res     4, b
+        ld      a, (curatr)
+        out     (c), a
+        pop     hl
+        inc     de
+        jr      putstr
+
+curatr:
+        db      07h
+knjptr:
+        dw      0e400h
+
+sig_text:
+        db      "TAPEOS-FNTTEST"
+sig_end:
+
+msg_b7:
+        db      "BAND ATR07", 0
+msg_b2:
+        db      "BAND ATR02", 0
+msg_b0:
+        db      "BAND ATR00 (LABEL IN RED)", 0

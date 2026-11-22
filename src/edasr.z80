@@ -1,0 +1,16 @@
+; EDAS - X1 target, TOSR edition (reloc stage 2).
+;
+; The same EDAS source (src/edas.z80) with EDAS_TOSR
+; defined: the RELOC directive is enabled, and a source
+; that heads with RELOC assembles to a complete TOSR v1
+; relocatable file (self-relocation stub + bitmap +
+; trailer) instead of a plain binary. Sources without
+; RELOC assemble exactly as with the standard edition.
+; The standard edition (src/edas.z80 assembled as-is) is
+; unchanged; this edition is a separate binary.
+; Assemble from the tapeos/ directory (INCLUDE is
+; CWD-relative).
+
+EDAS_TOSR       equ     1
+
+        include "src/edas.z80"
