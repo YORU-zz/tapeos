@@ -1,0 +1,52 @@
+/* cvsum.tb -- converter corpus A: loops and a helper.
+   Words at 0E688h + 2*i: [1275, 650, 720, 42]. */
+
+func void pw(int i, int v)
+    poke(0xE688 + i + i, v & 255)
+    poke(0xE689 + i + i, (v >> 8) & 255)
+endfunc
+
+func int dbl(int a)
+    return a + a
+endfunc
+
+func int Main()
+    int i, s
+    /* 0: for loop, sum 1..50 = 1275 */
+    s = 0
+    for i = 1 to 50
+        s = s + i
+    next
+    pw(0, s)
+    /* 1: while loop, sum of evens 2..50 = 650 */
+    s = 0
+    i = 2
+    while i <= 50
+        s = s + i
+        i = i + 2
+    endwhile
+    pw(1, s)
+    /* 2: repeat-until, 6! = 720 */
+    s = 1
+    i = 1
+    repeat
+        s = s * i
+        i = i + 1
+    until i > 6
+    pw(2, s)
+    /* 3: if/else and a call: dbl(21) = 42 */
+    if dbl(20) == 40 then
+        s = dbl(21)
+    else
+        s = 0
+    endif
+    pw(3, s)
+    /* signature header */
+    poke(0xE680, 0x54)
+    poke(0xE681, 0x42)
+    poke(0xE682, 0x52)
+    poke(0xE683, 0x53)
+    poke(0xE684, 2)
+    print("CVSUM DONE")
+    return 0
+endfunc

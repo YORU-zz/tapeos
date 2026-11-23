@@ -1,0 +1,53 @@
+/* cvrec.tb -- converter corpus C: recursion, nested
+   loops, break. Words: [720, 55, 100, 8]. */
+
+func void pw(int i, int v)
+    poke(0xE688 + i + i, v & 255)
+    poke(0xE689 + i + i, (v >> 8) & 255)
+endfunc
+
+func int fact(int n)
+    if n <= 1 then
+        return 1
+    endif
+    return n * fact(n - 1)
+endfunc
+
+func int fib(int n)
+    if n < 2 then
+        return n
+    endif
+    return fib(n - 1) + fib(n - 2)
+endfunc
+
+func int Main()
+    int i, j, s
+    /* 0: fact(6) = 720 */
+    pw(0, fact(6))
+    /* 1: fib(10) = 55 */
+    pw(1, fib(10))
+    /* 2: nested loops: (1+2+3+4)^2 = 100 */
+    s = 0
+    for i = 1 to 4
+        for j = 1 to 4
+            s = s + i * j
+        next
+    next
+    pw(2, s)
+    /* 3: break: first i with i*i > 50 is 8 */
+    s = 0
+    for i = 0 to 100
+        if i * i > 50 then
+            s = i
+            break
+        endif
+    next
+    pw(3, s)
+    poke(0xE680, 0x54)
+    poke(0xE681, 0x42)
+    poke(0xE682, 0x52)
+    poke(0xE683, 0x53)
+    poke(0xE684, 2)
+    print("CVREC DONE")
+    return 0
+endfunc

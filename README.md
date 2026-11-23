@@ -44,6 +44,7 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
   - SCED ― スクリーンエディタ（`src/sced.z80`）
   - MCED ― MicroEmacs 風エディタ（`src/mced.z80`）。モードレスな Emacs 系操作（C-k キル／C-y ヤンク、リージョン、検索、C-x プレフィクス）で、SCED とは別プログラム。ファイル形式は SCED と互換
   - TBC / TBI ― TinyBASIC コンパイラ／インタープリタ（`src/tbc.z80`、`src/tbi.z80`、共有コア `src/tbcore.inc`、X1 ライブラリ `src/tblib.z80`）。X-BASIC 風方言（関数定義の集合、int/char、再帰、配列、print/input/stick/vsync など）。TBC は TOSR 実行ファイルを出力し、TBI は関数単位の遅延 JIT で即実行する。サンプルは `src/fib.tb` / `src/calc.tb` / `src/game.tb` など
+  - SCC / SCI ― Small-C コンパイラ／インタープリタ（`src/scc.z80`、`src/sci.z80`、共有コア `src/sccore.inc`、X1 ライブラリ `src/clib.z80`）。Small-C サブセット（int/char、1段ポインタ、配列、再帰、構造化制御、#include/#define、printf/getchar など）。SCC は TOSR 実行ファイルを出力し、SCI は関数単位の遅延 JIT で即実行する（コンパイラと実行結果は完全一致）。TinyBASIC との双方向変換ツール `tools/bascvt.py` 付き（共通サブセット外は変換不可として報告される）。サンプルは `src/fib.c` / `src/calc.c` / `src/game.c` など、変換 corpus は `src/cvsum.tb`＋`src/cvsum.c` ほかの対照ペア
   - Tiny Scheme 2段階ブートローダー ― テープ先頭ローダー（`src/tsload.z80`、最終ロード用チャンク `src/ldfin.z80`）が Tiny Scheme（Z80 アセンブラ製コア、原始手続き 66 個、うち `(random n)`、IOCS RTGET 受け口の `(date)`／`(time)`、機械語ブリッジ `(call addr [hl])` を含む）を内蔵し、直後の固定長スクリプトブロックを検証して評価する。第2段スクリプト（`src/stage2.scm`）が Scheme 自身によるセレクタ／シェルで、スクリプトの保存（テープ全体の再生成）でブート手順が自己進化する。検証用プローブは `src/probe-rand.scm`、テープ作成／解析は `tools/mktape.py` / `tools/lstape.py`
 
 ### 設計：機種依存部と共通部の分離
@@ -74,6 +75,7 @@ newasm.bin、sced.bin、mced.bin など）とディスク／テープイメー�
 - `images/shell.d88` ― TapeOS シェルの起動ディスクイメージ
 - `images/mced.d88` ― シェル起動ディスク＋ MCED プログラムファイル入り。起動後に `r mced` / `g 4000` で MCED が使えます
 - `images/tinybasic.d88` ― シェル起動ディスク＋ TBC / TBI とサンプル（FIB.TB / CALC.TB / GAME.TB）入り。起動後に `r tbc` / `g 4000` でコンパイル（SRC/OUT を聞かれます）、`r tbi` / `g 4000` で即実行できます
+- `images/smallc.d88` ― シェル起動ディスク＋ SCC / SCI とサンプル（FIB.C / CALC.C / GAME.C）入り。起動後に `r scc` / `g 4000` でコンパイル（SRC/OUT を聞かれます）、`r sci` / `g 4000` で即実行できます
 - `images/tapeos.cmt` ― テープイメージ（IPL の CMT ブート用）
 - `images/tsboot.cmt` ― Tiny Scheme 2段階ブートテープ（ローダー＋スクリプトブロック＋ TapeOS ＋ TSDEMO）。IPL の CMT ブートで Tiny Scheme シェルが立ち上がり、`run 1` で TapeOS、`run 2` で TSDEMO が起動します
 - `images/font.d88` ― 漢字フォント（美咲フォント由来）のディスク

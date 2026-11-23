@@ -1,0 +1,45 @@
+/* cvarr.tb -- converter corpus B: arrays and chars.
+   Words at 0E688h + 2*i: [385, 67, 100, 55]. */
+
+dim int sq(16)
+
+func void pw(int i, int v)
+    poke(0xE688 + i + i, v & 255)
+    poke(0xE689 + i + i, (v >> 8) & 255)
+endfunc
+
+func int Main()
+    int i, s
+    char c
+    /* fill the global array with squares */
+    for i = 1 to 10
+        sq(i) = i * i
+    next
+    /* 0: sum of squares 1..10 = 385 */
+    s = 0
+    for i = 1 to 10
+        s = s + sq(i)
+    next
+    pw(0, s)
+    /* 1: char arithmetic: 'A' + 2 = 67 */
+    c = 65
+    c = c + 2
+    pw(1, c)
+    /* 2: the largest square = 100 */
+    pw(2, sq(10))
+    /* 3: sum 1..10 read back singly = 55 */
+    s = 0
+    i = 1
+    while i <= 10
+        s = s + i
+        i = i + 1
+    endwhile
+    pw(3, s)
+    poke(0xE680, 0x54)
+    poke(0xE681, 0x42)
+    poke(0xE682, 0x52)
+    poke(0xE683, 0x53)
+    poke(0xE684, 2)
+    print("CVARR DONE")
+    return 0
+endfunc

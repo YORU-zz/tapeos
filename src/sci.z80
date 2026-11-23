@@ -1,0 +1,475 @@
+; ---------------------------------------------------------------
+; SCI - Small-C interpreter (X1 / TapeOS, TOSD program).
+;
+; SCI shares its whole front end with SCC (sccore.inc):
+; preprocessor, lexer, parser, native code generator and
+; the external function library. The difference is the
+; execution model: instead of writing a TOSR file, SCI
+; lays the program out in RAM at 08000h and runs it in
+; place. Each function is compiled lazily on its first
+; call (per-function JIT): the function's slot initially
+; holds a JP to a small stub that asks jit_go to compile
+; the function (measure + emit sub-passes over just that
+; function) and then falls into the freshly compiled code
+; with the caller's stack untouched. The design follows
+; TinyBASIC's TBI (see tinybasic.md section 4).
+;
+; Load address 04000h like every TapeOS tool.
+; ---------------------------------------------------------------
+
+        org     04000h
+
+        jp      driver_start
+
+        include "sccore.inc"
+
+; ---------------------------------------------------------------
+; Driver.
+; ---------------------------------------------------------------
+driver_start:
+        ld      (saved_sp), sp
+        ld      hl, STBLK
+        ld      (hl), 'S'
+        inc     hl
+        ld      (hl), 'C'
+        inc     hl
+        ld      (hl), 'I'
+        inc     hl
+        ld      (hl), 0ffh              ; running
+        ld      hl, drv_banner
+        call    C_PRTMSG
+        ld      hl, msg_srcp
+        call    C_PRTMSG
+        ld      hl, linebuf
+        ld      b, 80
+        call    C_GETLIN
+        or      a
+        ret     z                       ; empty: back to shell
+        ld      hl, linebuf
+        ld      de, name_src
+        call    name_copy
+        ; find the source file
+        call    dir_load
+        ld      hl, name_src
+        ld      (find_name), hl
+        call    find_entry
+        ld      a, E_FILE
+        jp      c, err                  ; source not found
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; start record
+        ld      (main_rec), de
+        inc     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; size
+        ld      (main_size), de
+        ; the module lives at ORIGIN in RAM; no stub, no
+        ; relocation bitmap is needed
+        ld      hl, ORIGIN
+        ld      (outbase_v), hl
+        ld      hl, 0
+        ld      (rt_stub), hl
+        ld      hl, 04800h
+        ld      (heap_limit), hl
+        ; ---- pass 1 + measure + layout (as in SCC) ----
+        call    pass1
+        ld      a, 1
+        ld      (pass), a
+        call    parse_program           ; measure
+        call    layout
+        ; rtentry expects (total_padded) = the module size
+        ; rounded up to a page: the heap follows the module
+        ld      hl, (bodysize)
+        ld      de, 255
+        add     hl, de
+        xor     a
+        ld      l, a
+        ld      (total_padded), hl
+        ; ---- skeleton: entry + JP stubs + library ----
+        ld      a, 2
+        ld      (pass), a
+        ld      hl, 0
+        ld      (epc), hl
+        call    emit_rtentry
+        xor     a
+        ld      (jit_i), a
+sk_lp:
+        ld      a, (jit_i)
+        ld      hl, fcount
+        cp      (hl)
+        jr      nc, sk_lib
+        call    ftab_ptr                ; HL = entry
+        ld      de, 16
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = function address
+        ld      hl, ORIGIN
+        ex      de, hl
+        or      a
+        sbc     hl, de                  ; HL = body offset
+        ld      (epc), hl
+        ld      a, 0c3h                 ; JP stub_i
+        call    e_b
+        ld      a, (jit_i)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                  ; *4
+        ld      a, (jit_i)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; *5 (stub size)
+        ld      de, stubs
+        add     hl, de
+        call    e_w                     ; stub address (absolute)
+        ld      a, (jit_i)
+        inc     a
+        ld      (jit_i), a
+        jr      sk_lp
+sk_lib:
+        call    emit_library
+        ; ---- status: OK, then run ----
+        ld      hl, STBLK + 3
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      de, (bodysize)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, msg_ok
+        call    C_PRTMSG
+        ld      hl, (bodysize)
+        call    print_dec
+        call    C_CRLF
+        call    ORIGIN                  ; run the module
+        ret
+
+drv_banner: db  "SCI - Small-C INTERPRETER", 13, 10, 0
+
+; ---------------------------------------------------------------
+; JIT stubs: one per function (FMAX = 16). Each loads its
+; function index and jumps to jit_go. After the function is
+; compiled, its slot no longer contains the JP that led
+; here, so a stub runs at most once per function.
+; ---------------------------------------------------------------
+stubs:
+        ld      a, 0
+        jp      jit_go
+        ld      a, 1
+        jp      jit_go
+        ld      a, 2
+        jp      jit_go
+        ld      a, 3
+        jp      jit_go
+        ld      a, 4
+        jp      jit_go
+        ld      a, 5
+        jp      jit_go
+        ld      a, 6
+        jp      jit_go
+        ld      a, 7
+        jp      jit_go
+        ld      a, 8
+        jp      jit_go
+        ld      a, 9
+        jp      jit_go
+        ld      a, 10
+        jp      jit_go
+        ld      a, 11
+        jp      jit_go
+        ld      a, 12
+        jp      jit_go
+        ld      a, 13
+        jp      jit_go
+        ld      a, 14
+        jp      jit_go
+        ld      a, 15
+        jp      jit_go
+
+; ---------------------------------------------------------------
+; jit_go: A = function index. Entered by a JP from the
+; stub, so the stack is exactly as the caller of the
+; function left it: [retaddr][args...]. Pop the return
+; address, compile the function, restore the stack and
+; jump into the compiled code.
+; ---------------------------------------------------------------
+jit_go:
+        ld      (jit_idx), a
+        pop     hl                      ; caller return address
+        ld      (jit_ret), hl
+        call    jit_compile
+        ld      hl, (jit_ret)
+        push    hl
+        ld      a, (jit_idx)
+        call    ftab_ptr
+        ld      de, 16
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        jp      (hl)
+
+; jit_compile: measure + emit sub-passes for (jit_idx).
+jit_compile:
+        ld      a, 1
+        ld      (pass), a
+        call    jit_preset
+        call    parse_function
+        ld      a, 2
+        ld      (pass), a
+        call    jit_preset
+        call    parse_function
+        ret
+
+; jit_preset: rewind and skip to (jit_idx)'s function
+; definition, then preset epc / litcur / label state so
+; the sub-pass reproduces the load-time layout exactly.
+; On return the current token is the definition's '('
+; and namebuf holds its name (parse_function's entry
+; contract, as in parse_program).
+jit_preset:
+        call    jit_seek
+        ld      a, (jit_idx)
+        call    ftab_ptr                ; HL = entry
+        push    hl
+        ld      de, 16
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = address
+        ld      hl, ORIGIN
+        ex      de, hl
+        or      a
+        sbc     hl, de                  ; HL = body offset
+        ld      (epc), hl
+        pop     hl
+        ld      de, 30
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = litstart
+        ld      (litcur), de
+        ld      hl, 0
+        ld      (label_cnt), hl
+        xor     a
+        ld      (loopdep), a
+        ret
+
+; jit_seek: advance to the definition of function
+; (jit_idx), matched by name against its ftab entry
+; (prototypes are skipped: their definition is the
+; target). Two walks over the token stream: the first
+; finds the ordinal of the target definition among the
+; top-level items; the second stops at that item and
+; consumes only its head, leaving '(' current and
+; namebuf holding the name (parse_function's entry
+; contract, as in parse_program). C top-level items are
+; walked by tokens: a declaration ends at ';', a
+; definition's header is recognised by its '(' and the
+; body is skipped by brace counting; K&R parameter
+; declarations between ')' and '{' are consumed as part
+; of the walk.
+jit_seek:
+        xor     a
+        ld      (js_stop), a
+        call    js_walk                 ; sets (js_target)
+        ld      a, 1
+        ld      (js_stop), a
+        call    js_walk                 ; stops at the item
+        ret
+
+js_walk:
+        call    src_rewind
+        call    lex
+        xor     a
+        ld      (js_item), a
+js_lp:
+        ld      a, (tok)
+        or      a
+        jp      z, syn_err              ; EOF: no definition
+        ; stop check (second walk only)
+        ld      a, (js_stop)
+        or      a
+        jr      z, js_head
+        ld      a, (js_item)
+        ld      hl, js_target
+        cp      (hl)
+        jp      z, js_at_target
+js_head:
+        ; head: optional type, stars, name
+        ld      a, (tok)
+        cp      K_INT
+        jr      z, js_ty
+        cp      K_CHAR
+        jr      z, js_ty
+        cp      K_VOID
+        jr      z, js_ty
+        jr      js_stars
+js_ty:
+        call    lex
+js_stars:
+        ld      a, (tok)
+        cp      '*'
+        jr      nz, js_name
+        call    lex
+        jr      js_stars
+js_name:
+        ld      a, (tok)
+        cp      T_IDENT
+        jp      nz, syn_err
+        ; does this item's name match the target?
+        ld      a, (jit_idx)
+        call    ftab_ptr                ; HL = target entry
+        call    name_eq
+        jr      nz, js_nm
+        ld      a, 1
+        ld      (js_match), a
+        jr      js_af
+js_nm:
+        xor     a
+        ld      (js_match), a
+js_af:
+        call    lex                     ; token after the name
+        cp      '('
+        jr      z, js_func
+        ; a global declaration: consume through ';'
+js_glob:
+        ld      a, (tok)
+        cp      ';'
+        jr      z, js_gdone
+        or      a
+        jp      z, syn_err
+        call    lex
+        jr      js_glob
+js_gdone:
+        call    lex
+        jr      js_next
+js_func:
+        call    js_params               ; consumes through ')'
+        ld      a, (tok)
+        cp      ';'
+        jr      z, js_pdone             ; prototype: not a def
+        ; a definition: the target?
+        ld      a, (js_match)
+        or      a
+        jr      z, js_skipbody
+        ld      a, (js_item)
+        ld      (js_target), a
+        ret                             ; walk 1 is done
+js_skipbody:
+        ld      a, (tok)
+        cp      '{'
+        jr      z, js_body
+        ; K&R declarations: consume until '{'
+js_kr:
+        call    lex
+        ld      a, (tok)
+        cp      '{'
+        jr      z, js_body
+        or      a
+        jp      z, syn_err
+        jr      js_kr
+js_body:
+        ; skip the body by brace counting (tok = '{');
+        ; the depth lives in memory (lex clobbers all)
+        ld      a, 1
+        ld      (js_depth), a
+js_blp:
+        call    lex
+        ld      a, (tok)
+        or      a
+        jp      z, syn_err
+        cp      '{'
+        jr      z, js_bi
+        cp      '}'
+        jr      z, js_bd
+        jr      js_blp
+js_bi:
+        ld      a, (js_depth)
+        inc     a
+        ld      (js_depth), a
+        jr      js_blp
+js_bd:
+        ld      a, (js_depth)
+        dec     a
+        ld      (js_depth), a
+        jr      nz, js_blp
+        call    lex                     ; past '}'
+        jr      js_next
+js_pdone:
+        call    lex                     ; past ';'
+js_next:
+        ld      a, (js_item)
+        inc     a
+        ld      (js_item), a
+        jp      js_lp
+js_at_target:
+        ; consume only the head; return with '(' current
+        ld      a, (tok)
+        cp      K_INT
+        jr      z, js_aty
+        cp      K_CHAR
+        jr      z, js_aty
+        cp      K_VOID
+        jr      z, js_aty
+        jr      js_astars
+js_aty:
+        call    lex
+js_astars:
+        ld      a, (tok)
+        cp      '*'
+        jr      nz, js_aname
+        call    lex
+        jr      js_astars
+js_aname:
+        call    lex                     ; past the name
+        ret                             ; tok = '('
+
+; js_params: the current token is '('; consume through
+; the matching ')' and lex once more (token after ')').
+js_params:
+        ld      a, 1
+        ld      (js_depth), a
+js_plp:
+        call    lex
+        ld      a, (tok)
+        or      a
+        jp      z, syn_err
+        cp      '('
+        jr      z, js_pi
+        cp      ')'
+        jr      z, js_pd
+        jr      js_plp
+js_pi:
+        ld      a, (js_depth)
+        inc     a
+        ld      (js_depth), a
+        jr      js_plp
+js_pd:
+        ld      a, (js_depth)
+        dec     a
+        ld      (js_depth), a
+        jr      nz, js_plp
+        call    lex
+        ret
+
+; ---- SCI driver variables ----
+jit_idx: db     0
+jit_i: db       0
+jit_ret: dw     0
+js_stop: db     0
+js_item: db     0
+js_target: db   0
+js_match: db    0
+js_depth: db    0
+
+        end

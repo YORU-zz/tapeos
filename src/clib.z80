@@ -1,0 +1,692 @@
+; clib.z80 -- Small-C runtime + external function library (X1).
+;
+; This file is NOT a standalone program. It is assembled twice
+; by tools/mkclibtab.py (ORG 0 and ORG 04000h); the byte diff of
+; the two assemblies identifies every self-referential operand
+; (an address inside the same routine), and the result is
+; embedded into the compiler (SCC) as data tables (clibtab.inc).
+; SCC copies the routines a program actually uses into the
+; output module and patches all references (see smallc-tos.md).
+; The mechanism is inherited unchanged from TinyBASIC's tblib.
+;
+; Two routine classes:
+;   - runtime (register convention): inputs in DE and HL,
+;     result in HL, clobber AF and DE (BC preserved). Called
+;     directly by generated code.
+;   - external (stack convention, same as user functions):
+;     the caller pushes 16-bit argument slots in source
+;     order (arg1 first, argN last) and CALLs; the routine
+;     builds an IY frame (argN at (IY+4), arg1 at
+;     (IY + 4 + 2*(nargs-1))), returns the result in HL,
+;     and the caller cleans the stack.
+;     IX (the heap base of the running program) is preserved.
+;   x_printf is the one exception: it is variadic, so the
+;   caller additionally loads A = (number of arguments after
+;   the format), and printf walks the argument slots itself
+;   without building a frame (IX and IY preserved).
+;
+; Routines refer to each other ONLY through the X_ dummy
+; equates below (0C000h + 3*id). The compiler detects those
+; operand values in the templates and rewrites them to the
+; final addresses. Absolute constants (IOCS entries) are
+; written literally. Internal branches use JR where possible;
+; any remaining absolute self-reference is found by the
+; two-origin diff.
+;
+; Routine ids (also the X_ dummy order):
+;   0 rt_mul    1 rt_div    2 rt_mod    3 rt_shl    4 rt_shr
+;   5 x_puts    6 x_printf  7 x_getchar 8 x_input   9 x_locate
+;  10 x_cls    11 x_inkey  12 x_stick  13 x_vsync  14 x_peek
+;  15 x_poke   16 x_putc   17 neg_hl   18 rtd_setup
+;  19 udiv_core
+; Every routine is self-contained: cross-routine references
+; go through the X_ dummies only, never by label or by a
+; relative branch into another routine.
+
+C_INKEY         equ     0e400h          ; IOCS 0
+C_CONOUT        equ     0e406h          ; IOCS 2
+C_PRTMSG        equ     0e409h          ; IOCS 3
+C_CRLF          equ     0e40ch          ; IOCS 4
+C_GETLIN        equ     0e40fh          ; IOCS 5
+C_CLRSCR        equ     0e412h          ; IOCS 6
+C_LOCATE        equ     0e415h          ; IOCS 7
+
+X_RT_MUL        equ     0c000h
+X_RT_DIV        equ     0c003h
+X_RT_MOD        equ     0c006h
+X_RT_SHL        equ     0c009h
+X_RT_SHR        equ     0c00ch
+X_PUTS          equ     0c00fh
+X_PRINTF        equ     0c012h
+X_GETCHAR       equ     0c015h
+X_INPUT         equ     0c018h
+X_LOCATE        equ     0c01bh
+X_CLS           equ     0c01eh
+X_INKEY         equ     0c021h
+X_STICK         equ     0c024h
+X_VSYNC         equ     0c027h
+X_PEEK          equ     0c02ah
+X_POKE          equ     0c02dh
+X_PUTC          equ     0c030h
+X_NEGHL         equ     0c033h
+X_RTD_SETUP     equ     0c036h
+X_UDIV_CORE     equ     0c039h
+
+        org     __ORG__
+
+; ---------------------------------------------------------------
+; 0: rt_mul -- HL = DE * HL (low 16 bits; sign-agnostic)
+; ---------------------------------------------------------------
+RTB_00:
+        push    bc
+        ld      c, l
+        ld      b, h                    ; BC = multiplier
+        ld      hl, 0
+        ld      a, 16
+rtm_lp:
+        srl     b
+        rr      c
+        jr      nc, rtm_no
+        add     hl, de
+rtm_no:
+        sla     e
+        rl      d
+        dec     a
+        jr      nz, rtm_lp
+        pop     bc
+        ret
+
+; ---------------------------------------------------------------
+; 1: rt_div -- HL = DE / HL (signed, C semantics);
+;    division by zero yields 0.
+; 2: rt_mod -- HL = DE % HL (signed, sign of dividend);
+;    division by zero yields 0.
+; Shared core: udiv_core takes BC = divisor (unsigned,
+; nonzero), DE = dividend (unsigned); returns quotient in
+; DE, remainder in HL.
+; ---------------------------------------------------------------
+RTB_01:
+        call    X_RTD_SETUP             ; CF=1: divisor was 0
+        jr      c, rtdz_1
+        push    af                      ; udiv_core clobbers A
+        call    X_UDIV_CORE             ; DE=quot, HL=rem
+        pop     af
+        ex      de, hl                  ; HL = quotient
+        or      a
+        ret     p                       ; combined sign positive
+        jp      X_NEGHL
+rtdz_1:
+        ld      hl, 0
+        ret
+
+RTB_02:
+        call    X_RTD_SETUP
+        jr      c, rtdz_2
+        push    af                      ; udiv_core clobbers A
+        call    X_UDIV_CORE             ; HL = remainder
+        pop     af
+        bit     6, a                    ; dividend sign
+        ret     z
+        jp      X_NEGHL
+rtdz_2:
+        ld      hl, 0
+        ret
+
+; ---------------------------------------------------------------
+; 3: rt_shl -- HL = DE << (HL & 15)
+; 4: rt_shr -- HL = DE >> (HL & 15), arithmetic
+; ---------------------------------------------------------------
+RTB_03:
+        ld      a, l
+        and     015
+        ld      h, d
+        ld      l, e                    ; HL = value
+        ret     z
+        ld      b, a
+rsl_lp:
+        add     hl, hl
+        djnz    rsl_lp
+        ret
+
+RTB_04:
+        ld      a, l
+        and     015
+        ld      h, d
+        ld      l, e                    ; HL = value
+        ret     z
+        ld      b, a
+rsr_lp:
+        sra     h
+        rr      l
+        djnz    rsr_lp
+        ret
+
+; ---------------------------------------------------------------
+; 5: x_puts -- puts(s): print the NUL-terminated string at
+; arg1, then a newline. Returns 0.
+; ---------------------------------------------------------------
+RTB_05:
+        push    iy
+        ld      iy, 0
+        add     iy, sp
+        ld      l, (iy + 4)
+        ld      h, (iy + 5)
+        call    C_PRTMSG
+        call    C_CRLF
+        ld      hl, 0
+        pop     iy
+        ret
+
+; ---------------------------------------------------------------
+; 6: x_printf -- printf(fmt, ...): minimal C printf.
+; Convention (NOT the framed one): the caller pushed the
+; arguments in source order (fmt first) and loaded
+; A = (number of arguments after fmt) before the CALL;
+; the caller cleans the stack afterwards. printf walks
+; the slots itself: after PUSH IX / LD IX,0 / ADD IX,SP,
+; the return address is at (IX+2), argN at (IX+4) and
+; arg1 (fmt) at (IX + 4 + 2*A). Conversions: %d (signed),
+; %u (unsigned), %c, %s, %%. Any other %-sequence prints
+; the character after '%' as-is. Returns 0. IX/IY kept.
+; ---------------------------------------------------------------
+RTB_06:
+        push    ix
+        ld      ix, 0
+        add     ix, sp
+        ; HL = &arg1 slot = IX + 4 + 2*A
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, 4
+        add     hl, de
+        push    ix
+        pop     de
+        add     hl, de                  ; HL = &fmt slot
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = fmt pointer
+        dec     hl
+        dec     hl                      ; HL = &arg2 slot
+        ld      (xpf_vp), hl            ; self-ref (diff)
+xpf_lp:
+        ld      a, (de)
+        or      a
+        jr      nz, xpf_nz1
+        jp      xpf_done
+xpf_nz1:
+        inc     de
+        cp      '%'
+        jr      z, xpf_fmt
+        call    C_CONOUT
+        jr      xpf_lp
+xpf_fmt:
+        ld      a, (de)
+        or      a
+        jr      nz, xpf_nz2
+        jp      xpf_done                ; trailing '%': stop
+xpf_nz2:
+        inc     de
+        cp      '%'
+        jr      z, xpf_pct
+        cp      'd'
+        jr      z, xpf_dec
+        cp      'u'
+        jr      z, xpf_udec
+        cp      'c'
+        jr      z, xpf_chr
+        cp      's'
+        jr      z, xpf_str
+        call    C_CONOUT                ; unknown: literal
+        jr      xpf_lp
+xpf_pct:
+        ld      a, '%'
+        call    C_CONOUT
+        jr      xpf_lp
+; xpf_arg: fetch the next value slot into BC and advance
+; (xpf_vp) down by 2. Clobbers HL only.
+xpf_arg:
+        ld      hl, (xpf_vp)            ; self-ref (diff)
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        dec     hl
+        dec     hl
+        dec     hl
+        ld      (xpf_vp), hl            ; self-ref (diff)
+        ret
+xpf_chr:
+        call    xpf_arg
+        ld      a, c
+        call    C_CONOUT
+        jr      xpf_lp
+xpf_str:
+        call    xpf_arg
+        ld      l, c
+        ld      h, b
+        call    C_PRTMSG
+        jr      xpf_lp
+xpf_dec:
+        call    xpf_arg                 ; BC = value
+        bit     7, b
+        jr      z, xpf_mag
+        ld      a, '-'
+        call    C_CONOUT
+        ld      l, c
+        ld      h, b
+        call    X_NEGHL                 ; HL = magnitude
+        ld      c, l
+        ld      b, h
+        jr      xpf_mag
+xpf_udec:
+        call    xpf_arg                 ; BC = value
+xpf_mag:
+        ; print BC as unsigned decimal. Digits are produced
+        ; least-significant first into xpf_buf via udiv_core
+        ; (BC = divisor 10, DE = dividend -> DE quot, HL rem;
+        ; udiv_core preserves BC, so BC is reloaded anyway).
+        ld      e, c
+        ld      d, b                    ; DE = value
+        ld      hl, xpf_buf             ; self-ref (diff)
+        ld      (xpf_bp), hl            ; self-ref (diff)
+        xor     a
+        ld      (xpf_cnt), a            ; self-ref (diff)
+xpf_dlp:
+        ld      bc, 10
+        call    X_UDIV_CORE             ; DE = quot, HL = rem
+        ld      a, l
+        add     a, '0'
+        ld      hl, (xpf_bp)            ; self-ref (diff)
+        ld      (hl), a
+        inc     hl
+        ld      (xpf_bp), hl            ; self-ref (diff)
+        ld      hl, xpf_cnt             ; self-ref (diff)
+        inc     (hl)
+        ld      a, d
+        or      e
+        jr      nz, xpf_dlp             ; DE = quotient: again
+xpf_out:
+        ld      hl, (xpf_bp)            ; self-ref (diff)
+xpf_olp:
+        dec     hl
+        ld      (xpf_bp), hl            ; self-ref (diff)
+        ld      a, (hl)
+        call    C_CONOUT
+        ld      hl, xpf_cnt             ; self-ref (diff)
+        dec     (hl)
+        jr      z, xpf_odn
+        ld      hl, (xpf_bp)            ; self-ref (diff)
+        jr      xpf_olp
+xpf_odn:
+        jp      xpf_lp
+xpf_done:
+        ld      hl, 0
+        pop     ix
+        ret
+xpf_vp:
+        dw      0
+xpf_bp:
+        dw      0
+xpf_cnt:
+        defb    0
+xpf_buf:
+        defs    6
+
+; ---------------------------------------------------------------
+; 7: x_getchar -- getchar(): line-buffered character input.
+; The TapeOS console reads whole lines (IOCS GETLIN), so
+; getchar serves one buffered line at a time and returns
+; a '\n' at each line end; there is no EOF. State lives in
+; the routine image (self-references). CR bytes inside the
+; buffer are skipped (GETLIN terminator conventions vary).
+; ---------------------------------------------------------------
+RTB_07:
+        ld      a, (xgc_st)             ; self-ref (diff)
+        cp      1
+        jr      z, xgc_srv
+        cp      2
+        jr      z, xgc_nl
+        ; refill the line buffer
+        ld      hl, xgc_buf             ; self-ref (diff)
+        ld      b, 80
+        call    C_GETLIN                ; A = length
+        ld      (xgc_len), a            ; self-ref (diff)
+        xor     a
+        ld      (xgc_idx), a            ; self-ref (diff)
+        inc     a
+        ld      (xgc_st), a             ; self-ref (diff)
+xgc_srv:
+        ld      a, (xgc_idx)            ; self-ref (diff)
+        ld      hl, xgc_len             ; self-ref (diff)
+        cp      (hl)
+        jr      nc, xgc_eol
+        ld      hl, xgc_buf             ; self-ref (diff)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        ld      hl, xgc_idx             ; self-ref (diff)
+        inc     (hl)
+        cp      00dh
+        jr      z, xgc_srv              ; skip CR
+        ld      l, a
+        ld      h, 0
+        ret
+xgc_eol:
+        ld      a, 2
+        ld      (xgc_st), a             ; self-ref (diff)
+xgc_nl:
+        xor     a
+        ld      (xgc_st), a             ; self-ref (diff)
+        ld      hl, 10                  ; '\n'
+        ret
+xgc_st:
+        defb    0
+xgc_idx:
+        defb    0
+xgc_len:
+        defb    0
+xgc_buf:
+        defs    82
+
+; ---------------------------------------------------------------
+; 8: x_input -- input(): read a line, parse a signed decimal,
+; return it. No digits -> 0.
+; ---------------------------------------------------------------
+RTB_08:
+        ld      hl, xin_buf             ; self-ref (diff)
+        ld      b, 80
+        call    C_GETLIN                ; A = length (unused)
+        ld      hl, xin_buf
+        xor     a
+        ld      (xin_sign), a           ; self-ref (diff)
+        ld      a, (hl)
+        cp      '-'
+        jr      nz, xin_num
+        ld      a, 1
+        ld      (xin_sign), a
+        inc     hl
+xin_num:
+        ld      bc, 0                   ; value in BC
+xin_lp:
+        ld      a, (hl)
+        sub     '0'
+        jr      c, xin_done
+        cp      10
+        jr      nc, xin_done
+        inc     hl
+        push    hl                      ; text pointer
+        ld      l, a
+        ld      h, 0
+        push    hl                      ; digit
+        ld      l, c
+        ld      h, b                    ; HL = value
+        add     hl, hl                  ; *2
+        ld      d, h
+        ld      e, l                    ; DE = *2
+        add     hl, hl                  ; *4
+        add     hl, hl                  ; *8
+        add     hl, de                  ; *10
+        pop     de                      ; digit
+        add     hl, de
+        ld      c, l
+        ld      b, h                    ; BC = new value
+        pop     hl                      ; text pointer
+        jr      xin_lp
+xin_done:
+        ld      l, c
+        ld      h, b
+        ld      a, (xin_sign)           ; self-ref (diff)
+        or      a
+        ret     z
+        jp      X_NEGHL
+xin_sign:
+        defb    0
+xin_buf:
+        defs    82
+
+; ---------------------------------------------------------------
+; 9: x_locate -- locate(x, y): IOCS LOCATE (H = x, L = y).
+; With 2 args pushed in source order, y is at (IY+4) and
+; x at (IY+6).
+; ---------------------------------------------------------------
+RTB_09:
+        push    iy
+        ld      iy, 0
+        add     iy, sp
+        ld      h, (iy + 6)             ; x (low byte)
+        ld      l, (iy + 4)             ; y (low byte)
+        call    C_LOCATE
+        ld      hl, 0
+        pop     iy
+        ret
+
+; ---------------------------------------------------------------
+; 10: x_cls -- cls(): clear screen.
+; ---------------------------------------------------------------
+RTB_10:
+        call    C_CLRSCR
+        ld      hl, 0
+        ret
+
+; ---------------------------------------------------------------
+; 11: x_inkey -- inkey(): code of the key currently down,
+; 0 if none (IOCS INKEY, non-blocking).
+; ---------------------------------------------------------------
+RTB_11:
+        call    C_INKEY
+        ld      l, a
+        ld      h, 0
+        ret
+
+; ---------------------------------------------------------------
+; 12: x_stick -- stick(): direction of the "stick", read from
+; the keyboard (the X1 has no joystick port in this setup).
+;   0 = none, 1 = up, 2 = down, 3 = left, 4 = right.
+; Keys: 8/2/4/6 (numpad style), I/K/J/L, W/S/A/D (either case).
+; Diagonals cannot occur: INKEY reports one key at a time.
+; ---------------------------------------------------------------
+RTB_12:
+        call    C_INKEY
+        ld      hl, 0
+        cp      '8'
+        jr      z, xst_up
+        cp      'I'
+        jr      z, xst_up
+        cp      'i'
+        jr      z, xst_up
+        cp      'W'
+        jr      z, xst_up
+        cp      'w'
+        jr      z, xst_up
+        cp      '2'
+        jr      z, xst_dn
+        cp      'K'
+        jr      z, xst_dn
+        cp      'k'
+        jr      z, xst_dn
+        cp      'S'
+        jr      z, xst_dn
+        cp      's'
+        jr      z, xst_dn
+        cp      '4'
+        jr      z, xst_lf
+        cp      'J'
+        jr      z, xst_lf
+        cp      'j'
+        jr      z, xst_lf
+        cp      'A'
+        jr      z, xst_lf
+        cp      'a'
+        jr      z, xst_lf
+        cp      '6'
+        jr      z, xst_rt
+        cp      'L'
+        jr      z, xst_rt
+        cp      'l'
+        jr      z, xst_rt
+        cp      'D'
+        jr      z, xst_rt
+        cp      'd'
+        jr      z, xst_rt
+        ret
+xst_up:
+        ld      l, 1
+        ret
+xst_dn:
+        ld      l, 2
+        ret
+xst_lf:
+        ld      l, 3
+        ret
+xst_rt:
+        ld      l, 4
+        ret
+
+; ---------------------------------------------------------------
+; 13: x_vsync -- vsync(): frame pacing, about 1/60 s.
+; The stock X1 exposes no guest-readable vertical-sync
+; signal (in the novel, wiring the CRTC V-Sync into a Z80
+; CTC is a hardware mod of its own), so this is a calibrated
+; busy wait. VSYNC_N is tuned against the emulator's frame
+; clock during the sample sessions (see smallc-tos.md).
+; ---------------------------------------------------------------
+VSYNC_N         equ     2560
+RTB_13:
+        push    bc
+        ld      bc, VSYNC_N
+xvs_lp:
+        dec     bc
+        ld      a, b
+        or      c
+        jr      nz, xvs_lp
+        pop     bc
+        ld      hl, 0
+        ret
+
+; ---------------------------------------------------------------
+; 14: x_peek -- peek(addr): byte at addr, zero-extended.
+; ---------------------------------------------------------------
+RTB_14:
+        push    iy
+        ld      iy, 0
+        add     iy, sp
+        ld      l, (iy + 4)
+        ld      h, (iy + 5)
+        ld      a, (hl)
+        ld      l, a
+        ld      h, 0
+        pop     iy
+        ret
+
+; ---------------------------------------------------------------
+; 15: x_poke -- poke(addr, value): store a byte.
+; addr is at (IY+6), value at (IY+4).
+; ---------------------------------------------------------------
+RTB_15:
+        push    iy
+        ld      iy, 0
+        add     iy, sp
+        ld      l, (iy + 6)
+        ld      h, (iy + 7)
+        ld      a, (iy + 4)
+        ld      (hl), a
+        ld      hl, 0
+        pop     iy
+        ret
+
+; ---------------------------------------------------------------
+; 16: x_putc -- putchar(c): write one character (IOCS
+; CONOUT). Returns the character written, as in C.
+; ---------------------------------------------------------------
+RTB_16:
+        push    iy
+        ld      iy, 0
+        add     iy, sp
+        ld      a, (iy + 4)
+        ld      c, a
+        call    C_CONOUT
+        ld      l, c
+        ld      h, 0
+        pop     iy
+        ret
+
+; ---------------------------------------------------------------
+; 17: neg_hl -- HL = -HL (preserves BC, DE; clobbers A).
+; ---------------------------------------------------------------
+RTB_17:
+        xor     a
+        sub     l
+        ld      l, a
+        sbc     a, a
+        sub     h
+        ld      h, a
+        ret
+
+; ---------------------------------------------------------------
+; 18: rtd_setup -- signed divide setup for rt_div / rt_mod.
+; In: DE = dividend, HL = divisor.
+;   divisor == 0 -> carry set (callers return 0).
+;   else BC = |divisor|, DE = |dividend|, carry clear,
+;   A bit7 = sign(dividend) XOR sign(divisor),
+;   A bit6 = sign(dividend).
+; ---------------------------------------------------------------
+RTB_18:
+        ld      a, h
+        or      l
+        scf
+        ret     z                       ; divisor 0: carry
+        ld      a, d
+        xor     h
+        and     080h
+        push    af                      ; combined sign (bit7)
+        ld      a, d
+        and     080h
+        rrca                            ; dividend sign -> bit6
+        ld      c, a
+        pop     af
+        or      c                       ; A = both sign bits
+        push    af
+        bit     7, h
+        jr      z, rtd_hpos
+        call    X_NEGHL                 ; HL = |divisor|
+rtd_hpos:
+        ld      c, l
+        ld      b, h                    ; BC = |divisor|
+        bit     7, d
+        jr      z, rtd_dpos
+        ex      de, hl
+        call    X_NEGHL
+        ex      de, hl                  ; DE = |dividend|
+rtd_dpos:
+        pop     af
+        or      a                       ; clear carry
+        ret
+
+; ---------------------------------------------------------------
+; 19: udiv_core -- BC = divisor (unsigned, nonzero),
+; DE = dividend (unsigned) -> DE = quotient, HL = remainder.
+; ---------------------------------------------------------------
+RTB_19:
+        ld      hl, 0                   ; remainder
+        ld      a, 16
+udc_lp:
+        sla     e
+        rl      d                       ; dividend <<= 1, bit -> carry
+        adc     hl, hl                  ; remainder = rem*2 + carry
+        push    hl
+        or      a
+        sbc     hl, bc
+        jr      nc, udc_ok
+        pop     hl                      ; too big: restore remainder
+        jr      udc_nx
+udc_ok:
+        inc     sp
+        inc     sp                      ; discard saved remainder
+        inc     de                      ; quotient bit = 1
+udc_nx:
+        dec     a
+        jr      nz, udc_lp
+        ret
+
+RTB_END:
+        end
