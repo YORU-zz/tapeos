@@ -1,0 +1,46 @@
+/* game.tb - TinyBASIC sample: a bounded game loop in
+   the style of reloc-plan.md section 5.2. The '@' moves
+   with stick() (keyboard: 8/2/4/6, IKJL, WSAD), one step
+   per vsync() frame, for 180 frames. Signature "TBGM"
+   at 0E680h: +4 = final px, +5 = final py, +6 = frames. */
+
+func int Main()
+    int px, py, f, s
+    px = 20
+    py = 12
+    cls()
+    for f = 0 to 179
+        vsync()
+        s = stick()
+        if s == 3 then
+            if px > 0 then
+                px = px - 1
+            endif
+        endif
+        if s == 4 then
+            if px < 39 then
+                px = px + 1
+            endif
+        endif
+        if s == 1 then
+            if py > 0 then
+                py = py - 1
+            endif
+        endif
+        if s == 2 then
+            if py < 24 then
+                py = py + 1
+            endif
+        endif
+        locate(px, py)
+        putc(64)
+    next
+    poke(0xE680, 0x54)          /* 'T' */
+    poke(0xE681, 0x42)          /* 'B' */
+    poke(0xE682, 0x47)          /* 'G' */
+    poke(0xE683, 0x4D)          /* 'M' */
+    poke(0xE684, px)
+    poke(0xE685, py)
+    poke(0xE686, 180)
+    return 0
+endfunc

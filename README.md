@@ -36,6 +36,7 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
   - NEWASM ― オンマシンアセンブラ（`src/newasm.z80`）
   - SCED ― スクリーンエディタ（`src/sced.z80`）
   - MCED ― MicroEmacs 風エディタ（`src/mced.z80`）。モードレスな Emacs 系操作（C-k キル／C-y ヤンク、リージョン、検索、C-x プレフィクス）で、SCED とは別プログラム。ファイル形式は SCED と互換
+  - TBC / TBI ― TinyBASIC コンパイラ／インタープリタ（`src/tbc.z80`、`src/tbi.z80`、共有コア `src/tbcore.inc`、X1 ライブラリ `src/tblib.z80`）。X-BASIC 風方言（関数定義の集合、int/char、再帰、配列、print/input/stick/vsync など）。TBC は TOSR 実行ファイルを出力し、TBI は関数単位の遅延 JIT で即実行する。サンプルは `src/fib.tb` / `src/calc.tb` / `src/game.tb` など
 
 ### 設計：機種依存部と共通部の分離
 
@@ -64,6 +65,7 @@ newasm.bin、sced.bin、mced.bin など）とディスク／テープイメー�
 
 - `images/shell.d88` ― TapeOS シェルの起動ディスクイメージ
 - `images/mced.d88` ― シェル起動ディスク＋ MCED プログラムファイル入り。起動後に `r mced` / `g 4000` で MCED が使えます
+- `images/tinybasic.d88` ― シェル起動ディスク＋ TBC / TBI とサンプル（FIB.TB / CALC.TB / GAME.TB）入り。起動後に `r tbc` / `g 4000` でコンパイル（SRC/OUT を聞かれます）、`r tbi` / `g 4000` で即実行できます
 - `images/tapeos.cmt` ― テープイメージ（IPL の CMT ブート用）
 - `images/font.d88` ― 漢字フォント（美咲フォント由来）のディスク
 

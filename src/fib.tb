@@ -1,0 +1,36 @@
+/* fib.tb - TinyBASIC sample: recursive fibonacci.
+   Prints FIB(15) and FIB(10) and writes the result
+   signature ("TBRS", tag 1) at 0E680h. */
+
+func int fib(int n)
+    if n < 2 then
+        return n
+    endif
+    return fib(n - 1) + fib(n - 2)
+endfunc
+
+func void sig(int tag, int v0, int v1)
+    poke(0xE680, 0x54)          /* 'T' */
+    poke(0xE681, 0x42)          /* 'B' */
+    poke(0xE682, 0x52)          /* 'R' */
+    poke(0xE683, 0x53)          /* 'S' */
+    poke(0xE684, tag)
+    poke(0xE688, v0 & 255)
+    poke(0xE689, (v0 >> 8) & 255)
+    poke(0xE68A, v1 & 255)
+    poke(0xE68B, (v1 >> 8) & 255)
+endfunc
+
+func int Main()
+    int a, b
+    a = fib(15)
+    b = fib(10)
+    print("FIB(15)=")
+    print(a)
+    print()
+    print("FIB(10)=")
+    print(b)
+    print()
+    sig(1, a, b)
+    return 0
+endfunc

@@ -1,0 +1,8 @@
+/* err.tb - TinyBASIC sample: an undefined variable.
+   TBC and TBI must report ERR LINE 6 E2. */
+
+func int Main()
+    int a
+    a = b + 1
+    return 0
+endfunc
