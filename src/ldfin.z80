@@ -1,0 +1,67 @@
+; ===============================================================
+; ldfin.z80 -- Tiny Scheme loader, final load chunk.
+;
+; Assembled at FINADDR (0xC800) and embedded into the loader
+; image as data.  load_file_n copies it to FINADDR before the
+; actual data read, so the read can overwrite the loader body
+; itself (e.g. loading TapeOS at 0x2000) without losing the
+; code that finishes the job.
+;
+; Entry layout (patched by load_file_n):
+;   +0  jp fin_go
+;   +3  dw dest    (load address of the file body)
+;   +5  dw count   (number of bytes to read)
+;   +7  dw exec    (execution address; 0 = halt loop)
+; fin_go: play, sync to the data block (the tape is already
+; positioned right after the file's info block), read count
+; bytes to dest, stop, jump to exec (or halt).
+; Uses the TapeOS tape_x1.inc primitives with their data
+; variables equated into a scratch page at 0xCF00.
+; ===============================================================
+
+FINADDR         equ     0xC800
+
+SUBCPU          equ     01900h
+PPIB            equ     01a01h
+PPIC            equ     01a02h
+tp_byte         equ     0xCF00
+tp_shadow       equ     0xCF01
+tp_cksum        equ     0xCF02          ; 2 bytes
+tp_zcnt         equ     0xCF04
+
+        org     FINADDR
+
+fin_entry:
+        jp      fin_go
+fin_dest:       dw      0
+fin_count:      dw      0
+fin_exec:       dw      0
+
+fin_go:
+        ld      a, 2
+        call    tp_ctrl                 ; PLAY
+        call    tp_skip1s
+        jr      c, fin_halt
+        ld      d, 19
+        call    tp_skip0
+        jr      c, fin_halt
+        ld      d, 21
+        call    tp_skip1
+        jr      c, fin_halt
+        ld      hl, (fin_dest)
+        ld      de, (fin_count)
+        call    tp_readblk
+        jr      c, fin_halt
+        ld      a, 1
+        call    tp_ctrl                 ; STOP
+        ld      hl, (fin_exec)
+        ld      a, h
+        or      l
+        jr      z, fin_halt
+        jp      (hl)
+fin_halt:
+        halt
+        jr      fin_halt
+
+        include "tape_x1.inc"
+fin_end:

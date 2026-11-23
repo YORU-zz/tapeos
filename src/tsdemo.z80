@@ -1,0 +1,54 @@
+; ===============================================================
+; tsdemo.z80 -- tiny loadable demo program for the Tiny Scheme
+; loader sessions.  Loaded at 0x8000 from the tape, writes its
+; RAM signature "TSDM" at 0xE600 and prints a banner on the X1
+; text screen through direct port writes (no IOCS dependency),
+; then halts.
+; ===============================================================
+
+TXTRAM_L        equ     0x03        ; text VRAM low byte port
+TXTRAM_H        equ     0x04        ; text VRAM high nibble port
+ATTRAM_L        equ     0x05
+ATTRAM_H        equ     0x06
+
+        org     0x8000
+
+start:
+        di
+        ld      hl, sig
+        ld      de, 0xE600
+        ld      bc, 4
+        ldir
+        ; banner at row 2, col 4: VRAM addr = 2*80+4 = 164
+        ld      hl, 164
+        ld      de, msg
+        call    puts
+        halt
+        jr      $-1
+
+; puts: hl = VRAM cell offset, de = NUL-terminated text.
+; Same port scheme as tapeos/src/vram_x1.inc: character RAM at
+; 0x3000+offset, attribute RAM at 0x2000+offset, via out (c).
+puts:
+ploop:
+        ld      a, (de)
+        or      a
+        ret     z
+        ld      c, l
+        ld      a, h
+        add     a, 0x30
+        ld      b, a
+        ld      a, (de)
+        out     (c), a              ; character
+        ld      c, l
+        ld      a, h
+        add     a, 0x20
+        ld      b, a
+        ld      a, 0x07
+        out     (c), a              ; attribute: white
+        inc     hl
+        inc     de
+        jr      ploop
+
+sig:    db      "TSDM"
+msg:    db      "TS DEMO PROGRAM RUNNING", 0
