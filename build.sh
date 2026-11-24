@@ -25,7 +25,7 @@
 #   tsload.bin        Tiny Scheme stage-1 tape loader (IPL loadable)
 #   scmcore.bin       SCMCORE embedded Tiny Scheme core (TOSD file,
 #                     loaded by TinyBASIC/SmallC programs at start)
-#   trdemo.bin        TRDEMO demo program for the Tiny Scheme tape
+#   tsdemo.bin        TSDEMO demo program for the Tiny Scheme tape
 #   kanji.bin         KANJI kanji display program (TOSD, load 0x4000;
 #                     the shell's K command, demoted in roadmap 26)
 #   help.bin          HELP full help text program (TOSD, load 0x4000)
@@ -47,7 +47,7 @@
 #                     RHDBG.TB, TBI, SCMCORE, KANJI, HELP, EP56TEST)
 #   tapeos.cmt        tape image of the shell (IPL CMT boot)
 #   tsboot.cmt        Tiny Scheme 2-stage boot tape (loader +
-#                     script block + TapeOS + TRDEMO)
+#                     script block + TapeOS + TSDEMO)
 set -e
 cd "$(dirname "$0")"
 
@@ -120,7 +120,7 @@ with open("build/finlen.inc", "w") as f:
     f.write("FIN_LEN equ %d\n" % len(data))
 PYEOF
 "$PASMO" -I src -I build src/tsload.z80 build/tsload.bin build/tsload.lst
-"$PASMO" src/trdemo.z80 build/trdemo.bin
+"$PASMO" src/tsdemo.z80 build/tsdemo.bin
 # SCMCORE: the embedded Tiny Scheme core (roadmap 61).  The
 # core source (src/tscore.inc) is shared with TSLOAD; the
 # generator emits the reduced embedded variant.
@@ -174,7 +174,7 @@ python3 tools/mkcmt.py build/tapeos-shell.bin build/tapeos.cmt
 python3 tools/mktape.py --loader build/tsload.bin \
     --script src/stage2.scm --out build/tsboot.cmt \
     --file "TAPEOS:Bin:2000:build/tapeos-shell.bin" \
-    --file "TRDEMO:Bin:8000:build/trdemo.bin"
+    --file "TSDEMO:Bin:8000:build/tsdemo.bin"
 
 echo "== done =="
 ls -l build/
