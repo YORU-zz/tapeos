@@ -81,7 +81,9 @@ newasm.bin、sced.bin、mced.bin など）とディスク／テープイメー�
 - `images/disasm.d88` ― シェル起動ディスク＋ DISASM プログラムファイル入り。起動後に `r disasm` / `g 4000` で逆アセンブルできます（SRC/BASE、またはメモリ範囲 FROM/TO、DATA 範囲、OUT を聞かれます）
 - `images/edas.d88` ― シェル起動ディスク＋ EDAS と EDIS モジュール入り。起動後に `r edas` / `g 4000` で EDAS が使え、`Z` コマンドで逆アセンブルできます（SRC にファイル名、空ならメモリ範囲 FROM/TO、続いて DATA 範囲を聞かれます）
 - `images/tapeos.cmt` ― テープイメージ（IPL の CMT ブート用）
+- `images/tapeos.wav` ― `tapeos.cmt` を変換した WAV 版です。実機で再生して読み込ませる場合や、WAV のまま扱いたい場合はこちらを使ってください（ビット列は `.cmt` と同一です）
 - `images/tsboot.cmt` ― Tiny Scheme 2段階ブートテープ（ローダー＋スクリプトブロック＋ TapeOS ＋ TSDEMO）。IPL の CMT ブートで Tiny Scheme シェルが立ち上がり、`run 1` で TapeOS、`run 2` で TSDEMO が起動します
+- `images/tsboot.wav` ― `tsboot.cmt` を変換した WAV 版です（ビット列は `.cmt` と同一です）
 - `images/font.d88` ― 漢字フォント（美咲フォント由来）のディスク
 
 ## 起動方法
@@ -99,6 +101,8 @@ EMM／RAMDISK は、素の xmil には無い機能を使うため）。
    出れば起動成功です（`h` コマンドでヘルプが表示されます）。
 3. テープ起動を試す場合は、`images/tapeos.cmt` をテープとして
    セットし、IPL メニューから CMT ブートを選んでください。
+   パッチ版コアは `images/tapeos.wav` のような WAV 形式の
+   テープもそのまま再生できます。
 
 ※ エミュレータ側の文字表示には、コア側のシステムフォント
 （FNT0808.X1）が必要です。入手方法は xmil 側リポジトリの
