@@ -21,10 +21,18 @@ I_DWRITE        equ     16
 I_MINIT         equ     17              ; extended IOCS (ep.31),
 I_MDIR          equ     18              ; X1 only: main-memory
 I_MSTORE        equ     19              ; pool (see extiocs_x1.inc)
+I_BEEP          equ     21              ; PSG beep (body: X1, roadmap 26)
+I_RTGET         equ     22              ; RTC read (body: X1, roadmap 26)
+I_BREAK         equ     23              ; break flag (body: X1, roadmap 26)
 I_RREAD         equ     24
 I_RWRITE        equ     25
 I_RINIT         equ     26
 I_MFREE         equ     27              ; extended IOCS (ep.31), X1
+        IF      DEFINED TARGET_X1
+I_SIN           equ     28              ; serial in  (X1 only, roadmap 26)
+I_SOUT          equ     29              ; serial out (X1 only, roadmap 26)
+I_SPOLL         equ     30              ; serial poll (X1 only, roadmap 26)
+        ENDIF
 
 ; absolute addresses of the table entries (call targets)
 C_INKEY         equ     IOCS_BASE + 3 * I_INKEY
@@ -51,4 +59,12 @@ C_RREAD         equ     IOCS_BASE + 3 * I_RREAD
 C_RWRITE        equ     IOCS_BASE + 3 * I_RWRITE
 C_RINIT         equ     IOCS_BASE + 3 * I_RINIT
 C_MFREE         equ     IOCS_BASE + 3 * I_MFREE
+C_BEEP          equ     IOCS_BASE + 3 * I_BEEP
+C_RTGET         equ     IOCS_BASE + 3 * I_RTGET
+C_BREAK         equ     IOCS_BASE + 3 * I_BREAK
+        IF      DEFINED TARGET_X1
+C_SIN           equ     IOCS_BASE + 3 * I_SIN
+C_SOUT          equ     IOCS_BASE + 3 * I_SOUT
+C_SPOLL         equ     IOCS_BASE + 3 * I_SPOLL
+        ENDIF
 

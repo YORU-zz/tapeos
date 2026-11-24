@@ -1,0 +1,179 @@
+; kanji.z80 - KANJI: the Misaki-font Japanese display demo
+; as a TOSD program (load 0x4000).
+;
+; This used to be the shell's built-in K command. Roadmap 26
+; demoted it to a disk program to free shell space for the
+; serial IOCS bodies / RTGET / BEEP / BREAK and the reserved
+; seats; the drawing code itself is unchanged (cmd_kanji.inc
+; and kanji_x1.inc are included verbatim - the shell builds
+; no longer include them, so there is exactly one copy).
+;
+; Run: R KANJI, then G 4000. Needs the MISAKI8 font file on
+; the current FD (drive 0), like the old K command. Writes
+; "MSK8-OK" at 0xE6D0 on success (the old K harness marker).
+
+KF_ADV2         equ     1               ; kanji glyphs are 2 cells wide
+
+        org     04000h
+        jp      cmd_kanji               ; entry
+
+; --- IOCS / work-area equates (X1) ---
+C_PRTMSG        equ     0e409h
+C_DREAD         equ     0e42dh
+NAMEBUF         equ     0e358h
+DIRBUF          equ     0e500h
+FNTBUF          equ     0e800h
+KFSIG           equ     0e6d0h
+DIRREC          equ     32
+
+; --- minimal FD directory layer (from cmd_media.inc) ---
+; dir_load_fd: DIRBUF <- FD directory record.
+dir_load_fd:
+        ld      de, DIRREC
+        ld      hl, DIRBUF
+        jp      C_DREAD
+
+; dir_magic_ok: carry set if DIRBUF lacks the "TOSD" magic.
+dir_magic_ok:
+        ld      hl, dir_magic
+        ld      de, DIRBUF
+        ld      b, 4
+dm_lp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, dm_bad
+        inc     hl
+        inc     de
+        djnz    dm_lp
+        or      a
+        ret
+dm_bad:
+        scf
+        ret
+
+dir_magic:
+        db      "TOSD"
+
+; find_entry: NAMEBUF (10 bytes) -> hl = entry, carry = none.
+find_entry:
+        ld      hl, DIRBUF + 16
+        ld      b, 15
+fe_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, fe_next              ; free slot
+        push    hl
+        push    bc
+        ld      de, NAMEBUF
+        ld      b, 10
+fe_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, fe_dif
+        inc     hl
+        inc     de
+        djnz    fe_cmp
+        pop     bc
+        pop     hl
+        or      a
+        ret                             ; found
+fe_dif:
+        pop     bc
+        pop     hl
+fe_next:
+        ld      de, 16
+        add     hl, de
+        djnz    fe_lp
+        scf
+        ret
+
+; wr_chr2 / wr_att2: X1 text VRAM writers (from vram_x1.inc).
+;   a = raw code / attribute, hl = cell offset.
+wr_chr2:
+        push    af
+        ld      c, l
+        ld      a, h
+        add     a, 030h
+        ld      b, a
+        pop     af
+        out     (c), a
+        ret
+
+wr_att2:
+        push    af
+        ld      c, l
+        ld      a, h
+        add     a, 020h
+        ld      b, a
+        pop     af
+        out     (c), a
+        ret
+
+; The old command ended with JP shell_loop; a TOSD program
+; simply returns. err_exit (a glyph fetch failed mid-draw)
+; also just returns - the partial picture stays on screen.
+shell_loop:
+        ret
+err_exit:
+        ret
+
+        include "src/cmd_kanji.inc"
+        include "src/kanji_x1.inc"
+
+; --- data (moved out of the shell's data_x1.inc) ---
+msg_kanji:
+        db      "JAPANESE BY MISAKI FONT (ON FD)", 13, 10, 0
+msg_kferr:
+        db      "MISAKI8 FONT NOT FOUND ON DISK", 13, 10, 0
+kf_cell:
+        dw      0
+kf_cc:
+        dw      0
+kf_strp:
+        dw      0
+kf_start:
+        dw      0
+kf_rec:
+        dw      0
+kf_dx:
+        db      0
+kf_dy:
+        db      0
+kf_r:
+        db      0
+kf_j0:
+        db      0
+kf_byte:
+        db      0
+kf_ku:
+        db      0
+kf_ten:
+        db      0
+kf_off:
+        db      0
+kf_rem:
+        db      0
+kf_xhi:
+        db      0
+kf_xlo:
+        db      0
+kf_gbuf:
+        db      0, 0, 0, 0, 0, 0, 0, 0
+kf_name:
+        db      "MISAKI8   "
+kf_magic:
+        db      "MSK8"
+kf_sig:
+        db      "MSK8-OK"
+kf_xtab:
+        db      000h, 003h, 00ch, 00fh
+        db      030h, 033h, 03ch, 03fh
+        db      0c0h, 0c3h, 0cch, 0cfh
+        db      0f0h, 0f3h, 0fch, 0ffh
+kf_str1:                                ; OU SHOU (the king)
+        db      18, 6, 30, 13, 0
+kf_str2:                                ; "konnichiha, oushou no
+                                        ;  sekai e youkoso"
+        db      4, 19, 4, 83, 4, 43, 4, 33, 4, 47, 1, 2
+        db      18, 6, 30, 13, 4, 46, 32, 4, 19, 6, 4, 56
+        db      4, 72, 4, 6, 4, 19, 4, 29, 0

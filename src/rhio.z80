@@ -1,0 +1,204 @@
+; rhio.z80 - RHIO: the host program's RDP/1 frame
+; layer (roadmap 26). The TinyBASIC upper layer
+; (rhdbg.tb) is the debugger - command loop,
+; operation sequencing, decisions, formatting -
+; but a TinyBASIC program that uses the Scheme gate
+; must fit in 4 KB of compiled body (SCMCORE lands
+; at 0x9000), and per-byte Scheme evaluation would
+; also exhaust Tiny Scheme's no-GC arena. So the
+; framing, checksums and NAK retries live here as a
+; block routine, the period USR pattern, and
+; TinyBASIC works at transaction level. RHIO is
+; loaded at 0xD000 by the shell before TBI starts
+; and is invoked through the Scheme gate. The
+; address is dictated by the gate: (call) takes
+; its target as a 15-bit fixnum, so only
+; 00000-03FFFH (positive) and 0C000-0FFFFH
+; (negative fixnums) are reachable, and in the
+; SCMCORE map 0C000-0C7FFH is the core's string
+; arena and stack - 0D000H is the first free
+; reachable page above them:
+; SEVAL("(call -12288)").
+;
+; Contract (fixed cells, past the code's end):
+;   0xD0E0  IOCMD:  command byte; 0x85 = wait-only
+;   0xD0E1  IOSTAT: result - reply status (0 = OK,
+;           1 = NAK after retries, 2 = ERR), 0x80 for
+;           a STOP frame, 0xFF = timeout
+;   0xD0E2  IOLEN:  reply payload length
+;   0xD0E3  CNT:    payload length for the send
+;   BUF:    the frame buffer (payload out before
+;           the call, reply payload after), in the
+;           shell's resident Scheme seat (128 bytes
+;           of reserved zeros, roadmap 26 Phase 1) -
+;           scratch use until the resident core
+;           arrives; the address comes from the
+;           shell listing at build time
+;           (src/bufaddr.inc, generated).
+; Behaviour by IOCMD:
+;   0x05 (RUN): send only, IOSTAT = 0.
+;   0x85:       receive one frame (for STOP waits).
+;   others:     send, wait for the reply, verify its
+;               checksum; on NAK or a garbled reply,
+;               resend (3 tries in total).
+; Per-byte receive timeout is ~1 s of SPOLL polling.
+
+        org     0d000h
+SOUT            equ     0e457h
+SPOLL           equ     0e45ah
+SIN             equ     0e454h
+IOCMD           equ     0d0e0h
+IOSTAT          equ     0d0e1h
+IOLEN           equ     0d0e2h
+CNT             equ     0d0e3h
+                include "bufaddr.inc"   ; BUF equ (generated)
+
+xact:
+        ld      a, (IOCMD)
+        cp      085h
+        jr      z, wait_only
+        cp      005h
+        jr      z, send_only
+        ld      b, 3
+x_try:
+        push    bc
+        call    tx_frame
+        call    rx_frame
+        pop     bc
+        jr      c, x_timeout
+        cp      001h            ; NAK: resend
+        jr      z, x_retry
+        cp      0feh            ; garbled reply: resend
+        jr      z, x_retry
+        jr      x_done
+x_retry:
+        djnz    x_try
+        jr      x_done          ; A = 1 or 0xFE
+x_timeout:
+        ld      a, 0ffh
+x_done:
+        ld      (IOSTAT), a
+        ld      hl, 0
+        ret
+send_only:
+        call    tx_frame
+        xor     a
+        jr      x_done
+wait_only:
+        call    rx_frame
+        jr      c, x_timeout
+        jr      x_done
+
+; tx_frame: BUF[0..CNT) as payload, cmd = IOCMD.
+tx_frame:
+        ld      a, 0a5h
+        call    tx_byte
+        ld      a, (IOCMD)
+        call    tx_byte
+        ld      a, (CNT)
+        call    tx_byte
+        ld      a, (IOCMD)
+        ld      hl, CNT
+        xor     (hl)            ; chk = cmd ^ len
+        ld      e, a
+        ld      a, (CNT)
+        or      a
+        jr      z, tx_chk
+        ld      b, a
+        ld      hl, BUF
+tx_lp:
+        ld      a, (hl)
+        push    hl
+        push    bc
+        call    tx_byte
+        pop     bc
+        pop     hl
+        ld      a, e
+        xor     (hl)
+        ld      e, a
+        inc     hl
+        djnz    tx_lp
+tx_chk:
+        ld      a, e
+        call    tx_byte
+        ret
+tx_byte:
+        jp      SOUT            ; A = byte; SOUT returns
+
+; rx_frame: hunt 0x5A, read status/len/payload/chk.
+; -> A = status, payload in BUF, (IOLEN) set.
+;    A = 0xFE on checksum error. Carry on timeout.
+rx_frame:
+        call    rx_timed
+        jr      c, rx_ret
+        cp      05ah
+        jr      nz, rx_frame    ; keep hunting
+        call    rx_timed
+        jr      c, rx_ret
+        ld      (rs_st), a
+        call    rx_timed
+        jr      c, rx_ret
+        ld      (IOLEN), a
+        ld      b, a            ; payload count
+        ld      a, (rs_st)
+        ld      hl, IOLEN
+        xor     (hl)
+        ld      e, a            ; chk so far
+        ld      hl, BUF
+rx_pl:
+        ld      a, b
+        or      a
+        jr      z, rx_ck
+        push    hl
+        push    bc
+        call    rx_timed
+        pop     bc
+        pop     hl
+        jr      c, rx_ret
+        ld      (hl), a
+        ld      a, e
+        xor     (hl)
+        ld      e, a
+        inc     hl
+        djnz    rx_pl
+rx_ck:
+        call    rx_timed
+        jr      c, rx_ret
+        cp      e
+        jr      nz, rx_bad
+        ld      a, (rs_st)
+        or      a               ; carry clear
+        ret
+rx_bad:
+        ld      a, 0feh
+        or      a               ; carry clear
+        ret
+rx_ret:
+        ret                     ; carry set (timeout)
+
+; rx_timed: one byte with a ~1 s SPOLL timeout.
+; -> A = byte (carry clear) or carry set.
+;    Preserves DE: E carries rx_frame's checksum
+;    accumulator across payload bytes.
+rx_timed:
+        push    de
+        ld      de, 0
+rt_w:
+        call    SPOLL
+        or      a
+        jr      nz, rt_have
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, rt_w
+        pop     de
+        scf
+        ret
+rt_have:
+        pop     de
+        call    SIN             ; HL = byte
+        ld      a, l
+        or      a               ; carry clear
+        ret
+rs_st:
+        db      0

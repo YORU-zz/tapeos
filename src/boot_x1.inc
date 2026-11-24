@@ -28,7 +28,7 @@ clr1:
         ; --- build the IOCS jump table at IOCS_BASE ---
         ld      hl, iocs_template
         ld      de, IOCS_BASE
-        ld      bc, 28 * 3
+        ld      bc, 31 * 3              ; entries 0..30 (roadmap 26)
         ldir
 
         IF      DEFINED DBGSTUB

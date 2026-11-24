@@ -33,7 +33,11 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
   メモリ管理（EP.31 由来）や常駐デバッグスタブも含まれます。
 - **IOCS**：アドレス固定のジャンプテーブル経由で呼ばれる入出力
   インタフェース。FD（TOSD 形式）、カセットテープ、EMM 上の
-  RAMDISK を扱います。
+  RAMDISK を扱います。X1 版は31エントリに拡張され、RS-232C
+  ボード経由のシリアル入出力（SIN／SOUT／SPOLL）、BEEP、
+  リアルタイムクロック取得（RTGET）、ブレーク検出（BREAK）
+  の本体を持ちます。シェルには日付時刻を表示する C コマンド
+  があります。
 - **テープの WAV 相互運用**：テープイメージの相互運用形式は
   WAV です。パッチ版 xmil コア（別リポジトリ）が clean な
   PCM WAV の再生／録音に対応し、ホスト側ツール
@@ -50,6 +54,8 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
   - SCC / SCI ― Small-C コンパイラ／インタープリタ（`src/scc.z80`、`src/sci.z80`、共有コア `src/sccore.inc`、X1 ライブラリ `src/clib.z80`）。Small-C サブセット（int/char、1段ポインタ、配列、再帰、構造化制御、#include/#define、printf/getchar など）。SCC は TOSR 実行ファイルを出力し、SCI は関数単位の遅延 JIT で即実行する（コンパイラと実行結果は完全一致）。TinyBASIC との双方向変換ツール `tools/bascvt.py` 付き（共通サブセット外は変換不可として報告される）。サンプルは `src/fib.c` / `src/calc.c` / `src/game.c` など、変換 corpus は `src/cvsum.tb`＋`src/cvsum.c` ほかの対照ペア
   - DISASM ― Z80 逆アセンブラ（`src/disasm.z80`、デコード部は EDIS と共有の `src/disasm_core.inc`／`src/disasm_util.inc`）。TOSD ファイルまたはメモリ範囲を、NEWASM／EDAS で再アセンブル可能なソースへ変換します。全命令（CB／ED／DD／FD プレフィックス含む）に対応し、範囲内の制御フロー飛び先には自動でラベルを生成します。コード／データの区別は DATA 範囲の指定によります。再アセンブルでバイト一致しない非正規エンコーディングは DB として出力する方針で、出力は常に対象とバイト一致します
   - RDBG ― 単独デバッガ（`src/rdbg.z80`、ビルドは `tools/mkrdbg.py`）。TOSR 形式の自己再配置プログラムで、ディレクトリのロードアドレスを変えれば任意のページ境界アドレスで動作します。メモリ表示／変更、全レジスタ表示、RST 方式のワンショットブレークポイント（元バイトの退避・復元つき）、対象プログラムのロードと実行／継続、実行中の ESC キーによる捕獲停止を備えます。逆アセンブル表示（`U` コマンド）は DISASM／EDIS と共有のデコード部を使います。モニタ埋め込みのデバッグスタブとはページ0ベクタの受け渡しで共存し、終了後はスタブもそのまま使えます
+  - 二層リモートデバッガ（第56話）― ターゲット側の最小スタブ RSTUB（`src/rstub.z80`）と、ホスト側の TinyBASIC プログラム RHDBG（`src/rhdbg.tb`）を、RS-232C（i8251）越しのプロトコル RDP/1 でつなぐ二層構成です。プロトコル仕様は `remote-debug-protocol.md` にあります。バイナリ転送、実行、ブレークポイント停止、レジスタ／スタック表示、リンク越しのメモリ書き換え、再開ができます。フレーム処理は機械語ヘルパ RHIO（`src/rhio.z80`、0xD000 配置）が、16進ダンプの整形は RHFMT（`src/rhfmt.z80`、シェルのカーソル表示用予約領域に配置）が担い、RHDBG からは Scheme ゲートの `(call)` で呼びます。自己書き換えを行う検証用デモは `src/rhdemo.z80`、SmallC による代替実装の試作は `src/rhdbg.c` です。キット一式は `images/ep56.d88` に入っています
+  - KANJI / HELP ― シェルの K コマンド（漢字表示）と詳細ヘルプを、シェルの世代交代で TOSD プログラムへ移したものです（`src/kanji.z80` / `src/help.z80`）。シェル本体の H は簡約版になりました
   - Tiny Scheme 2段階ブートローダー ― テープ先頭ローダー（`src/tsload.z80`、最終ロード用チャンク `src/ldfin.z80`）が Tiny Scheme（Z80 アセンブラ製コア、原始手続き 66 個、うち `(random n)`、IOCS RTGET 受け口の `(date)`／`(time)`、機械語ブリッジ `(call addr [hl])` を含む）を内蔵し、直後の固定長スクリプトブロックを検証して評価する。第2段スクリプト（`src/stage2.scm`）が Scheme 自身によるセレクタ／シェルで、スクリプトの保存（テープ全体の再生成）でブート手順が自己進化する。検証用プローブは `src/probe-rand.scm`、テープ作成／解析は `tools/mktape.py` / `tools/lstape.py`
   - SCMCORE ― TinyBASIC／SmallC から Tiny Scheme を呼ぶための組み込みコア（`src/scmcore.z80`、コア本体は単体版と共有の `src/tscore.inc`、組み込み変種の生成は `tools/mkscmcore.py`）。TOSD ファイルとしてディスクに置かれ、言語側のプログラム開始時に自動で読み込まれます。TinyBASIC では `seval("式")`／`scall("名前", 引数...)`／`scmerr()`、SmallC では `scmeval`／`scmcall`／`scmerr` で Scheme の手続きを呼び、整数の結果を受け取ります。サンプルは `src/scm.tb` / `src/scm.c` です
 

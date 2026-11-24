@@ -31,9 +31,9 @@ iocs_template:
         jp      i_stub                  ; 19 SOUT   (serial)
         ENDIF
         jp      i_delay                 ; 20 DELAY
-        jp      i_stub                  ; 21 BEEP   (PSG)
-        jp      i_stub                  ; 22 RTGET  (RTC)
-        jp      i_stub                  ; 23 BREAK
+        jp      i_beep                  ; 21 BEEP   (PSG) (roadmap 26)
+        jp      i_rtget                 ; 22 RTGET  (RTC) (roadmap 26)
+        jp      i_break                 ; 23 BREAK        (roadmap 26)
         jp      i_rread                 ; 24 RREAD  (RAMDISK) (M5)
         jp      i_rwrite                ; 25 RWRITE (RAMDISK) (M5)
         jp      i_rinit                 ; 26 RINIT  (RAMDISK) (M5)
@@ -42,4 +42,7 @@ iocs_template:
         ELSE
         jp      i_stub                  ; 27 (reserved)
         ENDIF
+        jp      i_sin                   ; 28 SIN    (serial) (roadmap 26)
+        jp      i_sout                  ; 29 SOUT   (serial) (roadmap 26)
+        jp      i_spoll                 ; 30 SPOLL  (serial) (roadmap 26)
 

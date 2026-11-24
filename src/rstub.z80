@@ -1,0 +1,770 @@
+; rstub.z80 - RSTUB: the target-side remote-debug stub
+; (roadmap 26, lower layer of the two-layer debugger).
+;
+; Cut from RDBG (sdbg/src/rdbg.z80): the capture entries,
+; register save layout, one-shot RST 30H breakpoint, ESC
+; key-interrupt stop, return catcher and page-0 vector
+; borrowing are RDBG's, unchanged in discipline. What is
+; new is the control channel: instead of a local prompt,
+; the stub speaks the framed serial protocol of
+; ../remote-debug-protocol.md (RDP/1) over the IOCS
+; SIN/SOUT/SPOLL entries (28/29/30, roadmap 26 phase 1).
+;
+; The stub NEVER touches the screen: it has no console
+; output at all, so the target's display survives a debug
+; session untouched (non-interference by construction).
+;
+; Load 0x4000 (TOSD program). Run: R RSTUB, G 4000. It
+; waits for the host's PING on the serial line. QUIT (cmd
+; 0x07) restores the page-0 vectors and returns to the
+; shell.
+;
+; Status mirror (protocol spec section 7): 0xE660:
+;   +0 "RD", +2 status (0FFh starting, 0 waiting,
+;   1 target running), +3 last stop reason, +4..5 PC.
+
+        org     04000h
+
+C_SIN           equ     0e454h          ; IOCS 28
+C_SOUT          equ     0e457h          ; IOCS 29
+C_SPOLL         equ     0e45ah          ; IOCS 30
+SUBCPU          equ     01900h
+PPIB            equ     01a01h
+KBBUF           equ     0e340h
+KBHEAD          equ     0e350h
+KBTAIL          equ     0e351h
+KBPREV          equ     0e352h
+STACKTOP        equ     0e000h
+MIRBLK          equ     0e660h
+
+SYNC_RX         equ     0a5h            ; host -> target
+SYNC_TX         equ     05ah            ; target -> host
+
+; ===============================================================
+; Entry
+; ===============================================================
+start:
+        ld      (saved_sp), sp
+        ld      sp, rs_stack_top
+        ld      hl, MIRBLK
+        ld      (hl), 'R'
+        inc     hl
+        ld      (hl), 'D'
+        inc     hl
+        ld      (hl), 0ffh              ; status: starting
+        xor     a
+        ld      (rs_bps), a
+        ld      (rs_runf), a
+        ld      (rs_rsn), a
+        ld      hl, rs_sv
+        ld      b, 26
+en_iclr:
+        ld      (hl), a
+        inc     hl
+        djnz    en_iclr
+        ld      hl, STACKTOP
+        ld      (rs_sv+14), hl          ; sv SP
+        ; save the monitor's page-0 vectors (0030/0038/0066)
+        ld      hl, 00030h
+        ld      de, rs_vec_save
+        ld      bc, 3
+        ldir
+        ld      hl, 00038h
+        ld      de, rs_vec_save+3
+        ld      bc, 3
+        ldir
+        ld      hl, 00066h
+        ld      de, rs_vec_save+6
+        ld      bc, 3
+        ldir
+        ; plant the stub's vectors
+        ld      a, 0c3h                 ; JP
+        ld      (00030h), a
+        ld      hl, s_bp
+        ld      (00031h), hl
+        ld      a, 0c3h
+        ld      (00038h), a
+        ld      hl, s_int
+        ld      (00039h), hl
+        ld      a, 0c3h
+        ld      (00066h), a
+        ld      hl, s_int
+        ld      (00067h), hl
+        call    rs_disarm               ; key vector off
+        xor     a
+        ld      (MIRBLK+2), a           ; status: waiting
+
+; ===============================================================
+; Main loop: read a frame, dispatch it.
+; ===============================================================
+main_loop:
+        call    rx_frame
+        jr      c, main_loop            ; bad frame (NAK sent)
+        ld      a, (rx_cmd)
+        cp      001h
+        jp      z, cmd_ping
+        cp      002h
+        jp      z, cmd_read
+        cp      003h
+        jp      z, cmd_write
+        cp      004h
+        jp      z, cmd_setbp
+        cp      005h
+        jp      z, cmd_run
+        cp      006h
+        jp      z, cmd_regs
+        cp      007h
+        jp      z, cmd_quit
+        ; unknown: ERR + the offending byte
+        ld      a, (rx_cmd)
+        ld      (txbuf), a
+        ld      a, 1
+        ld      (tx_len), a
+        ld      a, 002h
+        call    tx_frame
+        jr      main_loop
+
+; reply OK with (tx_len) payload bytes at txbuf
+reply_ok:
+        xor     a
+        call    tx_frame
+        jr      main_loop
+
+cmd_ping:
+        ld      hl, ping_id
+        ld      de, txbuf
+        ld      bc, 3
+        ldir
+        ld      a, 3
+        ld      (tx_len), a
+        jp      reply_ok
+ping_id:
+        db      "RD", 001h              ; "RD" + RDP version
+
+cmd_read:
+        ld      hl, (rxbuf)             ; address
+        ld      a, (rxbuf+2)            ; count
+        ld      (tx_len), a
+        ld      de, txbuf
+        ld      b, a
+        or      a
+        jr      z, reply_ok
+cr_lp:
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    cr_lp
+        jp      reply_ok
+
+cmd_write:
+        ld      hl, (rxbuf)             ; address
+        ld      de, rxbuf+2
+        ld      a, (rx_len)
+        sub     2
+        jr      c, cmdw_done            ; len < 2: ignore
+        ld      b, a
+        or      a
+        jr      z, cmdw_done
+cw_lp:
+        ld      a, (de)
+        ld      (hl), a
+        inc     hl
+        inc     de
+        djnz    cw_lp
+cmdw_done:
+        xor     a
+        ld      (tx_len), a
+        jp      reply_ok
+
+cmd_setbp:
+        call    rs_unpatch              ; restore any old one
+        ld      hl, (rxbuf)
+        ld      a, h
+        or      l
+        jr      z, csb_done             ; addr 0 = clear only
+        ld      (rs_bpa), hl
+        ld      a, (hl)
+        ld      (rs_bpb), a
+        ld      a, 0f7h                 ; RST 30H
+        ld      (hl), a
+        ld      a, 1
+        ld      (rs_bps), a
+csb_done:
+        xor     a
+        ld      (tx_len), a
+        jp      reply_ok
+
+cmd_regs:
+        ld      hl, rs_sv
+        ld      de, txbuf
+        ld      bc, 26
+        ldir
+        ld      a, 26
+        ld      (tx_len), a
+        jp      reply_ok
+
+cmd_quit:
+        xor     a
+        ld      (tx_len), a
+        xor     a
+        call    tx_frame                ; OK first
+        call    rs_unpatch
+        call    rs_disarm
+        ld      hl, rs_vec_save
+        ld      de, 00030h
+        ld      bc, 3
+        ldir
+        ld      hl, rs_vec_save+3
+        ld      de, 00038h
+        ld      bc, 3
+        ldir
+        ld      hl, rs_vec_save+6
+        ld      de, 00066h
+        ld      bc, 3
+        ldir
+        ld      a, 0ffh
+        ld      (MIRBLK+2), a           ; status: gone
+        ld      sp, (saved_sp)
+        ei                              ; the shell runs
+        ret                             ; interruptible
+
+cmd_run:
+        ld      hl, (rxbuf)
+        ld      a, h
+        cp      0ffh
+        jr      nz, cr_fresh
+        ld      a, l
+        cp      0ffh
+        jr      z, cr_go                ; 0xFFFF = continue
+cr_fresh:
+        ; fresh context: registers zero, PC = addr,
+        ; SP = STACKTOP-2 with the return catcher planted,
+        ; IFF2 on so a fresh run is ESC-breakable.
+        xor     a
+        ld      hl, rs_sv
+        ld      b, 26
+cr_clr:
+        ld      (hl), a
+        inc     hl
+        djnz    cr_clr
+        ld      hl, (rxbuf)
+        ld      (rs_sv+12), hl          ; PC
+        ld      hl, STACKTOP-2
+        ld      (rs_sv+14), hl          ; SP
+        ld      de, s_retcatch
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      a, 004h
+        ld      (rs_sv+25), a           ; IFF2 = 1
+cr_go:
+        ld      a, 1
+        ld      (MIRBLK+2), a           ; status: running
+        jp      resume
+
+; stopped: a capture happened. Send the STOP frame
+; (reason + 26-byte register block), back to the loop.
+stopped:
+        call    rs_drain
+        ld      a, (rs_rsn)
+        ld      (MIRBLK+3), a
+        ld      hl, (rs_sv+12)
+        ld      (MIRBLK+4), hl
+        ld      (txbuf), a
+        ld      hl, rs_sv
+        ld      de, txbuf+1
+        ld      bc, 26
+        ldir
+        ld      a, 27
+        ld      (tx_len), a
+        ld      a, 080h                 ; STOP status
+        call    tx_frame
+        xor     a
+        ld      (MIRBLK+2), a           ; status: waiting
+        ld      (rs_rsn), a
+        jp      main_loop
+
+; ===============================================================
+; Frame transport (protocol spec sections 2 and 6)
+; ===============================================================
+; tx_frame: A = status/cmd byte; payload at txbuf,
+; length (tx_len). Sends SYNC_TX, cmd, len, payload, XOR.
+tx_frame:
+        ld      (tx_st), a
+        ld      a, (tx_len)
+        ld      c, a
+        ld      a, (tx_st)
+        xor     c
+        ld      (tx_chk), a             ; chk = cmd ^ len
+        ld      a, SYNC_TX
+        call    C_SOUT
+        ld      a, (tx_st)
+        call    C_SOUT
+        ld      a, (tx_len)
+        call    C_SOUT
+        ld      a, (tx_len)
+        or      a
+        jr      z, txf_chk
+        ld      hl, txbuf
+        ld      b, a
+txf_lp:
+        ld      a, (hl)
+        push    af
+        call    C_SOUT
+        pop     af
+        push    hl
+        ld      hl, tx_chk
+        xor     (hl)
+        ld      (hl), a
+        pop     hl
+        inc     hl
+        djnz    txf_lp
+txf_chk:
+        ld      a, (tx_chk)
+        call    C_SOUT
+        ret
+
+; rx_frame: hunt SYNC_RX (blocking), then timed reads.
+; -> carry set on timeout or checksum error (NAK sent on
+; checksum error). rx_cmd / rx_len / rxbuf filled.
+rx_frame:
+        call    C_SIN
+        cp      SYNC_RX
+        jr      nz, rx_frame
+        call    rx_timed
+        ret     c
+        ld      (rx_cmd), a
+        ld      (rx_chk), a
+        call    rx_timed
+        ret     c
+        ld      (rx_len), a
+        ld      hl, rx_chk
+        xor     (hl)
+        ld      (hl), a                 ; chk ^= len
+        ld      a, (rx_len)
+        or      a
+        jr      z, rxf_chk
+        ld      de, rxbuf
+        ld      b, a
+rxf_lp:
+        call    rx_timed
+        ret     c
+        ld      (de), a
+        inc     de
+        ld      c, a
+        ld      a, (rx_chk)
+        xor     c
+        ld      (rx_chk), a
+        djnz    rxf_lp
+rxf_chk:
+        call    rx_timed
+        ret     c
+        ld      c, a
+        ld      a, (rx_chk)
+        cp      c
+        jr      z, rxf_ok
+        ; checksum error: NAK, carry set
+        xor     a
+        ld      (tx_len), a
+        ld      a, 001h
+        call    tx_frame
+        scf
+        ret
+rxf_ok:
+        or      a
+        ret
+
+; rx_timed: one byte with a timeout (SPOLL loop).
+; -> A = byte, carry clear; carry set on timeout.
+; Clobbers HL (SIN's documented behaviour too).
+rx_timed:
+        ld      hl, 0                   ; ~65536 polls
+rt_lp:
+        push    hl
+        call    C_SPOLL
+        pop     hl
+        or      a
+        jr      nz, rt_have
+        dec     hl
+        ld      a, h
+        or      l
+        jr      nz, rt_lp
+        scf
+        ret
+rt_have:
+        call    C_SIN
+        or      a
+        ret
+
+; ===============================================================
+; Capture entries (from RDBG, unchanged in discipline).
+; s_bp: RST 30H vector (the stack holds the address
+; after the patched byte). s_int: key interrupt, IM 1
+; vector (also NMI). s_retcatch: a fresh target RETurned
+; here.
+; ===============================================================
+s_bp:
+        ld      (rs_spraw), sp
+        ld      sp, rs_stack_top
+        push    af                      ; reason store must
+        ld      a, 'B'                  ; not clobber A
+        ld      (rs_rsn), a
+        pop     af
+        jr      cap_body
+s_retcatch:
+        ld      (rs_spraw), sp
+        ld      sp, rs_stack_top
+        push    af
+        ld      a, 'R'
+        ld      (rs_rsn), a
+        pop     af
+        jr      cap_body
+s_int:
+        ld      (rs_spraw), sp
+        ld      sp, rs_stack_top
+        push    af
+        push    bc
+        push    de
+        push    hl
+        call    rs_rd_txn               ; -> A = key code
+        ld      (rs_key), a
+        ld      a, (rs_runf)
+        or      a
+        jr      z, si_fwd
+        ld      a, (rs_key)
+        cp      01bh                    ; ESC?
+        jr      z, si_stop
+si_fwd:
+        ; Not a break: forward the key into the shell's
+        ; ring buffer, so a target polling KEYIN/INKEY
+        ; still receives it.
+        ld      a, (rs_key)
+        or      a
+        jr      z, si_ret
+        ld      (KBPREV), a
+        ld      a, (KBHEAD)
+        inc     a
+        and     00fh
+        ld      c, a                    ; C = next head
+        ld      a, (KBTAIL)
+        cp      c
+        jr      z, si_ret               ; ring full: drop
+        ld      a, (KBHEAD)
+        ld      hl, KBBUF
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (rs_key)
+        ld      (hl), a
+        ld      a, c
+        ld      (KBHEAD), a
+si_ret:
+        pop     hl
+        pop     de
+        pop     bc
+        pop     af
+        ld      sp, (rs_spraw)
+        ei                              ; this core re-enables
+        reti                            ; via EI (see RDBG note)
+si_stop:
+        ld      a, 'I'
+        ld      (rs_rsn), a
+        pop     hl
+        pop     de
+        pop     bc
+        pop     af
+        jr      cap_body
+
+; rs_rd_txn: read the interrupt-staged sub-CPU
+; transaction. The core stages both bytes before
+; raising the interrupt, so no waits are needed.
+; First byte = function/flags (discarded), second =
+; ASCII code -> A.
+rs_rd_txn:
+        push    bc
+        ld      bc, SUBCPU
+        in      a, (c)
+        in      a, (c)
+        pop     bc
+        ret
+
+; ===============================================================
+; cap_body: capture every register into the save area.
+; Entered with SP = stub stack and (rs_spraw) = the
+; target SP, pointing at the pushed PC (breakpoint /
+; interrupt) or just past the target's balanced stack
+; (return catcher).
+; ===============================================================
+cap_body:
+        push    af
+        push    bc
+        push    de
+        push    hl
+        push    ix
+        push    iy
+        ex      af, af'
+        push    af                      ; shadow AF
+        exx
+        push    bc                      ; shadow BC
+        push    de                      ; shadow DE
+        push    hl                      ; shadow HL
+        exx
+        ex      af, af'
+        call    rs_disarm               ; vector off while
+                                        ; the stub has control
+        ; stub stack, top down: SHL SDE SBC SAF IY IX
+        ; HL DE BC AF
+        pop     hl
+        ld      (rs_sv+22), hl          ; HL'
+        pop     de
+        ld      (rs_sv+20), de          ; DE'
+        pop     bc
+        ld      (rs_sv+18), bc          ; BC'
+        pop     af
+        push    af
+        pop     hl
+        ld      (rs_sv+16), hl          ; AF'
+        pop     iy
+        ld      (rs_sv+0), iy
+        pop     ix
+        ld      (rs_sv+2), ix
+        pop     hl
+        ld      (rs_sv+4), hl
+        pop     de
+        ld      (rs_sv+6), de
+        pop     bc
+        ld      (rs_sv+8), bc
+        pop     af
+        push    af
+        pop     hl
+        ld      (rs_sv+10), hl          ; AF
+        ld      hl, (rs_spraw)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (rs_sv+12), de          ; PC
+        ld      hl, (rs_spraw)
+        inc     hl
+        inc     hl
+        ld      (rs_sv+14), hl          ; SP before the push
+        ld      a, i
+        ld      (rs_sv+24), a           ; I
+        push    af
+        pop     hl
+        ld      a, l
+        ld      (rs_sv+25), a           ; LD A,I flags (bit2)
+        ; reason-specific fixups
+        ld      a, (rs_rsn)
+        cp      'I'
+        jr      z, cap_int
+        cp      'B'
+        jr      z, cap_bp
+        cp      'R'
+        jr      z, cap_ret
+        jr      cap_done
+cap_int:
+        ; Interrupt delivery proves the target ran with
+        ; interrupts enabled (the core's DI latch makes
+        ; LD A,I read "disabled" here). Record IFF2 = 1
+        ; so C resumes interruptible.
+        ld      a, (rs_sv+25)
+        or      004h
+        ld      (rs_sv+25), a
+        jr      cap_done
+cap_bp:
+        ld      hl, (rs_sv+12)
+        dec     hl                      ; PC = patched byte
+        ld      (rs_sv+12), hl
+        call    rs_unpatch              ; restore + disarm
+        jr      cap_done
+cap_ret:
+        ld      hl, (rs_spraw)
+        ld      (rs_sv+14), hl          ; SP was balanced
+        ld      hl, s_retcatch
+        ld      (rs_sv+12), hl          ; PC = catcher itself
+cap_done:
+        xor     a
+        ld      (rs_runf), a
+        jp      stopped
+
+; rs_unpatch: restore the byte hidden by the patch.
+rs_unpatch:
+        ld      a, (rs_bps)
+        or      a
+        ret     z
+        ld      hl, (rs_bpa)
+        ld      a, (rs_bpb)
+        ld      (hl), a
+        xor     a
+        ld      (rs_bps), a
+        ret
+
+; ===============================================================
+; resume: restore everything and RETI into the target.
+; The key vector is armed first and the target always
+; runs in IM 1; EI is the last step before RETI iff the
+; captured IFF2 was set (the tail byte is patched) -
+; RDBG's proven discipline.
+; ===============================================================
+resume:
+        ld      a, 038h
+        call    rs_setvec               ; arm key interrupt
+        im      1
+        ld      a, (rs_sv+25)
+        and     004h
+        ld      a, 000h
+        jr      z, rs_ei
+        ld      a, 0fbh                 ; EI
+rs_ei:
+        ld      (rs_ei_slot), a
+        ld      a, 1
+        ld      (rs_runf), a
+        ld      a, (rs_sv+24)
+        ld      i, a                    ; I
+        ld      hl, (rs_sv+16)          ; AF'
+        push    hl
+        ld      hl, (rs_sv+22)          ; HL'
+        push    hl
+        ld      hl, (rs_sv+20)          ; DE'
+        push    hl
+        ld      hl, (rs_sv+18)          ; BC' (top)
+        push    hl
+        exx
+        ex      af, af'
+        pop     bc
+        pop     de
+        pop     hl
+        pop     af
+        exx
+        ex      af, af'
+        ld      hl, (rs_sv+14)
+        dec     hl
+        dec     hl
+        ld      (rs_sv+14), hl          ; SP slot for the PC
+        ld      de, (rs_sv+12)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d                 ; PC planted on stack
+        ld      sp, rs_sv               ; save-area image:
+        pop     iy                      ; IY IX HL DE BC AF
+        pop     ix
+        pop     hl
+        pop     de
+        pop     bc
+        pop     af
+        ld      sp, (rs_sv+14)
+rs_ei_slot:
+        nop                             ; patched to EI if IFF2
+        reti
+
+; ===============================================================
+; Sub-CPU key vector control (RDBG's procedures; the
+; monitor's kb_raw is not callable from here, so the raw
+; transaction is done directly on the ports - it is a
+; hardware protocol).
+; ===============================================================
+; rs_setvec: program the key-interrupt vector
+; (command 0E4h + one data byte; 0 disarms). A staged
+; transaction is drained first (rs_kbraw), because the
+; core drops command bytes while one is staged.
+rs_setvec:
+        ld      (rs_vec), a
+        call    rs_kbraw                ; drain (discarded)
+        ld      bc, PPIB
+        ld      e, 0
+sv_w1:
+        in      a, (c)
+        and     040h
+        jr      z, sv_s1
+        dec     e
+        jr      nz, sv_w1
+sv_s1:
+        ld      bc, SUBCPU
+        ld      a, 0e4h
+        out     (c), a
+        ld      bc, PPIB
+        ld      e, 0
+sv_w2:
+        in      a, (c)
+        and     040h
+        jr      z, sv_s2
+        dec     e
+        jr      nz, sv_w2
+sv_s2:
+        ld      bc, SUBCPU
+        ld      a, (rs_vec)
+        out     (c), a
+        ret
+rs_disarm:
+        xor     a
+        jr      rs_setvec
+
+; rs_kbraw: one raw sub-CPU key transaction (the
+; IPL's KBHIT, command 0E6h). -> A = ASCII code of
+; the key currently down, or 0. Preserves BC.
+rs_kbraw:
+        push    bc
+        ld      bc, PPIB
+sk_w1:
+        in      a, (c)
+        and     040h
+        jr      nz, sk_w1               ; wait while busy
+        ld      bc, SUBCPU
+        ld      a, 0e6h                 ; key input command
+        out     (c), a
+        ld      bc, PPIB
+sk_w2:
+        in      a, (c)
+        and     040h
+        jr      nz, sk_w2
+        call    sk_read                 ; function byte (drop)
+        call    sk_read                 ; ASCII byte -> A
+        pop     bc
+        ret
+sk_read:
+        ld      bc, PPIB
+skr_w:
+        in      a, (c)
+        and     020h
+        jr      nz, skr_w
+        ld      bc, SUBCPU
+        in      a, (c)
+        ret
+
+; rs_drain: discard keyboard input that arrived while
+; a target ran (it belongs to the run, not to the
+; protocol) and re-sync the edge filter.
+rs_drain:
+        ld      a, (KBTAIL)
+        ld      (KBHEAD), a             ; ring empty
+        call    rs_kbraw
+        ld      (KBPREV), a
+        ret
+
+; ===============================================================
+; Work areas
+; ===============================================================
+saved_sp:       dw      0
+rx_cmd:         db      0
+rx_len:         db      0
+rx_chk:         db      0
+tx_st:          db      0
+tx_len:         db      0
+tx_chk:         db      0
+rs_sv:          ds      26              ; captured registers
+rs_spraw:       dw      0               ; target SP at capture
+rs_key:         db      0               ; key from interrupt
+rs_vec:         db      0               ; vector byte to send
+rs_runf:        db      0               ; 1 while target runs
+rs_rsn:         db      0               ; stop reason B/I/R
+rs_bpa:         dw      0               ; breakpoint address
+rs_bpb:         db      0               ; byte under the patch
+rs_bps:         db      0               ; 1 while BP armed
+rs_vec_save:    ds      9               ; saved page-0 vectors
+rxbuf:          ds      256
+txbuf:          ds      256
+rs_stack:       ds      256
+rs_stack_top:
+
+        end

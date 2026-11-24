@@ -1,0 +1,61 @@
+; rhdemo.z80 - RHDEMO: the remote-debug target demo
+; (roadmap 26). A deliberately self-modifying program:
+; every pass rewrites the operand of its own LD A,n
+; instruction (sm_exec) with the pass counter, then
+; executes it and prints the digit. It runs maxpass
+; passes (a byte in memory the host can patch over the
+; link to prove WRITE works), prints a banner at start
+; and at end (so the target screen proves the stub
+; never touched it), leaves "SM-OK" + the final count
+; at 0xE670, and RETs (the stub's return catcher turns
+; that into stop reason R).
+;
+; Load 0x8000 (placed there by the host over the link,
+; not by the shell).
+;
+; Labels the host program needs (extracted from the
+; listing by ep56/build.sh): start, sm_exec, maxpass.
+
+        org     08000h
+CONOUT          equ     0e406h
+PRTMSG          equ     0e409h
+SIG             equ     0e670h
+
+start:
+        ld      hl, msg_title
+        call    PRTMSG
+        xor     a
+        ld      (cnt), a
+loop:
+        ld      a, (cnt)
+        inc     a
+        ld      (cnt), a
+        ld      hl, sm_exec+1           ; the operand byte
+        ld      (hl), a                 ; self-modify
+sm_exec:
+        ld      a, 0                    ; <- rewritten per pass
+        add     a, '0'
+        call    CONOUT                  ; print the pass digit
+        ld      a, (cnt)
+        ld      hl, maxpass
+        cp      (hl)
+        jr      c, loop
+        ld      hl, msg_done
+        call    PRTMSG
+        ld      hl, sig_text
+        ld      de, SIG
+        ld      bc, 5
+        ldir
+        ld      a, (cnt)
+        ld      (SIG+5), a
+        ret
+maxpass:
+        db      5
+cnt:
+        db      0
+msg_title:
+        db      "RHDEMO START ", 0
+msg_done:
+        db      " RHDEMO DONE", 13, 10, 0
+sig_text:
+        db      "SM-OK"

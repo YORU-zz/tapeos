@@ -46,6 +46,14 @@ kb_poll:
         ld      a, c
         or      a
         jr      nz, kbpl_ret            ; held, not an edge
+        IF      DEFINED BRKFLAG
+        ld      a, b
+        cp      01bh                    ; ESC press edge: set the
+        jr      nz, kbpl_nobrk          ; BREAK flag (roadmap 26,
+        ld      a, 1                    ; addendum 4: CONOUT's
+        ld      (brk_flag), a           ; polling carries it)
+kbpl_nobrk:
+        ENDIF
         ld      a, (KBHEAD)
         inc     a
         and     00fh
@@ -137,6 +145,9 @@ i_conout:
         push    bc
         push    de
         push    hl
+        IF      DEFINED HAS_CURSOR_SEAT
+        call    cursor_hook             ; wish 23 seat (roadmap 26):
+        ENDIF                           ; a = char, must preserve all
         call    kb_poll                 ; M4: scan keys while printing
         cp      00dh
         jr      z, co_cr

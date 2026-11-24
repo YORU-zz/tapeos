@@ -102,64 +102,9 @@ fr_full:
         db      0
 fr_rem:
         db      0
-kf_cell:
-        dw      0
-kf_cc:
-        dw      0
-kf_strp:
-        dw      0
-kf_start:
-        dw      0
-kf_rec:
-        dw      0
-kf_dx:
-        db      0
-kf_dy:
-        db      0
-kf_r:
-        db      0
-kf_j0:
-        db      0
-kf_byte:
-        db      0
-kf_ku:
-        db      0
-kf_ten:
-        db      0
-kf_off:
-        db      0
-kf_rem:
-        db      0
-kf_xhi:
-        db      0
-kf_xlo:
-        db      0
-kf_gbuf:
-        db      0, 0, 0, 0, 0, 0, 0, 0
-
-; Misaki font support data (see cmd_kanji). The hand-made
-; 16x16 glyphs that M4 used here were removed: the Misaki
-; font covers all of JIS X 0208, including OU and SHOU.
-kf_name:
-        db      "MISAKI8   "
-kf_magic:
-        db      "MSK8"
-kf_sig:
-        db      "MSK8-OK"
-; 2x expansion table: nibble -> byte with every bit doubled
-kf_xtab:
-        db      000h, 003h, 00ch, 00fh
-        db      030h, 033h, 03ch, 03fh
-        db      0c0h, 0c3h, 0cch, 0cfh
-        db      0f0h, 0f3h, 0fch, 0ffh
-; Demo strings as JIS X 0208 (ku, ten) pairs, 0-terminated.
-kf_str1:                                ; OU SHOU (the king)
-        db      18, 6, 30, 13, 0
-kf_str2:                                ; "konnichiha, oushou no
-                                        ;  sekai e youkoso"
-        db      4, 19, 4, 83, 4, 43, 4, 33, 4, 47, 1, 2
-        db      18, 6, 30, 13, 4, 46, 32, 4, 19, 6, 4, 56
-        db      4, 72, 4, 6, 4, 19, 4, 29, 0
+; The kf_* kanji work area and font data used to live here;
+; they moved into the KANJI TOSD program (roadmap 26 -
+; the shell's K command was demoted to a disk program).
 
 sig_text:
         db      "TAPEOS-M2-SHELL"
@@ -176,23 +121,9 @@ msg_err:
 msg_ver:
         db      "TAPEOS M5 - OUROBO/ROS REPRO PROJECT", 0
 msg_help:
-        db      "H: HELP   D [A]: DUMP 128 BYTES", 13, 10
-        db      "E A: EXAMINE/MODIFY BYTES", 13, 10
-        db      "M A B..: WRITE BYTES", 13, 10
-        db      "G [A]: CALL (NO ARG = DEMO)", 13, 10
-        db      "T [NAME]: LOAD FROM TAPE", 13, 10
-        db      "S A L [NAME]: SAVE TO TAPE (NEW)", 13, 10
-        db      "A A L [NAME]: APPEND TO TAPE", 13, 10
-        db      "F: LIST FILES (CURRENT DRIVE)", 13, 10
-        db      "W NAME A L: SAVE TO DRIVE", 13, 10
-        db      "R NAME: LOAD FROM DRIVE", 13, 10
-        db      "U [D]: DRIVE SELECT (0=FD 1=RAMDISK)", 13, 10
-        db      "I [N]: INIT RAMDISK (N BLOCKS, HEX)", 13, 10
-        db      "K: KANJI DEMO   V: VERSION", 13, 10
-        IF      DEFINED EXTIOCS
-        db      "N: MEMORY (EP.31)", 13, 10
-        ENDIF
-        db      "X: RESIDENT DEBUG STUB", 0
+        db      "H D E M G T S A F W R U I C X V N", 13, 10
+        db      "FULL HELP IS THE 'HELP' PROGRAM ON DISK", 13, 10
+        db      "KANJI IS THE 'KANJI' PROGRAM ON DISK", 0
 msg_tload:
         db      " LOADED", 13, 10, 0
 msg_tsave:
@@ -201,12 +132,8 @@ msg_fdsave:
         db      " SAVED", 13, 10, 0
 msg_nofile:
         db      "NO FILES", 13, 10, 0
-msg_kanji:
-        db      "JAPANESE BY MISAKI FONT (ON FD)", 13, 10, 0
-msg_kferr:
-        db      "MISAKI8 FONT NOT FOUND ON DISK", 13, 10, 0
 msg_demo:
-        db      "HELLO FROM G", 13, 10, 0
+        db      "DEMO IS ON DISK: R DEMO1, THEN G", 13, 10, 0
 msg_drv0:
         db      "DRIVE 0: FD", 13, 10, 0
 msg_drv1:

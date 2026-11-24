@@ -1,0 +1,35 @@
+; help.z80 - HELP: the full shell help text as a TOSD
+; program (load 0x4000).
+;
+; The shell's H command used to carry this whole text in
+; the shell body. Roadmap 26 compressed the built-in help
+; to three lines and moved the full text here, to free
+; shell space for the serial IOCS bodies / RTGET / BEEP /
+; BREAK and the reserved seats.
+;
+; Run: R HELP, then G 4000.
+
+        org     04000h
+PRTMSG          equ     0e409h
+
+        ld      hl, msg_help_full
+        call    PRTMSG
+        ret
+
+msg_help_full:
+        db      "H: HELP   D [A]: DUMP 128 BYTES", 13, 10
+        db      "E A: EXAMINE/MODIFY BYTES", 13, 10
+        db      "M A B..: WRITE BYTES", 13, 10
+        db      "G [A]: CALL (NO ARG = DEMO NOTE)", 13, 10
+        db      "T [NAME]: LOAD FROM TAPE", 13, 10
+        db      "S A L [NAME]: SAVE TO TAPE (NEW)", 13, 10
+        db      "A A L [NAME]: APPEND TO TAPE", 13, 10
+        db      "F: LIST FILES (CURRENT DRIVE)", 13, 10
+        db      "W NAME A L: SAVE TO DRIVE", 13, 10
+        db      "R NAME: LOAD FROM DRIVE", 13, 10
+        db      "U [D]: DRIVE SELECT (0=FD 1=RAMDISK)", 13, 10
+        db      "I [N]: INIT RAMDISK (N BLOCKS, HEX)", 13, 10
+        db      "C: DATE AND TIME   V: VERSION", 13, 10
+        db      "N: MEMORY (EP.31)", 13, 10
+        db      "X: RESIDENT DEBUG STUB", 13, 10
+        db      "KANJI / HELP: DISK PROGRAMS (R + G 4000)", 0

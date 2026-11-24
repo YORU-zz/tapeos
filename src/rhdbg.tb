@@ -1,0 +1,262 @@
+/* rhdbg.tb - RHDBG: the host-side upper layer of the
+   two-layer remote debugger (roadmap 26), written in
+   TinyBASIC as in the fiction (ep.56: the upper layer
+   ran on the MBC-55 host in TinyBASIC).
+   It speaks RDP/1 (see remote-debug-protocol.md) to
+   RSTUB on the target machine, over IOCS SIN/SOUT.
+
+   Division of labour, shaped by two measured walls:
+   a TinyBASIC program holds at most 16 functions
+   (FMAX), and one that uses the Scheme gate must fit
+   a 4 KB compiled body because SCMCORE lands at
+   0x9000 (a full frame-level draft measured 8,157
+   bytes; see debugger-ep56.md). So this program is
+   the debugger - command loop, operation sequencing,
+   decisions, interpretation - while the byte-level
+   mechanics live in two small ML helpers called
+   through the Scheme gate's (call) primitive
+   (roadmap 61), the period USR-routine pattern:
+   RHIO (src/rhio.z80, at 0xD000) does framing,
+   checksums and NAK retries; RHFMT (src/rhfmt.z80,
+   in the shell's cursor seat) renders hex dumps.
+   Per-byte Scheme calls were never an option: they
+   would exhaust Tiny Scheme's no-GC arena. RHIO
+   sits at 0xD000 because (call) takes its address
+   as a 15-bit fixnum: only 0x0000-0x3FFF (positive)
+   and 0xC000-0xFFFF (negative, hence "(call
+   -12288)") are reachable; 0x4000-0xBFFF is a
+   dead zone, and 0xC000-0xC7FF is SCMCORE's own
+   string arena / stack. RHFMT's seat at 12396 is
+   positive-reachable.
+   RHIO's frame buffer is the shell's resident
+   Scheme seat (scratch use; 12523 from the shell
+   listing). The demo binary sits in host RAM at
+   0x8F00 (shell-loaded from the RHDEMO file).
+
+   Keys (single letters): L load demo, B set BP +
+   run, D dump at PC, S stack dump, W patch
+   maxpass=9, C continue (BP re-armed), G go (BP
+   cleared), Q quit. (The REGS command is exercised
+   implicitly: every STOP carries the same block.)
+   Evidence at 0xE680: "RH", stops, last reason,
+   ping ok, load ok, maxpass readback, demo count,
+   link errors at 0xE68A, quit-done (81) at 0xE68C. */
+
+int stops, lastrsn, pcval, spval, linkerr
+int mpval, dcount
+
+/* reply payload byte i (frame buffer at 12523) */
+func int rb(int i)
+    return peek(12523 + i)
+endfunc
+
+/* one RHIO transaction: cmd with cnt payload bytes
+   already in the frame buffer; 133 = wait-only.
+   Returns IOSTAT: 0 OK, 1 NAK, 2 ERR, 128 STOP,
+   255 timeout. */
+func int xact(int cmd, int cnt)
+    int dummy
+    poke(0xD0E3, cnt)
+    poke(0xD0E0, cmd)
+    dummy = SEVAL("(call -12288)")
+    return peek(0xD0E1)
+endfunc
+
+/* print the text RHFMT rendered at 12523 + 32 */
+func void printbuf()
+    int i, c
+    i = 0
+    c = peek(12523 + 32)
+    while c != 0
+        putc(c)
+        i = i + 1
+        c = peek(12523 + 32 + i)
+    endwhile
+endfunc
+
+/* register dump: the 26-byte block in the reply
+   payload at offset off (1 for STOP, 0 for REGS),
+   order IY IX HL DE BC AF PC SP AF' BC' DE' HL' I F */
+func void showregs(int off)
+    int dummy
+    poke(0xD0E4, off)
+    poke(0xD0E5, 26)
+    dummy = SEVAL("(call 12398)")
+    printbuf()
+endfunc
+
+func void cmd_load()
+    int i, r, base, n
+    r = xact(1, 0)
+    if r != 0 then
+        print("PING NG")
+        return
+    endif
+    if rb(0) == 82 && rb(1) == 68 && rb(2) == 1 then
+        poke(0xE684, 1)
+    else
+        print("BAD")
+        return
+    endif
+    base = 0
+    while base < 97
+        n = 97 - base
+        if n > 90 then
+            n = 90
+        endif
+        poke(12523, base)
+        poke(12523 + 1, 128)
+        for i = 0 to n - 1
+            poke(12523 + 2 + i, peek(0x8F00 + base + i))
+        next
+        r = xact(3, n + 2)
+        if r != 0 then
+            print("LOAD NG")
+            return
+        endif
+        base = base + n
+    endwhile
+    poke(0xE685, 1)
+    print("LOADED")
+endfunc
+
+/* cont=0: fresh RUN at 8000, BP armed. cont=1:
+   continue (RUN FFFF), BP re-armed. cont=2:
+   continue, BP cleared (runs to the end). */
+func void cmd_run(int cont)
+    int r
+    poke(12523, (cont != 2) * 21)
+    poke(12523 + 1, (cont != 2) * 128)
+    r = xact(4, 2)
+    if r != 0 then
+        print("SETBP NG")
+        return
+    endif
+    poke(12523, (cont != 0) * 255)
+    poke(12523 + 1, (cont == 0) * 128 + (cont != 0) * 255)
+    r = xact(5, 2)
+    print("RUN")
+    r = xact(133, 0)
+    while r != 128
+        if r == 255 then
+            linkerr = linkerr + 1
+            poke(0xE68A, linkerr)
+            return
+        endif
+        r = xact(133, 0)
+    endwhile
+    lastrsn = rb(0)
+    pcval = rb(13) + rb(14) * 256
+    spval = rb(15) + rb(16) * 256
+    stops = stops + 1
+    poke(0xE682, stops)
+    poke(0xE683, lastrsn)
+    print("STOP ")
+    putc(lastrsn)
+    print()
+    showregs(1)
+endfunc
+
+/* READ transaction: n bytes at addr -> frame buffer */
+func int dread(int addr, int n)
+    poke(12523, addr & 255)
+    poke(12523 + 1, (addr >> 8) & 255)
+    poke(12523 + 2, n)
+    return xact(2, 3)
+endfunc
+
+func void cmd_read(int addr, int n)
+    int r, dummy
+    r = dread(addr, n)
+    if r != 0 then
+        print("READ NG")
+        return
+    endif
+    poke(0xD0E4, 0)
+    poke(0xD0E5, n)
+    dummy = SEVAL("(call 12398)")
+    printbuf()
+endfunc
+
+func void cmd_write()
+    int r
+    poke(12523, 61)
+    poke(12523 + 1, 128)
+    poke(12523 + 2, 9)
+    poke(0xE686, 9)
+    r = xact(3, 3)
+    if r != 0 then
+        print("WRITE NG")
+        return
+    endif
+    mpval = 9
+endfunc
+
+func void cmd_quit()
+    int r
+    /* read the demo's signature block before QUIT */
+    r = dread(0xE670, 6)
+    if r == 0 then
+        dcount = rb(5)
+    else
+        linkerr = linkerr + 1
+        poke(0xE68A, linkerr)
+    endif
+    r = xact(7, 0)
+    /* evidence pokes come LAST: the host harness exits
+       on 0xE68C, and the QUIT frame must be fully sent
+       and answered before that can happen */
+    poke(0xE687, dcount)
+    poke(0xE68C, 81)
+    print("BYE")
+endfunc
+
+func int Main()
+    int k
+    stops = 0
+    lastrsn = 0
+    pcval = 0
+    spval = 0
+    linkerr = 0
+    mpval = 0
+    dcount = 0
+    poke(0xE680, 82)
+    poke(0xE681, 72)
+    print("RHDBG")
+    k = 0
+    while k != 113
+        print("RH>")
+        k = inkey()
+        while k == 0
+            k = inkey()
+        endwhile
+        while inkey() != 0
+            k = k
+        endwhile
+        if k == 108 then
+            cmd_load()
+        endif
+        if k == 98 then
+            cmd_run(0)
+        endif
+        if k == 100 then
+            cmd_read(pcval, 16)
+        endif
+        if k == 115 then
+            cmd_read(spval, 16)
+        endif
+        if k == 119 then
+            cmd_write()
+        endif
+        if k == 99 then
+            cmd_run(1)
+        endif
+        if k == 103 then
+            cmd_run(2)
+        endif
+        if k == 113 then
+            cmd_quit()
+        endif
+    endwhile
+    return 0
+endfunc

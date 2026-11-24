@@ -1,0 +1,153 @@
+; ep56test.z80 - EP56TEST: verification program for the
+; roadmap 26 IOCS bodies (load 0x4000).
+;
+; Checks, in order, writing a result block at 0xE620:
+;   +0  "E56" magic (written at start)
+;   +3  SPOLL result with nothing attached (must be 0)
+;   +4  SOUT drain: 'U' sent with no host attached; the
+;       call must return (TxRDY drains into the void)
+;   +5  BEEP: after the call, PSG reg 0 readback (0x8E)
+;   +6  BEEP: PSG reg 8 readback (0 = muted again)
+;   +7  RTGET: 6 bytes copied from the buffer (+7..+12),
+;       then +13 = validity flags (bit0 month 1..12,
+;       bit1 day 1..31, bit2 hour < 24, bit3 min < 60,
+;       bit4 sec < 60, bit5 second call also ok)
+;   +14 BREAK: first call result (0 expected - cleared),
+;       then the program prints dots via CONOUT for a
+;       while (the harness presses ESC during this), and
+;       +15 = the BREAK result after the print loop
+;       (1 if the flag arrived), +16 = "OK" when done.
+;
+; PSG readback: latch the register at 0x1C00, read 0x1B00.
+
+        org     04000h
+CONOUT          equ     0e406h
+PRTMSG          equ     0e409h
+BEEP            equ     0e43fh
+RTGET           equ     0e442h
+BREAK           equ     0e445h
+SERIN           equ     0e454h
+SEROUT          equ     0e457h
+SERPOLL         equ     0e45ah
+RESB             equ     0e620h
+PSG_LATCH       equ     01c00h
+PSG_DATA        equ     01b00h
+
+        ld      hl, sig
+        ld      de, RESB
+        ld      bc, 3
+        ldir
+        ; --- SPOLL with no host: expect 0 ---
+        call    SERPOLL
+        ld      (RESB + 3), a
+        ; --- SOUT drain: expect return ---
+        ld      a, 'U'
+        call    SEROUT
+        ld      a, 1
+        ld      (RESB + 4), a
+        ; --- BEEP, then read back regs 0 and 8 ---
+        call    BEEP
+        xor     a                       ; reg 0
+        ld      bc, PSG_LATCH
+        out     (c), a
+        ld      bc, PSG_DATA
+        in      a, (c)
+        ld      (RESB + 5), a
+        ld      a, 8                    ; reg 8
+        ld      bc, PSG_LATCH
+        out     (c), a
+        ld      bc, PSG_DATA
+        in      a, (c)
+        ld      (RESB + 6), a
+        ; --- RTGET twice ---
+        ld      hl, rtcbuf
+        call    RTGET
+        jr      c, rt_fail
+        ld      hl, rtcbuf
+        ld      de, RESB + 7
+        ld      bc, 6
+        ldir
+        ld      hl, rtcbuf
+        call    RTGET
+        jr      c, rt_fail
+        ; validity flags
+        ld      d, 0
+        ld      a, (RESB + 8)            ; month
+        cp      1
+        jr      c, f2
+        cp      13
+        jr      nc, f2
+        set     0, d
+f2:
+        ld      a, (RESB + 9)            ; day
+        cp      1
+        jr      c, f3
+        cp      32
+        jr      nc, f3
+        set     1, d
+f3:
+        ld      a, (RESB + 10)           ; hour
+        cp      24
+        jr      nc, f4
+        set     2, d
+f4:
+        ld      a, (RESB + 11)           ; minute
+        cp      60
+        jr      nc, f5
+        set     3, d
+f5:
+        ld      a, (RESB + 12)           ; second
+        cp      60
+        jr      nc, f6
+        set     4, d
+f6:
+        set     5, d                    ; second RTGET ok
+        ld      a, d
+        ld      (RESB + 13), a
+        jr      brk_test
+rt_fail:
+        xor     a
+        ld      (RESB + 13), a
+brk_test:
+        ; --- BREAK: clear, then print dots (each CONOUT
+        ; pumps kb_poll) until the flag arrives or the cap
+        ; runs out. +15 = flag, +18/+19 = iterations waited.
+        call    BREAK
+        ld      (RESB + 14), a
+        ld      hl, msg_dots
+        call    PRTMSG
+        ld      bc, 0                   ; iterations done
+        ld      de, 20000               ; cap
+brk_lp:
+        push    bc
+        push    de
+        ld      a, '.'
+        call    CONOUT
+        call    BREAK
+        pop     de
+        pop     bc
+        or      a
+        jr      nz, brk_hit
+        inc     bc
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, brk_lp
+brk_hit:
+        ld      (RESB + 15), a
+        ld      a, c
+        ld      (RESB + 18), a
+        ld      a, b
+        ld      (RESB + 19), a
+        ld      a, 'O'
+        ld      (RESB + 16), a
+        ld      a, 'K'
+        ld      (RESB + 17), a
+        ret
+
+sig:
+        db      "E56"
+msg_dots:
+        db      "EP56TEST: PRINTING DOTS - ESC SETS BREAK", 13, 10, 0
+rtcbuf:
+        ds      6

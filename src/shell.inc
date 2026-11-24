@@ -85,6 +85,10 @@ cp_done:
         cp      'K'
         jp      z, cmd_kanji
         ENDIF
+        IF      DEFINED HAS_DATE
+        cp      'C'
+        jp      z, cmd_date
+        ENDIF
         ld      hl, msg_err
         call    C_PRTMSG
         jp      shell_loop

@@ -16,8 +16,16 @@
              (filld (+ i 1)))))
 (filld 0)
 (poke 59048 (random 1))
-; (date)/(time) must fail safely (#f) while RTGET is a stub:
-; poke 'T' (84) if a value came back, 'F' (70) for #f.
+; (date)/(time): this probe runs in the standalone
+; tape boot, where no IOCS is resident (0xE442 is
+; uninitialised RAM), so both must return #f even
+; though roadmap 26 gave RTGET a body - the seat
+; guard in rtget_fetch makes that safe by design.
+; The with-body behaviour is verified where the
+; shell stays resident (the tapeos EP56TEST session
+; and the shell C command). poke 'T' (84) if a value
+; came back, 'F' (70) for #f; check_ts.py expects
+; 'F'/'F' here.
 (poke 59049 (if (date) 84 70))
 (poke 59050 (if (time) 84 70))
 ; (call addr [hl]): plant "ld hl,1234; or a; ret" at

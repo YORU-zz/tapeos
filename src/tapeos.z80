@@ -26,15 +26,16 @@
 ;     then ASCII). Interrupts stay disabled; delivery is by polling
 ;     the ports, which is how the emulated sub-CPU hands over data.
 ;
-; IOCS call table (MZ-80B flavour, see README): 28 jump-table
+; IOCS call table (MZ-80B flavour, see README): 31 jump-table
 ; entries at fixed address 0E400h, 3 bytes each (JP). The shell
 ; itself calls the table for all of its console I/O (dogfooding):
 ; C_xxx equates in common.inc are absolute addresses into the
 ; table.
 
 TARGET_X1       equ     1
-HAS_KANJI       equ     1
-KF_ADV2         equ     1               ; kanji glyphs are 2 cells wide
+HAS_DATE        equ     1               ; C command (roadmap 26)
+BRKFLAG         equ     1               ; BREAK flag in kb_poll (roadmap 26)
+HAS_CURSOR_SEAT equ     1               ; CONOUT cursor hook (roadmap 26)
 DBGSTUB         equ     1               ; resident debug stub (X command);
                                         ; X1 first - see dbgstub.inc and
                                         ; ../dbg-stub.md (deliberate
@@ -53,8 +54,6 @@ EXTIOCS         equ     1               ; extended IOCS (ep.31): FAT-style
         include "src/cmd_tape.inc"
         include "src/cmd_core.inc"
         include "src/cmd_media.inc"
-        include "src/cmd_kanji.inc"
-        include "src/kanji_x1.inc"
         include "src/helpers.inc"
         include "src/vram_x1.inc"
         include "src/scroll.inc"
@@ -63,6 +62,7 @@ EXTIOCS         equ     1               ; extended IOCS (ep.31): FAT-style
         include "src/console.inc"
         include "src/tape_x1.inc"
         include "src/fd_x1.inc"
+        include "src/serial_x1.inc"
         include "src/tail.inc"
         include "src/template_x1.inc"
         include "src/data_x1.inc"

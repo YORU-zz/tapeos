@@ -1,0 +1,85 @@
+; rhfmt.z80 - RHFMT: hex text renderer for the
+; TinyBASIC upper layer (roadmap 26). Register and
+; memory dumps are the most statement-hungry part of
+; a TinyBASIC program (a prhex2 call per byte), and
+; the gate's 4 KB body cap is tight, so the rendering
+; lives here as a tiny ML helper, called through the
+; Scheme gate like RHIO.
+;
+; It is loaded into the shell's cursor seat (125
+; bytes of reserved space after cursor_hook, roadmap
+; 26 Phase 1; the hook itself stays a RET, so the
+; shell never executes the seat) - scratch use until
+; the cursor display lands. The load address comes
+; from the shell listing at build time
+; (src/fmtorg.inc, generated).
+;
+; Contract:
+;   0xD0E4  FMTOFF: offset into BUF of the first byte
+;   0xD0E5  FMTN:   byte count (<= 26)
+;   BUF:    RHIO's frame buffer (the Scheme seat);
+;           the payload sits at BUF[0..96), the
+;           rendered text goes to BUF+32 as
+;           "XX XX ... " NUL-terminated (the write
+;           pointer stays ahead of the read pointer).
+; Returns HL = text length (3 * count).
+
+                include "fmtorg.inc"  ; FMTORG, BUF (generated)
+        org     FMTORG
+FMTOFF          equ     0d0e4h
+FMTN            equ     0d0e5h
+
+fmt:
+        ld      a, (FMTOFF)
+        ld      e, a
+        ld      d, 0
+        ld      hl, BUF
+        add     hl, de              ; HL = read ptr
+        ld      de, BUF+32          ; DE = write ptr
+        ld      a, (FMTN)
+        ld      b, a
+        or      a
+        jr      z, fmt_dn
+fmt_lp:
+        ld      a, (hl)
+        inc     hl
+        push    hl
+        push    bc
+        call    fmt_b
+        pop     bc
+        pop     hl
+        djnz    fmt_lp
+fmt_dn:
+        xor     a
+        ld      (de), a             ; NUL terminate
+        ld      hl, BUF+32
+        or      a
+        ex      de, hl
+        sbc     hl, de              ; HL = length
+        ret
+; fmt_b: byte in A -> "XX " at DE, DE += 3
+fmt_b:
+        push    af
+        rrca
+        rrca
+        rrca
+        rrca
+        call    fmt_n
+        pop     af
+        call    fmt_n
+        ld      a, ' '
+        ld      (de), a
+        inc     de
+        ret
+fmt_n:
+        and     00fh
+        cp      10
+        jr      c, fmt_d
+        add     a, 'A'-10
+        jr      fmt_o
+fmt_d:
+        add     a, '0'
+fmt_o:
+        ld      (de), a
+        inc     de
+        ret
