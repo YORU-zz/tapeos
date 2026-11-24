@@ -93,7 +93,7 @@ newasm.bin、sced.bin、mced.bin など）とディスク／テープイメー�
 - `images/edas.d88` ― シェル起動ディスク＋ EDAS と EDIS モジュール入り。起動後に `r edas` / `g 4000` で EDAS が使え、`Z` コマンドで逆アセンブルできます（SRC にファイル名、空ならメモリ範囲 FROM/TO、続いて DATA 範囲を聞かれます）
 - `images/tapeos.cmt` ― テープイメージ（IPL の CMT ブート用）
 - `images/tapeos.wav` ― `tapeos.cmt` を変換した WAV 版です。実機で再生して読み込ませる場合や、WAV のまま扱いたい場合はこちらを使ってください（ビット列は `.cmt` と同一です）
-- `images/tsboot.cmt` ― Tiny Scheme 2段階ブートテープ（ローダー＋スクリプトブロック＋ TapeOS ＋ TRDEMO）。IPL の CMT ブートで Tiny Scheme シェルが立ち上がり、`run 1` で TapeOS、`run 2` で TRDEMO が起動します
+- `images/tsboot.cmt` ― Tiny Scheme 2段階ブートテープ（ローダー＋スクリプトブロック＋ TapeOS ＋ TSDEMO）。IPL の CMT ブートで Tiny Scheme シェルが立ち上がり、`run 1` で TapeOS、`run 2` で TSDEMO が起動します
 - `images/tsboot.wav` ― `tsboot.cmt` を変換した WAV 版です（ビット列は `.cmt` と同一です）
 - `images/font.d88` ― 漢字フォント（美咲フォント由来）のディスク
 
@@ -120,6 +120,10 @@ EMM／RAMDISK は、素の xmil には無い機能を使うため）。
 README の案内（meister68k 氏の X1 互換フォント配布）に従って
 ください。TapeOS 本体はこのフォントを同梱しません（漢字表示用
 フォントは上記 font.d88 として TapeOS 側に含まれます）。
+
+起動時の IPL-ROM の動き（ブートデバイス選択や内蔵モニタ）については
+`docs/boot-and-ipl.md` に、シェルの最低限のコマンドについては
+`docs/shell-commands.md` にまとめています。
 
 ## ライセンスとクレジット
 
