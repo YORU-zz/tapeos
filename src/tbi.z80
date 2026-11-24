@@ -112,10 +112,18 @@ sk_lp:
         ld      a, 0c3h                 ; JP stub_i
         call    e_b
         ld      a, (jit_i)
-        add     a, a
-        add     a, a                    ; *4 (stub size)
         ld      l, a
         ld      h, 0
+        add     hl, hl
+        add     hl, hl                  ; *4
+        ld      a, (jit_i)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; *5 (stub size; was
+                                        ; *4, which misdispatched
+                                        ; function index >= 3 --
+                                        ; bug fix, roadmap id 63;
+                                        ; same fix as sci.z80)
         ld      de, stubs
         add     hl, de
         call    e_w                     ; stub address (absolute)

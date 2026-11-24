@@ -3326,25 +3326,21 @@ pc_ext:
         ex      de, hl
         call    e_wm
 pc_clean:
+        ; drop the argument slots with POP DE, one per
+        ; argument: the LD HL,2n / ADD HL,SP form used
+        ; before destroyed the return value in HL for
+        ; calls with >= 2 arguments (bug fix, roadmap
+        ; id 63; same fix as sccore.inc in SmallC id 18)
         ld      a, (pc_n)
         or      a
         jr      z, pc_type
-        cp      1
-        jr      nz, pc_cl2
+        ld      b, a
+pc_clp:
+        push    bc
         ld      a, 0d1h                 ; POP DE (drop 1 arg)
         call    e_b
-        jr      pc_type
-pc_cl2:
-        add     a, a
-        ld      (pc_n2), a
-        ld      a, 021h                 ; LD HL, 2*nargs
-        call    e_b
-        ld      hl, (pc_n2)
-        ld      h, 0
-        call    e_w
-        ld      hl, sq_spadj            ; ADD HL,SP / LD SP,HL
-        ld      b, 2
-        call    e_seq
+        pop     bc
+        djnz    pc_clp
 pc_type:
         ld      a, (pc_ret)
         or      a

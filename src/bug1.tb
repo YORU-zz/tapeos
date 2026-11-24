@@ -1,0 +1,25 @@
+/* bug1.tb - regression sample for roadmap id 63,
+   bug 1: a call with >= 2 arguments destroyed the
+   return value in HL (tbcore post-call cleanup).
+   Words at 0E688h: [40, 123], tag 9. */
+
+func void pw(int i, int v)
+    poke(0xE688 + i + i, v & 255)
+    poke(0xE689 + i + i, (v >> 8) & 255)
+endfunc
+
+func int add2(int a, int b)
+    return a + b
+endfunc
+
+func int Main()
+    pw(0, add2(20, 20))
+    pw(1, add2(100, 23))
+    poke(0xE680, 0x54)
+    poke(0xE681, 0x42)
+    poke(0xE682, 0x52)
+    poke(0xE683, 0x53)
+    poke(0xE684, 9)
+    print("ADD2 DONE")
+    return 0
+endfunc

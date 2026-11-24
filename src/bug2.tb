@@ -1,0 +1,31 @@
+/* bug2.tb - regression sample for roadmap id 63,
+   bug 2: the TBI skeleton computed JIT stub addresses
+   with a 4-byte stride (stubs are 5 bytes), so calls
+   to function index >= 3 were misdispatched and Main
+   (the 4th function here) silently never ran.
+   Words at 0E688h: [11, 22], tag 10. */
+
+func void pw(int i, int v)
+    poke(0xE688 + i + i, v & 255)
+    poke(0xE689 + i + i, (v >> 8) & 255)
+endfunc
+
+func int one(int n)
+    return n + 1
+endfunc
+
+func int two(int n)
+    return n + 2
+endfunc
+
+func int Main()
+    pw(0, one(10))
+    pw(1, two(20))
+    poke(0xE680, 0x54)
+    poke(0xE681, 0x42)
+    poke(0xE682, 0x52)
+    poke(0xE683, 0x53)
+    poke(0xE684, 10)
+    print("BUG2 DONE")
+    return 0
+endfunc
