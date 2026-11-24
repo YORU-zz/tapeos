@@ -49,7 +49,7 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
   - TBC / TBI ― TinyBASIC コンパイラ／インタープリタ（`src/tbc.z80`、`src/tbi.z80`、共有コア `src/tbcore.inc`、X1 ライブラリ `src/tblib.z80`）。X-BASIC 風方言（関数定義の集合、int/char、再帰、配列、print/input/stick/vsync など）。TBC は TOSR 実行ファイルを出力し、TBI は関数単位の遅延 JIT で即実行する。サンプルは `src/fib.tb` / `src/calc.tb` / `src/game.tb` など
   - SCC / SCI ― Small-C コンパイラ／インタープリタ（`src/scc.z80`、`src/sci.z80`、共有コア `src/sccore.inc`、X1 ライブラリ `src/clib.z80`）。Small-C サブセット（int/char、1段ポインタ、配列、再帰、構造化制御、#include/#define、printf/getchar など）。SCC は TOSR 実行ファイルを出力し、SCI は関数単位の遅延 JIT で即実行する（コンパイラと実行結果は完全一致）。TinyBASIC との双方向変換ツール `tools/bascvt.py` 付き（共通サブセット外は変換不可として報告される）。サンプルは `src/fib.c` / `src/calc.c` / `src/game.c` など、変換 corpus は `src/cvsum.tb`＋`src/cvsum.c` ほかの対照ペア
   - DISASM ― Z80 逆アセンブラ（`src/disasm.z80`、デコード部は EDIS と共有の `src/disasm_core.inc`／`src/disasm_util.inc`）。TOSD ファイルまたはメモリ範囲を、NEWASM／EDAS で再アセンブル可能なソースへ変換します。全命令（CB／ED／DD／FD プレフィックス含む）に対応し、範囲内の制御フロー飛び先には自動でラベルを生成します。コード／データの区別は DATA 範囲の指定によります。再アセンブルでバイト一致しない非正規エンコーディングは DB として出力する方針で、出力は常に対象とバイト一致します
-  - SDBG ― 単独デバッガ（`src/sdbg.z80`、ビルドは `tools/mksdbg.py`）。TOSR 形式の自己再配置プログラムで、ディレクトリのロードアドレスを変えれば任意のページ境界アドレスで動作します。メモリ表示／変更、全レジスタ表示、RST 方式のワンショットブレークポイント（元バイトの退避・復元つき）、対象プログラムのロードと実行／継続、実行中の ESC キーによる捕獲停止を備えます。逆アセンブル表示（`U` コマンド）は DISASM／EDIS と共有のデコード部を使います。モニタ埋め込みのデバッグスタブとはページ0ベクタの受け渡しで共存し、終了後はスタブもそのまま使えます
+  - RDBG ― 単独デバッガ（`src/rdbg.z80`、ビルドは `tools/mkrdbg.py`）。TOSR 形式の自己再配置プログラムで、ディレクトリのロードアドレスを変えれば任意のページ境界アドレスで動作します。メモリ表示／変更、全レジスタ表示、RST 方式のワンショットブレークポイント（元バイトの退避・復元つき）、対象プログラムのロードと実行／継続、実行中の ESC キーによる捕獲停止を備えます。逆アセンブル表示（`U` コマンド）は DISASM／EDIS と共有のデコード部を使います。モニタ埋め込みのデバッグスタブとはページ0ベクタの受け渡しで共存し、終了後はスタブもそのまま使えます
   - Tiny Scheme 2段階ブートローダー ― テープ先頭ローダー（`src/tsload.z80`、最終ロード用チャンク `src/ldfin.z80`）が Tiny Scheme（Z80 アセンブラ製コア、原始手続き 66 個、うち `(random n)`、IOCS RTGET 受け口の `(date)`／`(time)`、機械語ブリッジ `(call addr [hl])` を含む）を内蔵し、直後の固定長スクリプトブロックを検証して評価する。第2段スクリプト（`src/stage2.scm`）が Scheme 自身によるセレクタ／シェルで、スクリプトの保存（テープ全体の再生成）でブート手順が自己進化する。検証用プローブは `src/probe-rand.scm`、テープ作成／解析は `tools/mktape.py` / `tools/lstape.py`
   - SCMCORE ― TinyBASIC／SmallC から Tiny Scheme を呼ぶための組み込みコア（`src/scmcore.z80`、コア本体は単体版と共有の `src/tscore.inc`、組み込み変種の生成は `tools/mkscmcore.py`）。TOSD ファイルとしてディスクに置かれ、言語側のプログラム開始時に自動で読み込まれます。TinyBASIC では `seval("式")`／`scall("名前", 引数...)`／`scmerr()`、SmallC では `scmeval`／`scmcall`／`scmerr` で Scheme の手続きを呼び、整数の結果を受け取ります。サンプルは `src/scm.tb` / `src/scm.c` です
 
@@ -83,11 +83,11 @@ newasm.bin、sced.bin、mced.bin など）とディスク／テープイメー�
 - `images/tinybasic.d88` ― シェル起動ディスク＋ TBC / TBI とサンプル（FIB.TB / CALC.TB / GAME.TB / SCM.TB）、Scheme 組み込みコア SCMCORE 入り。起動後に `r tbc` / `g 4000` でコンパイル（SRC/OUT を聞かれます）、`r tbi` / `g 4000` で即実行できます
 - `images/smallc.d88` ― シェル起動ディスク＋ SCC / SCI とサンプル（FIB.C / CALC.C / GAME.C / SCM.C）、Scheme 組み込みコア SCMCORE 入り。起動後に `r scc` / `g 4000` でコンパイル（SRC/OUT を聞かれます）、`r sci` / `g 4000` で即実行できます
 - `images/disasm.d88` ― シェル起動ディスク＋ DISASM プログラムファイル入り。起動後に `r disasm` / `g 4000` で逆アセンブルできます（SRC/BASE、またはメモリ範囲 FROM/TO、DATA 範囲、OUT を聞かれます）
-- `images/sdbg.d88` ― シェル起動ディスク＋ SDBG プログラムファイル入り。起動後に `r sdbg` / `g 4000` でデバッガが使えます（`L ファイル名` で対象を読み、`B`／`G`／`C`／`U`／`D`／`M`／`R`、`Q` でシェルへ戻ります）
+- `images/rdbg.d88` ― シェル起動ディスク＋ RDBG プログラムファイル入り。起動後に `r rdbg` / `g 4000` でデバッガが使えます（`L ファイル名` で対象を読み、`B`／`G`／`C`／`U`／`D`／`M`／`R`、`Q` でシェルへ戻ります）
 - `images/edas.d88` ― シェル起動ディスク＋ EDAS と EDIS モジュール入り。起動後に `r edas` / `g 4000` で EDAS が使え、`Z` コマンドで逆アセンブルできます（SRC にファイル名、空ならメモリ範囲 FROM/TO、続いて DATA 範囲を聞かれます）
 - `images/tapeos.cmt` ― テープイメージ（IPL の CMT ブート用）
 - `images/tapeos.wav` ― `tapeos.cmt` を変換した WAV 版です。実機で再生して読み込ませる場合や、WAV のまま扱いたい場合はこちらを使ってください（ビット列は `.cmt` と同一です）
-- `images/tsboot.cmt` ― Tiny Scheme 2段階ブートテープ（ローダー＋スクリプトブロック＋ TapeOS ＋ TSDEMO）。IPL の CMT ブートで Tiny Scheme シェルが立ち上がり、`run 1` で TapeOS、`run 2` で TSDEMO が起動します
+- `images/tsboot.cmt` ― Tiny Scheme 2段階ブートテープ（ローダー＋スクリプトブロック＋ TapeOS ＋ TRDEMO）。IPL の CMT ブートで Tiny Scheme シェルが立ち上がり、`run 1` で TapeOS、`run 2` で TRDEMO が起動します
 - `images/tsboot.wav` ― `tsboot.cmt` を変換した WAV 版です（ビット列は `.cmt` と同一です）
 - `images/font.d88` ― 漢字フォント（美咲フォント由来）のディスク
 
