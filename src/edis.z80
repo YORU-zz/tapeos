@@ -1,0 +1,418 @@
+; edis.z80 - EDIS: the EDAS disassembler module for
+; TapeOS. OUROBO/ROS reproduction project (P2),
+; roadmap item 60: the standalone DISASM's decode core
+; (roadmap item 59) built into EDAS.
+;
+; Why a module: the decode core is about 4.9 KB, and
+; EDAS itself has only about 1 KB of headroom under
+; its 0x6400 work-area bound (the TOSR edition has
+; under 100 bytes), so the core cannot live inside
+; the EDAS binary. Instead EDAS gains a Z command
+; that loads this module (TOSD file "EDIS") at
+; 0x9000 and calls it; the disassembled source is
+; inserted straight into EDAS's text buffer, ready
+; to edit and re-assemble with B. There is exactly
+; one decode implementation: this file and the
+; standalone DISASM (disasm/src/disasm.z80) assemble
+; the same shared sources, tapeos/src/disasm_util.inc
+; and tapeos/src/disasm_core.inc. The EDISMOD seams
+; in the core are the input staging translation in
+; gb_mem and the out_mode = 2 sink in emit_ch, which
+; jumps to ec_cb_hook below.
+;
+; Interface (set up by EDAS's Z command):
+;   ZPARM (0x6E00, in EDAS's free gap 0x6E00-0x6FFF):
+;     +0  address of EDAS's txt_lines variable
+;     +2  address of EDAS's txt_used variable
+;     +4  status out: 0FFh while running, 0 = OK,
+;         else the DISASM error code
+;   The module reads its prompts from the console
+;   exactly like the standalone (SRC: / BASE: or
+;   FROM: / TO:, then DATA: lines), disassembles,
+;   appends the source lines to the text buffer and
+;   returns to EDAS. File input is read from the FD
+;   (drive 0), as with the standalone DISASM.
+;
+; Memory map while EDIS runs:
+;   04000h..063ffh  EDAS (idle)
+;   06400h          EDIRBUF = the module's DIRBUF
+;   06600h..06dffh  LABTAB (overlays EDAS's symbol
+;                   table, which B re-initialises)
+;   06e00h          ZPARM
+;   07000h..07fffh  ETEXT (appended to)
+;   09000h..        this module (code + variables)
+;   0a9a0h          DRTAB (16 x 4 bytes)
+;   0aa00h..0adffh  FDBITS (input <= 8 KiB)
+;   0ae00h          INBUF (prompt input line)
+;   0ae80h          LINEBUF (output line assembly)
+;   0af00h          SECBUF (256-aligned: the core's
+;                   gb_hit forms its address from
+;                   SECBUF / 256) / OUTBUF (unused)
+;   0b000h..0bfffh  memory-mode input staging (<= 4 KiB)
+;
+; Memory-mode ranges must not overlap 0x6400-0x7FFF
+; (EDAS work areas + ETEXT) or 0x9000-0xBFFF (this
+; module); the input is copied to the staging buffer
+; before the passes run, so EDAS's own code at
+; 0x4000-0x63FF and anything at 0xC000 up can be
+; disassembled.
+
+EDISMOD         equ     1
+
+        org     09000h
+
+; ---- IOCS entries (table base is machine-dependent) ----
+        IF      DEFINED EDAS_MZ
+IOCS_BASE       equ     0c400h          ; MZ-80B / MZ-80K
+        ELSE
+IOCS_BASE       equ     0e400h          ; X1 / PC-8801
+        ENDIF
+C_CONOUT        equ     IOCS_BASE + 6
+C_PRTMSG        equ     IOCS_BASE + 9
+C_CRLF          equ     IOCS_BASE + 0ch
+C_GETLIN        equ     IOCS_BASE + 0fh
+C_DREAD         equ     IOCS_BASE + 02dh
+C_DWRITE        equ     IOCS_BASE + 030h
+
+; ---- constants ----
+DIRREC          equ     32              ; directory record
+FDMAXREC        equ     1280            ; FD records (320 KB)
+DIRBUF          equ     06400h          ; = EDAS's EDIRBUF
+SECBUF          equ     0af00h          ; must be 256-aligned
+OUTBUF          equ     0af00h          ; file-out is unused here
+INBUF           equ     0ae00h
+LINEBUF         equ     0ae80h
+LABTAB          equ     06600h          ; overlays ESYMTAB
+LABMAX          equ     1024
+FDBITS          equ     0aa00h
+DRTAB           equ     0a9a0h
+DRMAX           equ     16
+RANGEMAX        equ     8192            ; input cap (FDBITS size)
+MEMCAP          equ     4096            ; staging buffer size
+INPBUF          equ     0b000h          ; staging buffer
+ZPARM           equ     06e00h
+ETEXT           equ     07000h          ; EDAS's text buffer
+ETEXTSZ         equ     01000h
+LINECAP         equ     80              ; sink line buffer cap
+
+; ---- error codes (same as the standalone) ----
+E_BIG           equ     6               ; too big (house codes)
+E_FILE          equ     7               ; file error (house)
+E_RANGE         equ     20              ; bad / overlapping range
+E_LAB           equ     21              ; too many labels
+E_NUM           equ     22              ; bad number
+E_DR            equ     23              ; too many data ranges
+E_DIR           equ     24              ; directory full
+
+; ---------------------------------------------------------------
+; Entry: EDAS's Z command CALLs 0x9000 with ZPARM set.
+; ---------------------------------------------------------------
+        jp      zmod_start
+
+zmod_start:
+        ld      (saved_sp), sp
+        ; clear state (as the standalone's start)
+        xor     a
+        ld      (dr_cnt), a
+        ld      (lab_cnt), a
+        ld      (lab_cnt + 1), a
+        ld      (src_mode), a
+        ld      (ec_llen), a
+        ld      a, 2
+        ld      (out_mode), a           ; sink = EDAS text
+        ld      hl, 0
+        ld      (out_len), hl
+        ld      (out_len + 2), hl
+        ld      hl, 0ffffh
+        ld      (cache_rec), hl
+        ld      a, 0ffh
+        ld      (ZPARM + 4), a          ; status: running
+        ld      hl, zmsg_banner
+        call    C_PRTMSG
+        ; ---- SRC prompt ----
+        ld      hl, msg_srcp
+        call    C_PRTMSG
+        call    read_line
+        or      a
+        jr      z, z_src_mem            ; empty: memory mode
+        ld      hl, INBUF
+        ld      de, name_src
+        call    name_copy
+        ; find the file (FD, via the shared dir layer)
+        call    dir_load
+        ld      hl, name_src
+        ld      (find_name), hl
+        call    find_entry
+        ld      a, E_FILE
+        jp      c, err                  ; not found
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; start record
+        ld      (src_rec0), de
+        inc     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; size
+        ld      (src_size), de
+        ; file size cap (FDBITS covers 8 KiB here)
+        ld      hl, (src_size)
+        ld      de, RANGEMAX + 1
+        or      a
+        sbc     hl, de
+        ld      a, E_BIG
+        jp      nc, err
+        xor     a
+        ld      (src_mode), a           ; file mode
+        ; ---- BASE prompt ----
+        ld      hl, msg_basep
+        call    C_PRTMSG
+        call    read_line
+        or      a
+        ld      a, E_NUM
+        jp      z, err                  ; base is required
+        call    parse_hex_line
+        ld      (src_base), hl
+        jp      z_data_lp
+z_src_mem:
+        ld      a, 1
+        ld      (src_mode), a           ; memory mode
+        ld      hl, msg_fromp
+        call    C_PRTMSG
+        call    read_line
+        or      a
+        ld      a, E_NUM
+        jp      z, err
+        call    parse_hex_line
+        ld      (src_base), hl
+        ld      hl, msg_top
+        call    C_PRTMSG
+        call    read_line
+        or      a
+        ld      a, E_NUM
+        jp      z, err
+        call    parse_hex_line          ; HL = TO (inclusive)
+        ld      de, (src_base)
+        or      a
+        sbc     hl, de                  ; TO - FROM
+        ld      a, E_RANGE
+        jp      c, err                  ; TO < FROM
+        inc     hl                      ; size = TO-FROM+1
+        ld      (src_size), hl
+        ; staging cap
+        ld      de, MEMCAP + 1
+        or      a
+        sbc     hl, de
+        ld      a, E_BIG
+        jp      nc, err
+        ; guard: no overlap with 06400h-07fffh ...
+        ld      hl, (src_base)
+        ld      de, 08000h
+        or      a
+        sbc     hl, de
+        jr      nc, z_g2                ; base >= 0x8000
+        ld      hl, (src_base)
+        ld      de, (src_size)
+        add     hl, de                  ; end (exclusive)
+        ld      de, 06400h
+        or      a
+        sbc     hl, de
+        ld      a, E_RANGE
+        jp      nc, err                 ; end > 0x6400: overlap
+z_g2:
+        ; ... nor with 09000h-0bfffh (this module)
+        ld      hl, (src_base)
+        ld      de, 0c000h
+        or      a
+        sbc     hl, de
+        jr      nc, z_guard_ok          ; base >= 0xC000
+        ld      hl, (src_base)
+        ld      de, (src_size)
+        add     hl, de                  ; end (exclusive)
+        ld      de, 09000h
+        or      a
+        sbc     hl, de
+        ld      a, E_RANGE
+        jp      nc, err                 ; end > 0x9000: overlap
+z_guard_ok:
+        ; stage the input into INPBUF
+        ld      hl, (src_base)
+        ld      de, INPBUF
+        ld      (inp_origin), de
+        ld      bc, (src_size)
+        ldir
+        ; ---- DATA range prompts ----
+z_data_lp:
+        ld      hl, msg_datap
+        call    C_PRTMSG
+        call    read_line
+        or      a
+        jr      z, z_run
+        call    parse_range_line        ; -> dr_lo, dr_hi
+        ld      a, (dr_cnt)
+        cp      DRMAX
+        ld      a, E_DR
+        jp      nc, err
+        ld      a, (dr_cnt)
+        add     a, a
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, DRTAB
+        add     hl, de
+        ld      de, (dr_lo)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (dr_hi)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      hl, dr_cnt
+        inc     (hl)
+        jr      z_data_lp
+z_run:
+        call    pass1
+        call    pass15
+        call    pass2
+        ; ---- status: OK ----
+        xor     a
+        ld      (ZPARM + 4), a
+        ld      hl, msg_ok
+        call    C_PRTMSG
+        ld      hl, (out_len)
+        call    print_dec
+        ld      hl, msg_bytes
+        call    C_PRTMSG
+        ld      sp, (saved_sp)
+        ret
+
+; err: A = error code. Prints "ERR n", records the
+; code at ZPARM+4, and returns to EDAS.
+err:
+        ld      (err_code), a
+        ld      (ZPARM + 4), a
+        ld      hl, msg_err
+        call    C_PRTMSG
+        ld      a, (err_code)
+        ld      l, a
+        ld      h, 0
+        call    print_dec
+        call    C_CRLF
+        ld      sp, (saved_sp)
+        ret
+
+zmsg_banner:
+        db      "EDIS - EDAS DISASSEMBLER", 13, 10, 0
+
+; ---------------------------------------------------------------
+; Shared layers: the same sources the standalone
+; DISASM assembles (see disasm/src/disasm.z80).
+; Assemble from the tapeos/ directory.
+; ---------------------------------------------------------------
+        include "src/disasm_util.inc"
+        include "src/disasm_core.inc"
+
+; ---------------------------------------------------------------
+; The out_mode = 2 sink: emit_ch jumps here with
+; A = the character. Characters accumulate in
+; z_linebuf; on LF the line is appended to EDAS's
+; text buffer (length byte + bytes, 0FFh-terminated)
+; and EDAS's txt_lines / txt_used are updated
+; through the ZPARM pointers.
+; ---------------------------------------------------------------
+ec_cb_hook:
+        cp      00ah
+        jr      z, ec_flush
+        ld      (ec_chsv), a
+        ld      a, (ec_llen)
+        cp      LINECAP
+        jr      nc, ec_big
+        ld      e, a
+        ld      d, 0
+        ld      hl, z_linebuf
+        add     hl, de
+        ld      a, (ec_chsv)
+        ld      (hl), a
+        ld      hl, ec_llen
+        inc     (hl)
+        ret
+ec_big:
+        ld      a, E_BIG
+        jp      err
+ec_flush:
+        ; DE = txt_used
+        ld      hl, (ZPARM + 2)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ; capacity: used + llen + 1 <= ETEXTSZ
+        ld      a, (ec_llen)
+        ld      c, a
+        ld      b, 0
+        push    de
+        ld      h, d
+        ld      l, e
+        add     hl, bc
+        inc     hl
+        ld      de, ETEXTSZ + 1
+        or      a
+        sbc     hl, de
+        pop     de
+        jr      nc, ec_big
+        ; write the line at ETEXT + used - 1
+        ld      hl, ETEXT - 1
+        add     hl, de
+        ld      a, (ec_llen)
+        ld      (hl), a
+        inc     hl
+        or      a
+        jr      z, ec_term
+        ld      de, z_linebuf
+        ld      c, a
+        ld      b, 0
+        ex      de, hl
+        ldir
+        ex      de, hl
+ec_term:
+        ld      (hl), 0ffh
+        ; txt_used += llen + 1
+        ld      hl, (ZPARM + 2)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      a, (ec_llen)
+        ld      c, a
+        ld      b, 0
+        ex      de, hl
+        add     hl, bc
+        inc     hl
+        ex      de, hl
+        ld      (hl), d
+        dec     hl
+        ld      (hl), e
+        ; txt_lines += 1
+        ld      hl, (ZPARM)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        inc     hl
+        ex      de, hl
+        ld      (hl), d
+        dec     hl
+        ld      (hl), e
+        ; reset the line accumulator
+        xor     a
+        ld      (ec_llen), a
+        ret
+
+; ---- EDIS-local variables ----
+inp_origin:     dw      0               ; staging buffer base
+ec_llen:        db      0
+ec_chsv:        db      0
+z_linebuf:      ds      LINECAP
+
+        end

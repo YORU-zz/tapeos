@@ -36,6 +36,12 @@
 ; single 0ffh terminator byte. Line numbers are positional
 ; (1-based) and implicit.
 ;
+; The Z command (standard edition only, roadmap item 60)
+; disassembles into the text buffer via the EDIS module
+; (src/edis.z80): the DISASM decode core as a loadable
+; module at 0x9000, since the core does not fit inside
+; this binary. See the Z command block below.
+;
 ; Assembler: two passes. Pass 1 defines labels/EQU symbols
 ; (forward references allowed; instruction sizes never depend
 ; on operand values, so no phase errors are possible). Pass 2
@@ -176,6 +182,10 @@ ed_loop:
         jp      z, ec_usedrv
         cp      'B'
         jp      z, ec_build
+        IF      !DEFINED EDAS_TOSR
+        cp      'Z'
+        jp      z, ec_disasm
+        ENDIF
         cp      'Q'
         jp      z, ec_quit
         ld      hl, msg_err
@@ -1081,6 +1091,89 @@ wf_filled:
 ; ---------------------------------------------------------------
 ; Editor file commands: R / W / F / U
 ; ---------------------------------------------------------------
+
+        IF      !DEFINED EDAS_TOSR
+; ---------------------------------------------------------------
+; Z command: built-in disassembler (roadmap item 60).
+; Loads the EDIS module (TOSD file "EDIS": the DISASM
+; decode core, shared source - see src/edis.z80) at
+; 0x9000 from the current drive and calls it with the
+; ZPARM block at 0x6E00 (the free gap below ETEXT):
+; +0 / +2 carry the addresses of txt_lines / txt_used,
+; so the module appends the disassembled source
+; straight into the text buffer. A missing EDIS just
+; reports "?". Not present in the TOSR edition:
+; EDASR has under 100 bytes of headroom below its
+; 0x6400 bound (RELOC support is likewise
+; edition-specific, the other way round).
+; ---------------------------------------------------------------
+ZMODBASE        equ     09000h
+ZPARM           equ     06e00h
+
+ec_disasm:
+        ld      hl, txt_lines
+        ld      (ZPARM), hl
+        ld      hl, txt_used
+        ld      (ZPARM + 2), hl
+        xor     a
+        ld      (ZPARM + 4), a
+        call    dir_load
+        jp      c, err_exit
+        ld      hl, znm_edis
+        ld      de, ed_namebuf
+        ld      bc, 10
+        ldir
+        call    find_entry
+        jp      c, err_exit
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; start record/block
+        ld      (z_rec), de
+        inc     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; size
+        ld      (z_rem), de
+        ld      hl, ZMODBASE
+        ld      (z_dst), hl
+z_ldlp:
+        ld      hl, (z_rem)
+        ld      a, h
+        or      l
+        jr      z, z_lddn
+        ld      de, (z_rec)
+        ld      hl, (z_dst)
+        call    blk_read
+        jp      c, err_exit
+        ld      hl, (z_rec)
+        inc     hl
+        ld      (z_rec), hl
+        ld      hl, (z_dst)
+        ld      de, 256
+        add     hl, de
+        ld      (z_dst), hl
+        ld      hl, (z_rem)
+        ld      de, 256
+        or      a
+        sbc     hl, de
+        jr      nc, z_st
+        ld      hl, 0
+z_st:
+        ld      (z_rem), hl
+        jr      z_ldlp
+z_lddn:
+        call    ZMODBASE
+        call    dir_load                ; EDIS file mode may
+                                        ; have replaced EDIRBUF
+        jp      ed_loop
+znm_edis:
+        db      "EDIS      "
+z_rec:          dw      0
+z_rem:          dw      0
+z_dst:          dw      0
+        ENDIF
 
 ; R name - read a text file into the text buffer.
 ; On-disk text is CRLF (or LF) separated lines; the buffer is
@@ -4561,6 +4654,9 @@ msg_help:
         db      "F: LIST FILES", 13, 10
         db      "U [D]: DRIVE (0=FD 1=RAMDISK)", 13, 10
         db      "B [NAME]: ASSEMBLE [AND SAVE]", 13, 10
+        IF      !DEFINED EDAS_TOSR
+        db      "Z: DISASSEMBLE TO TEXT (EDIS)", 13, 10
+        ENDIF
         IF      DEFINED EDAS_TOSR
         db      "  (RELOC FIRST LINE = TOSR OUTPUT)", 13, 10
         ENDIF
