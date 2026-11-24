@@ -19,6 +19,8 @@
 #   scc.bin           SCC Small-C compiler (TOSD program)
 #   sci.bin           SCI Small-C interpreter (JIT, TOSD program)
 #   disasm.bin        DISASM Z80 disassembler (TOSD program)
+#   sdbg.tosr         SDBG standalone debugger (TOSR program,
+#                     built by tools/mksdbg.py)
 #   edis.bin          EDIS disassembler module for EDAS (load 0x9000)
 #   tsload.bin        Tiny Scheme stage-1 tape loader (IPL loadable)
 #   scmcore.bin       SCMCORE embedded Tiny Scheme core (TOSD file,
@@ -30,6 +32,7 @@
 #   tinybasic.d88     bootable shell disk with TBC/TBI and samples
 #   smallc.d88        bootable shell disk with SCC/SCI and samples
 #   disasm.d88        bootable shell disk with the DISASM program file
+#   sdbg.d88          bootable shell disk with the SDBG program file
 #   edas.d88          bootable shell disk with EDAS and the EDIS module
 #   tapeos.cmt        tape image of the shell (IPL CMT boot)
 #   tsboot.cmt        Tiny Scheme 2-stage boot tape (loader +
@@ -59,6 +62,7 @@ python3 tools/mkclibtab.py src/clib.z80 "$PASMO" build
 "$PASMO" -I src -I build src/sci.z80 build/sci.bin build/sci.lst
 "$PASMO" src/disasm.z80 build/disasm.bin build/disasm.lst
 "$PASMO" src/edis.z80 build/edis.bin build/edis.lst
+PASMO="$PASMO" python3 tools/mksdbg.py
 # Tiny Scheme: the final-load chunk is embedded into the loader
 "$PASMO" -I src src/ldfin.z80 build/ldfin.bin
 python3 - <<'PYEOF'
@@ -104,6 +108,8 @@ python3 tools/putfiles.py build/smallc.d88 \
     src/scm.c SCM.C 0x8000
 python3 tools/mkd88.py build/tapeos-shell.bin build/disasm.d88 0x2000 0x2000 full
 python3 tools/putfile.py build/disasm.d88 build/disasm.bin DISASM 0x4000
+python3 tools/mkd88.py build/tapeos-shell.bin build/sdbg.d88 0x2000 0x2000 full
+python3 tools/putfile.py build/sdbg.d88 build/sdbg.tosr SDBG 0x4000
 python3 tools/mkd88.py build/tapeos-shell.bin build/edas.d88 0x2000 0x2000 full
 python3 tools/putfiles.py build/edas.d88 \
     build/edas.bin EDAS 0x4000 \
