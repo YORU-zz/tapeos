@@ -1490,6 +1490,21 @@ lay_sizes:
         or      a
         sbc     hl, de
         jr      nc, lay_big             ; > 06000h: too big
+        ; Scheme cap (roadmap id 61): a program carrying
+        ; the embedded core must end below SCMBASE
+        ; (09000h): total_padded + gtotal <= 01000h above
+        ; ORIGIN.
+        ld      a, 22
+        call    used_test
+        jr      z, lay_mn               ; Z set: not used
+        ld      hl, (total_padded)
+        ld      de, (gtotal)
+        add     hl, de
+        ld      de, 01001h
+        or      a
+        sbc     hl, de
+        jr      nc, lay_big
+lay_mn:
         ; find Main
         ld      hl, namebuf
         ld      b, 16
@@ -1869,6 +1884,32 @@ emit_rtentry:
         call    e_b
         ld      a, 0e1h
         call    e_b                     ; POP IX
+        ; Scheme hook (roadmap id 61): three bytes in
+        ; every entry -- NOPs, unless the closed used set
+        ; says the program carries the embedded Scheme
+        ; core, in which case they are a CALL to the
+        ; loader routine (libid 22, pulled in by the scm
+        ; routines' dependency anchors).  The measure
+        ; pass cannot know yet and emits the NOPs; both
+        ; forms are 3 bytes, so the passes agree on the
+        ; size.  (The hook sits before the heap-zero
+        ; block: the gtotal=0 shortcut must not skip it.)
+        ld      a, (pass)
+        cp      2
+        jr      nz, er_nop3
+        ld      a, 22
+        call    used_test
+        jr      z, er_nop3              ; Z set: not used
+        ld      a, 22
+        call    emit_call_lib           ; CALL x_scmload
+        jr      er_zchk
+er_nop3:
+        ld      b, 3
+er_nl:
+        xor     a
+        call    e_b
+        djnz    er_nl
+er_zchk:
         ld      hl, (gtotal)
         ld      a, h
         or      l
@@ -3273,10 +3314,34 @@ parse_call:
 pc_alp:
         ld      a, (tok)
         cp      T_STR
-        jr      z, pc_str               ; strings: print only
+        jr      z, pc_str               ; strings: see below
         call    parse_expr
         ld      a, 0e5h                 ; PUSH HL
         call    e_b
+        jr      pc_pushed
+pc_str:
+        ; a string literal is allowed only as the first
+        ; argument of SEVAL / SCALL (the Scheme text /
+        ; procedure name; libids 0feh / 0fdh); everywhere
+        ; else it stays E_STR as before
+        ld      a, (pc_n)
+        or      a
+        jr      nz, pc_strerr
+        ld      a, (pc_libid)
+        cp      0feh
+        jr      z, pc_strgo
+        cp      0fdh
+        jr      nz, pc_strerr
+pc_strgo:
+        ld      a, 021h                 ; LD HL, literal
+        call    e_b
+        call    lit_addr_hl
+        call    e_wm
+        call    lit_register
+        ld      a, 0e5h                 ; PUSH HL
+        call    e_b
+        call    lex                     ; past the string
+pc_pushed:
         ld      a, (pc_n)
         inc     a
         ld      (pc_n), a
@@ -3285,12 +3350,15 @@ pc_alp:
         jr      nz, pc_fin
         call    lex
         jr      pc_alp
-pc_str:
+pc_strerr:
         ld      a, E_STR
         jp      err
 pc_fin:
         ld      a, ')'
         call    expect
+        ld      a, (pc_libid)
+        cp      0fdh
+        jr      z, pc_scall             ; SCALL is variadic
         ld      a, (pc_n)
         ld      hl, pc_nargs
         cp      (hl)
@@ -3311,20 +3379,40 @@ pc_fin:
         jr      pc_clean
 pc_ext:
         ld      a, (pc_libid)
+        cp      0feh
+        jr      z, pc_seval             ; SEVAL -> routine 20
         call    mark_used
-        ld      a, 0cdh
-        call    e_b
         ld      a, (pc_libid)
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, libaddr
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ex      de, hl
-        call    e_wm
+        call    emit_call_lib
+        jr      pc_clean
+pc_seval:
+        ld      a, 20
+        call    mark_used
+        ld      a, 20
+        call    emit_call_lib
+        jr      pc_clean
+pc_scall:
+        ; SCALL(name, args...): 1..9 slots in total (the
+        ; name plus at most 8 int arguments, the gate's
+        ; limit).  Emit LD A, int-count before the CALL,
+        ; PRINT-style; the caller cleanup below drops all
+        ; slots including the name.
+        ld      a, (pc_n)
+        or      a
+        jp      z, pc_args
+        cp      10
+        jp      nc, pc_args
+        dec     a
+        ld      (pc_n2), a
+        ld      a, 21
+        call    mark_used
+        ld      a, 03eh                 ; LD A, int count
+        call    e_b
+        ld      a, (pc_n2)
+        call    e_b
+        ld      a, 21
+        call    emit_call_lib
+        jr      pc_clean
 pc_clean:
         ; drop the argument slots with POP DE, one per
         ; argument: the LD HL,2n / ADD HL,SP form used
@@ -3377,6 +3465,25 @@ pc_verr:
 pc_args:
         ld      a, E_ARGS
         jp      err
+
+; emit_call_lib: A = library routine id -> emit a marked
+; CALL libaddr[id].  Shared by the extern call sites and
+; the runtime-entry Scheme hook (roadmap id 61).
+emit_call_lib:
+        push    af
+        ld      a, 0cdh
+        call    e_b
+        pop     af
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, libaddr
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        jp      e_wm
 sq_spadj: db    039h, 0f9h              ; ADD HL,SP / LD SP,HL
 
 ; ---------------------------------------------------------------
@@ -3985,7 +4092,10 @@ kwtab:
         db      0
 
 ; external function table: db libid, nargs, ret, "NAME", 0
-; ret: 0 = void, 1 = int. libid 0ffh = PRINT (special).
+; ret: 0 = void, 1 = int. libid 0ffh = PRINT (special);
+; 0feh = SEVAL and 0fdh = SCALL (special ids for library
+; routines 20 / 21, roadmap id 61: their first argument is
+; a string literal, which the general grammar forbids).
 exttab:
         db      0ffh, 0, 0, "PRINT", 0
         db      8, 0, 1, "INPUT", 0
@@ -3997,6 +4107,9 @@ exttab:
         db      14, 1, 1, "PEEK", 0
         db      15, 2, 0, "POKE", 0
         db      16, 1, 0, "PUTC", 0
+        db      0feh, 1, 1, "SEVAL", 0
+        db      0fdh, 0ffh, 1, "SCALL", 0
+        db      23, 0, 1, "SCMERR", 0
         db      0eeh
 
 ; the library tables (generated by tools/mklibtab.py)
@@ -4055,7 +4168,7 @@ gk_ret: db      0
 gk_fptr: dw     0
 gk_nargs: db    0
 used_mask: defs 3
-libaddr: defs   40
+libaddr: defs   48              ; LIB_NROUT words (24 routines)
 litbase: dw     0
 litcur: dw      0
 libbase: dw     0

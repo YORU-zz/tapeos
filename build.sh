@@ -21,6 +21,8 @@
 #   disasm.bin        DISASM Z80 disassembler (TOSD program)
 #   edis.bin          EDIS disassembler module for EDAS (load 0x9000)
 #   tsload.bin        Tiny Scheme stage-1 tape loader (IPL loadable)
+#   scmcore.bin       SCMCORE embedded Tiny Scheme core (TOSD file,
+#                     loaded by TinyBASIC/SmallC programs at start)
 #   tsdemo.bin        TSDEMO demo program for the Tiny Scheme tape
 #   tapeos.d88        bootable disk image of the M1 program
 #   shell.d88         bootable disk image of the shell
@@ -71,6 +73,11 @@ with open("build/finlen.inc", "w") as f:
 PYEOF
 "$PASMO" -I src -I build src/tsload.z80 build/tsload.bin build/tsload.lst
 "$PASMO" src/tsdemo.z80 build/tsdemo.bin
+# SCMCORE: the embedded Tiny Scheme core (roadmap 61).  The
+# core source (src/tscore.inc) is shared with TSLOAD; the
+# generator emits the reduced embedded variant.
+python3 tools/mkscmcore.py src/tscore.inc build/scmcore-gen.inc
+"$PASMO" -I src -I build src/scmcore.z80 build/scmcore.bin build/scmcore.lst
 
 echo "== disk / tape images =="
 python3 tools/mkd88.py build/tapeos.bin build/tapeos.d88
@@ -81,16 +88,20 @@ python3 tools/mkd88.py build/tapeos-shell.bin build/tinybasic.d88 0x2000 0x2000 
 python3 tools/putfiles.py build/tinybasic.d88 \
     build/tbc.bin TBC 0x4000 \
     build/tbi.bin TBI 0x4000 \
+    build/scmcore.bin SCMCORE 0x9000 \
     src/fib.tb FIB.TB 0x8000 \
     src/calc.tb CALC.TB 0x8000 \
-    src/game.tb GAME.TB 0x8000
+    src/game.tb GAME.TB 0x8000 \
+    src/scm.tb SCM.TB 0x8000
 python3 tools/mkd88.py build/tapeos-shell.bin build/smallc.d88 0x2000 0x2000 full
 python3 tools/putfiles.py build/smallc.d88 \
     build/scc.bin SCC 0x4000 \
     build/sci.bin SCI 0x4000 \
+    build/scmcore.bin SCMCORE 0x9000 \
     src/fib.c FIB.C 0x8000 \
     src/calc.c CALC.C 0x8000 \
-    src/game.c GAME.C 0x8000
+    src/game.c GAME.C 0x8000 \
+    src/scm.c SCM.C 0x8000
 python3 tools/mkd88.py build/tapeos-shell.bin build/disasm.d88 0x2000 0x2000 full
 python3 tools/putfile.py build/disasm.d88 build/disasm.bin DISASM 0x4000
 python3 tools/mkd88.py build/tapeos-shell.bin build/edas.d88 0x2000 0x2000 full

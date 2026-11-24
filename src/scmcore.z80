@@ -1,0 +1,330 @@
+; scmcore.z80 - Tiny Scheme embedded core (SCMCORE),
+; roadmap id 61.
+; ---------------------------------------------------------------
+; The Tiny Scheme core (src/tscore.inc, shared with the
+; standalone TSLOAD build) packaged as a TOSD file that the
+; language runtimes load at program start (method 1: the
+; language side carries the core).  TinyBASIC's SEVAL/SCALL
+; and SmallC's scmeval/scmcall reach Scheme through the gate
+; header at the image base; the calling convention is written
+; up in ../scheme-call.md.
+;
+; The build assembles a generated variant of the core
+; (tools/mkscmcore.py): the primitive table holds the 48
+; computation primitives -- the standalone program's console /
+; tape / script / block-editor primitives are absent, so their
+; names are simply unbound here -- and the loader-only data
+; areas are shrunk to stubs.
+;
+; Memory map (fixed; the host program must stay below
+; SCMBASE when it uses Scheme -- the language drivers enforce
+; this with their E_BIG / layout checks):
+;   09000h..0b3ffh  this image (gate + core code + data)
+;   0b400h..0b9ffh  cons arena (384 cells x 4 bytes)
+;   0ba00h..0bfffh  atom arena (192 objects x 8 bytes)
+;   0c000h..0c3ffh  string arena (1024 bytes)
+;   0c400h..0c7ffh  gate private stack (grows down from
+;                   SCM_STKTOP); also the dummy SCRBUF target
+;                   of the dead standalone-only bodies.
+; No GC (same as TSLOAD): arenas are bump-allocated and reset
+; by gate_init, which the host runtime calls once at program
+; start.  Definitions persist across gate calls for the whole
+; program run.
+;
+; Gate header (at SCMBASE):
+;   +0  "SC" magic          +2  gate version (1)
+;   +3  last-error byte     +4  JP gate_init
+;   +7  JP gate_eval        +10 JP gate_call
+; gate_init: no args.  Resets the Scheme world.  Carry set +
+;   error byte on failure.
+; gate_eval: HL = NUL-terminated Scheme text.  Evaluates all
+;   top-level forms in order; HL = last value converted to a
+;   host int; carry set + error byte on failure.
+; gate_call: HL = NUL-terminated procedure name, DE = argv,
+;   BC = argc.  argv holds the int arguments in REVERSE
+;   order (argv[0] is the last argument) -- the order the
+;   hosts' argument slots already lie on their stacks, so
+;   they pass a pointer into the slots with no copying.
+;   HL = result converted; carry set + error byte on
+;   failure.
+; Error byte: 0 = OK; 1..10 = the core's E_* codes;
+;   0FCh = a host int outside the fixnum range -16384..16383
+;   (E_RANGE); 0FDh = the Scheme result is not convertible to
+;   a host int (E_RESULT).  0FBh (core not loaded) is reported
+;   by the host libraries, never by the gate.
+; Value conversion (see scheme-call.md for the full rules):
+;   host int -> fixnum (range-checked, never wrapped);
+;   fixnum -> host int (exact); #t -> 1; #f -> 0; nil -> 0;
+;   anything else -> E_RESULT.
+; The gate preserves the host's IX/IY and stack (it runs the
+; evaluator on its own private stack) and is not re-entrant.
+; ---------------------------------------------------------------
+
+        org     09000h
+
+SCMBASE         equ     09000h
+CONS_BASE       equ     0b400h
+CONS_END        equ     0ba00h
+ATOM_BASE       equ     0ba00h
+ATOM_END        equ     0c000h
+STR_BASE        equ     0c000h
+STR_END         equ     0c400h
+SCRBUF          equ     0c400h          ; dead-code target only
+SCRPSIZE        equ     256
+STAGE           equ     0c400h          ; dead-code target only
+SCM_STKTOP      equ     0c800h
+
+T_SYM           equ     1
+T_STR           equ     2
+T_CLO           equ     3
+T_PRIM          equ     4
+
+; error codes (same numbering as the standalone core)
+E_UNBOUND       equ     1
+E_TYPE          equ     2
+E_ARITY         equ     3
+E_READ          equ     4
+E_HEAP          equ     5
+E_TAPE          equ     6
+E_NOTPROC       equ     7
+E_BIG           equ     8
+E_DIV0          equ     9
+E_FORM          equ     10
+; gate-level codes
+E_NOLOAD        equ     0fbh
+E_RANGE         equ     0fch
+E_RESULT        equ     0fdh
+
+; ---- gate header ----
+        db      "SC"                    ; +0 magic
+        db      1                       ; +2 gate version
+gate_err:
+        db      0                       ; +3 last-error byte
+        jp      gate_init               ; +4
+        jp      gate_eval               ; +7
+        jp      gate_call               ; +10
+
+; ---- gate prologue / epilogue ----
+; Every entry: clear the error byte, save the host's IX/IY on
+; the host stack, point (save_sp) at that stack state (so
+; err_throw lands in err_land with the same state) and switch
+; to the private stack.  Epilogues restore SP from (save_sp),
+; pop IY/IX and RET to the host with carry = error flag.
+gate_prolog:
+        pop     de                      ; return into the gate body
+        push    ix
+        push    iy
+        ld      hl, 0
+        add     hl, sp
+        ld      (save_sp), hl           ; -> saved IY; below it on
+        ld      sp, SCM_STKTOP          ; the host stack lie IX and
+        push    de                      ; the host return address,
+        ret                             ; which the epilogues reach
+                                        ; by restoring SP and
+                                        ; popping IY/IX
+
+gate_epok:                              ; HL = result
+        ld      sp, (save_sp)
+        pop     iy
+        pop     ix
+        or      a
+        ret
+
+gate_epierr:                            ; (gate_err) already set
+        ld      sp, (save_sp)
+        pop     iy
+        pop     ix
+        scf
+        ret
+
+; err_land: the core's error landing pad for this packaging.
+; err_throw has reset SP to (save_sp) (host stack, IY on top).
+err_land:
+        ld      a, (err_code)
+        ld      (gate_err), a
+        pop     iy
+        pop     ix
+        scf
+        ret
+
+gate_fail:                              ; A = gate error code
+        ld      (gate_err), a
+        jr      gate_epierr
+
+; ---- gate_init ----
+gate_init:
+        xor     a
+        ld      (gate_err), a
+        call    gate_prolog
+        call    scheme_init
+        ld      hl, 0
+        jp      gate_epok
+
+; ---- gate_eval ----
+gate_eval:
+        xor     a
+        ld      (gate_err), a
+        ld      (gate_text), hl
+        call    gate_prolog
+        ld      hl, (gate_text)
+        push    hl
+        call    strlen                  ; DE = length
+        pop     hl
+        call    rd_init
+        ld      hl, 0
+        ld      (gate_result), hl
+gev_loop:
+        call    read_expr
+        cp      1
+        jr      z, gev_done             ; EOF: finished
+        or      a
+        jp      nz, throw_read
+        ld      de, (genv)
+        call    eval
+        ld      (gate_result), hl
+        jr      gev_loop
+gev_done:
+        ld      hl, (gate_result)
+        jp      gate_convert
+
+; ---- gate_call ----
+gate_call:
+        xor     a
+        ld      (gate_err), a
+        ld      (gate_name), hl
+        ld      (gate_argv), de
+        ld      (gate_argc), bc
+        call    gate_prolog
+        ; at most 8 int arguments (the host libraries'
+        ; argv buffer); more is an arity error
+        ld      hl, (gate_argc)
+        ld      a, h
+        or      a
+        jr      nz, gc_many
+        ld      a, l
+        cp      9
+        jr      c, gc_bld0
+gc_many:
+        ld      a, E_ARITY
+        jp      err_throw
+gc_bld0:
+        ; Build the argument list.  The hosts pass their
+        ; own argument slots as they lie on the stack:
+        ; argv[0] is the LAST argument, argv[argc-1] the
+        ; first.  Consing them in array order therefore
+        ; builds the list in source order.
+        ld      hl, 0
+        ld      (gate_list), hl
+        ld      (gate_idx), hl
+gc_bld:
+        ld      hl, (gate_idx)
+        ld      de, (gate_argc)
+        or      a
+        sbc     hl, de
+        jr      nc, gc_form             ; idx == argc: done
+        ld      hl, (gate_idx)
+        add     hl, hl
+        ld      de, (gate_argv)
+        add     hl, de                  ; HL = &argv[idx]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl                  ; HL = raw host int
+        push    hl
+        ld      de, 16384
+        add     hl, de                  ; in range iff bit15 = 0
+        bit     7, h
+        jr      nz, gc_range
+        pop     hl
+        call    fix_from_int            ; exact for in-range
+        ld      de, (gate_list)
+        call    mk_cons
+        ld      (gate_list), hl
+        ld      hl, (gate_idx)
+        inc     hl
+        ld      (gate_idx), hl
+        jr      gc_bld
+gc_range:
+        pop     hl
+        ld      a, E_RANGE
+        jp      gate_fail
+gc_form:
+        ld      hl, (gate_name)
+        push    hl
+        call    strlen                  ; DE = length
+        pop     hl
+        call    intern                  ; HL = symbol
+        ld      de, (gate_list)
+        call    mk_cons                 ; HL = (name . args)
+        ld      de, (genv)
+        call    eval
+        ; fall into gate_convert
+
+; ---- result conversion: HL = Scheme value -> host int ----
+gate_convert:
+        call    val_type                ; A = value class
+        cp      1
+        jr      z, gcv_fix              ; fixnum
+        cp      2
+        jr      z, gcv_bool             ; #t / #f
+        or      a
+        jr      z, gcv_nil              ; nil
+        ld      a, E_RESULT
+        jp      gate_fail
+gcv_fix:
+        call    fix_decode
+        jp      gate_epok
+gcv_bool:
+        ld      a, l
+        cp      4                       ; #t = 0004h
+        ld      hl, 0
+        jr      nz, gcv_ok
+        inc     hl
+gcv_ok:
+        jp      gate_epok
+gcv_nil:
+        ld      hl, 0
+        jp      gate_epok
+
+; ---- stubs for the standalone packaging's services ----
+; The core's printer and the (dead, table-less) standalone
+; primitives call these.  The embedded build has no console of
+; its own -- the host program owns the screen and keyboard --
+; so they are no-ops.  They are never reached through the
+; gate: the primitives that use them are not in the table.
+con_putc:
+        ret
+con_puts:
+        ret
+con_crlf:
+        ret
+clrscr:
+        ret
+kb_getkey:
+        xor     a
+        ret
+getline:
+        xor     a
+        ret
+load_file_n:
+        ret
+scan_files:
+        ret
+record_tape:
+        ret
+save_script_native:
+        ret
+menu:
+        ret
+
+; ---- gate work area ----
+gate_text:      ds      2
+gate_result:    ds      2
+gate_name:      ds      2
+gate_argv:      ds      2
+gate_argc:      ds      2
+gate_idx:       ds      2
+gate_list:      ds      2
+
+; ---- the core itself (generated embedded variant) ----
+        include "../build/scmcore-gen.inc"

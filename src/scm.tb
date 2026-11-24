@@ -1,0 +1,67 @@
+/* scm.tb - TinyBASIC sample: calling Tiny Scheme through
+   the gate (roadmap id 61).  Defines fact and sq in
+   Scheme via SEVAL, calls them back via SCALL, checks
+   the SCMERR channel on a divide by zero, on an unbound
+   name, on an out-of-range argument (E_RANGE) and on a
+   non-integer result (E_RESULT), and writes the result
+   signature ("TBRS", tag 11) at 0E680h with words
+   (42, 5040, 144, 9, 0, 1, 252, 253).
+   Run on a disk WITHOUT SCMCORE, every call returns 0
+   and SCMERR reports 251 (0FBh, core not loaded); the
+   scmnc session checks the words
+   (0, 0, 0, 251, 0, 251, 251, 251) for that case. */
+
+func void sig8(int v0, int v1, int v2, int v3, int v4, int v5, int v6, int v7)
+    poke(0xE680, 0x54)          /* 'T' */
+    poke(0xE681, 0x42)          /* 'B' */
+    poke(0xE682, 0x52)          /* 'R' */
+    poke(0xE683, 0x53)          /* 'S' */
+    poke(0xE684, 11)
+    poke(0xE688, v0 & 255)
+    poke(0xE689, (v0 >> 8) & 255)
+    poke(0xE68A, v1 & 255)
+    poke(0xE68B, (v1 >> 8) & 255)
+    poke(0xE68C, v2 & 255)
+    poke(0xE68D, (v2 >> 8) & 255)
+    poke(0xE68E, v3 & 255)
+    poke(0xE68F, (v3 >> 8) & 255)
+    poke(0xE690, v4 & 255)
+    poke(0xE691, (v4 >> 8) & 255)
+    poke(0xE692, v5 & 255)
+    poke(0xE693, (v5 >> 8) & 255)
+    poke(0xE694, v6 & 255)
+    poke(0xE695, (v6 >> 8) & 255)
+    poke(0xE696, v7 & 255)
+    poke(0xE697, (v7 >> 8) & 255)
+endfunc
+
+func int Main()
+    int r1, r2, r3, e1, r4, e2, r5, e3, r6, e4, d
+    d = seval("(begin (define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) 0)")
+    d = seval("(begin (define (sq x) (* x x)) 0)")
+    r1 = seval("(+ 40 2)")
+    r2 = scall("fact", 7)
+    r3 = scall("sq", 12)
+    d = seval("(quotient 1 0)")
+    e1 = scmerr()
+    r4 = scall("nosuch", 1)
+    e2 = scmerr()
+    r5 = scall("fact", 20000)
+    e3 = scmerr()
+    r6 = seval("(cons 1 2)")
+    e4 = scmerr()
+    print("EVAL=")
+    print(r1)
+    print()
+    print("FACT=")
+    print(r2)
+    print()
+    print("SQ=")
+    print(r3)
+    print()
+    print("ERR=")
+    print(e1)
+    print()
+    sig8(r1, r2, r3, e1, r4, e2, e3, e4)
+    return 0
+endfunc

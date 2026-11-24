@@ -39,6 +39,9 @@
 ;  10 x_cls    11 x_inkey  12 x_stick  13 x_vsync  14 x_peek
 ;  15 x_poke   16 x_putc   17 neg_hl   18 rtd_setup
 ;  19 udiv_core
+;  20 x_scmeval  21 x_scmcall  22 x_scmload  23 x_scmerr
+;   (roadmap 61: the embedded Tiny Scheme gate; 20/21 also
+;   mark 22 used, and the runtime entry calls 22 first)
 ; Every routine is self-contained: cross-routine references
 ; go through the X_ dummies only, never by label or by a
 ; relative branch into another routine.
@@ -50,6 +53,7 @@ C_CRLF          equ     0e40ch          ; IOCS 4
 C_GETLIN        equ     0e40fh          ; IOCS 5
 C_CLRSCR        equ     0e412h          ; IOCS 6
 C_LOCATE        equ     0e415h          ; IOCS 7
+C_DREAD         equ     0e42dh          ; IOCS 15
 
 X_RT_MUL        equ     0c000h
 X_RT_DIV        equ     0c003h
@@ -71,6 +75,10 @@ X_PUTC          equ     0c030h
 X_NEGHL         equ     0c033h
 X_RTD_SETUP     equ     0c036h
 X_UDIV_CORE     equ     0c039h
+X_SCMEVAL       equ     0c03ch
+X_SCMC          equ     0c03fh
+X_SCMLOAD       equ     0c042h
+X_SCMERR        equ     0c045h
 
         org     __ORG__
 
@@ -686,6 +694,199 @@ udc_ok:
 udc_nx:
         dec     a
         jr      nz, udc_lp
+        ret
+
+; ---------------------------------------------------------------
+; 20: x_scmeval -- scmeval(text): evaluate the Scheme text
+; in the embedded core (see x_scmload) and return the last
+; form's value converted to int.  Errors and a missing core
+; return 0; scmerr() reports the code.  Framed, 1 arg.
+; ---------------------------------------------------------------
+RTB_20:
+        push    iy
+        ld      iy, 0
+        add     iy, sp
+        ld      a, (09000h)
+        cp      'S'
+        jr      nz, xse_none
+        ld      a, (09001h)
+        cp      'C'
+        jr      nz, xse_none
+        ld      l, (iy + 4)
+        ld      h, (iy + 5)             ; HL = text pointer
+        call    09007h                  ; gate_eval
+        jr      nc, xse_ok
+xse_none:
+        ld      hl, 0
+xse_ok:
+        pop     iy
+        ret
+        ; dependency anchor: this word is registered by
+        ; mkclibtab as a reference to x_scmload (22), so
+        ; the layout closure includes the loader whenever
+        ; this routine is used.  Never executed.
+        dw      X_SCMLOAD
+
+; ---------------------------------------------------------------
+; 21: x_scmcall -- scmcall(name, ...): call a Scheme
+; procedure by name with int arguments (at most 8; the
+; gate enforces it) and return its value converted to
+; int.  Variadic like x_printf: A = number of int
+; arguments (after the name); the caller cleans the
+; stack.  The gate's argv is the caller's own argument
+; slots (at IX+4, last argument first -- the gate's
+; documented order), so no copy is needed.  Errors and
+; a missing core return 0.
+; ---------------------------------------------------------------
+RTB_21:
+        push    ix
+        ld      ix, 0
+        add     ix, sp
+        ld      (xsc_n), a              ; self-ref (diff)
+        ld      a, (09000h)
+        cp      'S'
+        jr      nz, xsc_none
+        ld      a, (09001h)
+        cp      'C'
+        jr      nz, xsc_none
+        ; name slot at IX + 4 + 2*n (arg1, deepest)
+        ld      a, (xsc_n)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, 4
+        add     hl, de
+        push    ix
+        pop     de
+        add     hl, de                  ; HL = &name slot
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = name pointer
+        push    ix
+        pop     hl
+        ld      bc, 4
+        add     hl, bc                  ; HL = &argN slot
+        ex      de, hl                  ; DE = argv, HL = name
+        ld      a, (xsc_n)
+        ld      c, a
+        ld      b, 0
+        call    0900ah                  ; gate_call
+        jr      nc, xsc_ok
+xsc_none:
+        ld      hl, 0
+xsc_ok:
+        pop     ix
+        ret
+xsc_n:  defb    0
+        ; dependency anchor (see x_scmeval): -> x_scmload.
+        dw      X_SCMLOAD
+
+; ---------------------------------------------------------------
+; 22: x_scmload -- load the embedded Tiny Scheme core
+; (the TOSD file "SCMCORE") from the current disk into
+; 09000h and initialise it through its gate.  Register
+; convention (no arguments): the runtime entry calls it
+; once when the program uses scmeval/scmcall (their code
+; generation also marks this routine used).  A missing
+; file or a bad image is not an error here: the magic
+; stays clear and scmerr() reports 0fbh.  The records
+; are read straight into the core area (the tail of the
+; last record lands in the not-yet-initialised arena
+; and is reset by gate_init).  Uses the tool DIRBUF.
+; ---------------------------------------------------------------
+RTB_22:
+        xor     a
+        ld      (09000h), a             ; clear any stale magic
+        ld      (09001h), a
+        ld      de, 32                  ; directory record
+        ld      hl, 0d500h              ; DIRBUF (sccore map)
+        call    C_DREAD
+        ld      hl, 0d500h + 16
+        ld      b, 15
+xsl_lp:
+        ld      a, (hl)
+        or      a
+        jr      z, xsl_nx
+        push    hl
+        push    bc
+        ld      de, xsl_name            ; self-ref (diff)
+        ld      b, 10
+xsl_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jr      nz, xsl_dif
+        inc     hl
+        inc     de
+        djnz    xsl_cmp
+        pop     bc
+        pop     hl
+        jr      xsl_fd
+xsl_dif:
+        pop     bc
+        pop     hl
+xsl_nx:
+        ld      de, 16
+        add     hl, de
+        djnz    xsl_lp
+        ret                             ; not found
+xsl_fd:
+        ld      de, 10
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = first record
+        inc     hl
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)                 ; BC = size in bytes
+        ld      a, c
+        or      a
+        ld      a, b
+        jr      z, xsl_nc
+        inc     a                       ; A = record count
+xsl_nc:
+        ld      b, a
+        ld      hl, 09000h              ; destination
+xsl_rd:
+        push    bc
+        push    de
+        push    hl
+        call    C_DREAD                 ; DE = record, HL = dest
+        pop     hl
+        pop     de
+        pop     bc
+        inc     de                      ; next record
+        inc     h                       ; dest += 256
+        djnz    xsl_rd
+        ld      a, (09000h)
+        cp      'S'
+        ret     nz
+        ld      a, (09001h)
+        cp      'C'
+        ret     nz
+        jp      09004h                  ; gate_init (tail call)
+xsl_name:
+        defb    "SCMCORE   "
+
+; ---------------------------------------------------------------
+; 23: x_scmerr -- scmerr(): the embedded core's last
+; error code (0 = OK, 1..10 = the Scheme E_* codes,
+; 0fbh = core not loaded, 0fch = an argument outside
+; the fixnum range, 0fdh = result not convertible).
+; ---------------------------------------------------------------
+RTB_23:
+        ld      a, (09000h)
+        cp      'S'
+        jr      nz, xsr_none
+        ld      a, (09001h)
+        cp      'C'
+        jr      nz, xsr_none
+        ld      a, (09003h)
+        ld      l, a
+        ld      h, 0
+        ret
+xsr_none:
+        ld      hl, 0fbh
         ret
 
 RTB_END:

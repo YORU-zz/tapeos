@@ -61,8 +61,7 @@
 ; Memory map (the tool's own, in the EDAS zone; the
 ; binary outgrows the 10,240-byte NEWASM/SCED frame --
 ; see smallc-tos.md for the size accounting):
-;   04000h..071ffh  this program (code + data)
-;   07200h          DIRBUF: TOSD directory sector
+;   04000h..072ffh  this program (code + data)
 ;   07300h..075ffh  SECBUF: source sector buffers, one
 ;                   256-byte page per include level
 ;   07600h..07dffh  symbol tables (scratch)
@@ -74,10 +73,15 @@
 ;   0c800h..0d1ffh  BITMAP: TOSR relocation bitmap
 ;   0d200h          MACEXP: macro expansion stack buffer
 ;   0d300h          MACTAB: macro table (10 x 48)
+;   0d500h          DIRBUF: TOSD directory sector
 ; The 0c800h+ scratch sits above the largest image and
 ; below the stack (STACKTOP 0e000h); SCI additionally
 ; caps module + heap at 0c800h so this scratch survives
 ; while a JIT-compiled program runs (see layout).
+; (DIRBUF moved 07200h -> 0d500h in the roadmap-61 work:
+; the binary outgrew the space below 07200h when the
+; Scheme gate library was added; the directory sector
+; now sits in the free tail of the 0c800h+ scratch.)
 
 ; ---- IOCS (X1) ----
 C_CONOUT        equ     0e406h          ; IOCS 2
@@ -89,7 +93,7 @@ C_DWRITE        equ     0e430h          ; IOCS 16
 
 MACEXP          equ     0d200h
 MACTAB          equ     0d300h
-DIRBUF          equ     07200h
+DIRBUF          equ     0d500h
 SECBUF          equ     07300h
 BITMAP          equ     0c800h
 ; symbol tables live in the tool scratch area (as in
@@ -2627,6 +2631,21 @@ lay_sizes:
         or      a
         sbc     hl, de
         jr      nc, lay_big             ; over the cap: too big
+        ; Scheme cap (roadmap 61): a program carrying the
+        ; embedded core must end below SCMBASE (09000h):
+        ; total_padded + gtotal <= 01000h above ORIGIN.
+        ld      a, 22
+        call    used_test
+        jr      z, lay_main             ; Z set: not used
+        ld      hl, (total_padded)
+        ld      de, (gtotal)
+        add     hl, de
+        ld      de, 01000h
+        inc     de
+        or      a
+        sbc     hl, de
+        jr      nc, lay_big
+lay_main:
         ; find main
         ld      hl, namebuf
         ld      b, 16
@@ -2911,6 +2930,32 @@ emit_rtentry:
         call    e_b
         ld      a, 0e1h
         call    e_b                     ; POP IX
+        ; Scheme hook (roadmap 61): three bytes in every
+        ; entry -- NOPs, unless the closed used set says
+        ; the program carries the embedded Scheme core,
+        ; in which case they are a CALL to the loader
+        ; routine (libid 22, pulled in by the scm
+        ; routines' dependency masks).  The measure pass
+        ; cannot know yet and emits the NOPs; both forms
+        ; are 3 bytes, so the passes agree on the size.
+        ; (The hook sits before the heap-zero block: the
+        ; gtotal=0 shortcut must not skip it.)
+        ld      a, (pass)
+        cp      2
+        jr      nz, er_nop3
+        ld      a, 22
+        call    used_test
+        jr      z, er_nop3              ; Z set: not used
+        ld      a, 22
+        call    emit_call_lib           ; CALL x_scmload
+        jr      er_zchk
+er_nop3:
+        ld      b, 3
+er_nl:
+        xor     a
+        call    e_b
+        djnz    er_nl
+er_zchk:
         ld      hl, (gtotal)
         ld      a, h
         or      l
@@ -5474,6 +5519,8 @@ pc_fin_ext:
         ld      a, (pc_libid)
         cp      6
         jr      z, pc_printf2           ; variadic printf
+        cp      21
+        jr      z, pc_printf2           ; variadic scmcall
         ld      a, (pc_n)
         ld      hl, pc_nargs
         cp      (hl)
@@ -5481,45 +5528,23 @@ pc_fin_ext:
 pc_ext:
         ld      a, (pc_libid)
         call    mark_used
-        ld      a, 0cdh
-        call    e_b
         ld      a, (pc_libid)
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, libaddr
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ex      de, hl
-        call    e_wm
+        call    emit_call_lib
         jr      pc_clean
 pc_printf2:
         ld      a, (pc_n)
         or      a
-        jp      z, pc_args              ; printf needs >= 1
+        jp      z, pc_args              ; printf/scmcall need >= 1
         dec     a
         ld      (pc_n2), a
-        ld      a, 6
+        ld      a, (pc_libid)
         call    mark_used
         ld      a, 03eh                 ; LD A, nargs - 1
         call    e_b
         ld      a, (pc_n2)
         call    e_b
-        ld      a, 0cdh                 ; CALL x_printf
-        call    e_b
-        ld      a, 6
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, libaddr
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ex      de, hl
-        call    e_wm
+        ld      a, (pc_libid)
+        call    emit_call_lib           ; CALL x_printf / x_scmcall
 pc_clean:
         ; drop the argument slots with POP DE, one per
         ; argument: the LD HL,2n / ADD HL,SP form used
@@ -5555,6 +5580,25 @@ pc_out:
 pc_args:
         ld      a, E_ARGS
         jp      err
+
+; emit_call_lib: A = library id; emit a marked
+; CALL libaddr[id].  Shared by the extern call sites
+; and the runtime entry's Scheme hook.
+emit_call_lib:
+        push    af
+        ld      a, 0cdh
+        call    e_b
+        pop     af
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, libaddr
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl
+        jp      e_wm
 sq_spadj: db    039h, 0f9h              ; ADD HL,SP / LD SP,HL
 
 ; lit_addr_hl: HL = the runtime address of the literal
@@ -5626,7 +5670,10 @@ kwtab:
 
 ; external function table: db libid, nargs, ret, "name", 0
 ; ret is a C type code (0 int, 2 void). libid 6 (printf)
-; is variadic: nargs 0ffh, handled specially.
+; is variadic: nargs 0ffh, handled specially.  libid 21
+; (scmcall) is variadic the same way (roadmap 61); the
+; Scheme externs' loader dependency (libid 22) is marked
+; by the call code generation, not by a table entry.
 exttab:
         db      6, 0ffh, 0, "printf", 0
         db      5, 1, 0, "puts", 0
@@ -5640,6 +5687,9 @@ exttab:
         db      13, 0, 2, "vsync", 0
         db      14, 1, 0, "peek", 0
         db      15, 2, 2, "poke", 0
+        db      20, 1, 0, "scmeval", 0
+        db      21, 0ffh, 0, "scmcall", 0
+        db      23, 0, 0, "scmerr", 0
         db      0eeh
 
 ; the library tables (generated by tools/mkclibtab.py)
@@ -5729,7 +5779,7 @@ gk_kbase: db    0
 pn_ptr: dw      0
 p1_depth: db    0
 used_mask: defs 3
-libaddr: defs   40
+libaddr: defs   48              ; LIB_NROUT words (24 routines)
 litbase: dw     0
 litcur: dw      0
 libbase: dw     0

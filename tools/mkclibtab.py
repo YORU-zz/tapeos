@@ -8,7 +8,7 @@ same routine); words equal to 0xC000 + 3*id are calls to
 another routine (dummy addresses). From those facts this
 tool emits libtab.inc, which the compiler embeds:
 
-  libtab:  20 entries x 16 bytes (all words):
+  libtab:  24 entries x 16 bytes (all words):
              off, len, selfidx, nself, dumidx, ndum,
              dep_lo, dep_hi
            off/len locate the routine inside libimg;
@@ -27,7 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-NROUT = 20
+NROUT = 24
 
 
 def assemble(pasmo, src_text, org, workdir, tag):
@@ -131,7 +131,8 @@ def main():
              "x_puts", "x_printf", "x_getchar", "x_input",
              "x_locate", "x_cls", "x_inkey", "x_stick", "x_vsync",
              "x_peek", "x_poke", "x_putc", "neg_hl", "rtd_setup",
-             "udiv_core"]
+             "udiv_core", "x_scmeval", "x_scmcall", "x_scmload",
+             "x_scmerr"]
     rep = [f"clib image: {len(img0)} bytes, {NROUT} routines"]
     for i in range(NROUT):
         rep.append(

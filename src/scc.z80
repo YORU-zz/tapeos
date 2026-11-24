@@ -12,8 +12,8 @@
 ;
 ; Memory map:
 ;   04000h..        this program (code + data)
-;   (memory map in sccore.inc: binary to 071ffh,
-;   DIRBUF 07200h, source buffers 07300h.., symbol
+;   (memory map in sccore.inc: binary to 072ffh,
+;   source buffers 07300h.., DIRBUF 0d500h, symbol
 ;   tables 07600h.., bitmap 0c800h, macro areas 0d200h+)
 ;   08000h..        output file image (stub at 08000h,
 ;                   body at 0806dh), guarded to 0c000h+
