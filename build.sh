@@ -18,6 +18,7 @@
 #   tbi.bin           TBI TinyBASIC interpreter (JIT, TOSD program)
 #   scc.bin           SCC Small-C compiler (TOSD program)
 #   sci.bin           SCI Small-C interpreter (JIT, TOSD program)
+#   disasm.bin        DISASM Z80 disassembler (TOSD program)
 #   tsload.bin        Tiny Scheme stage-1 tape loader (IPL loadable)
 #   tsdemo.bin        TSDEMO demo program for the Tiny Scheme tape
 #   tapeos.d88        bootable disk image of the M1 program
@@ -25,6 +26,7 @@
 #   mced.d88          bootable shell disk with the MCED program file
 #   tinybasic.d88     bootable shell disk with TBC/TBI and samples
 #   smallc.d88        bootable shell disk with SCC/SCI and samples
+#   disasm.d88        bootable shell disk with the DISASM program file
 #   tapeos.cmt        tape image of the shell (IPL CMT boot)
 #   tsboot.cmt        Tiny Scheme 2-stage boot tape (loader +
 #                     script block + TapeOS + TSDEMO)
@@ -51,6 +53,7 @@ python3 tools/genstub.py tools/stub-template.bin build/stub.inc
 python3 tools/mkclibtab.py src/clib.z80 "$PASMO" build
 "$PASMO" -I src -I build src/scc.z80 build/scc.bin build/scc.lst
 "$PASMO" -I src -I build src/sci.z80 build/sci.bin build/sci.lst
+"$PASMO" src/disasm.z80 build/disasm.bin build/disasm.lst
 # Tiny Scheme: the final-load chunk is embedded into the loader
 "$PASMO" -I src src/ldfin.z80 build/ldfin.bin
 python3 - <<'PYEOF'
@@ -85,6 +88,8 @@ python3 tools/putfiles.py build/smallc.d88 \
     src/fib.c FIB.C 0x8000 \
     src/calc.c CALC.C 0x8000 \
     src/game.c GAME.C 0x8000
+python3 tools/mkd88.py build/tapeos-shell.bin build/disasm.d88 0x2000 0x2000 full
+python3 tools/putfile.py build/disasm.d88 build/disasm.bin DISASM 0x4000
 python3 tools/mkcmt.py build/tapeos-shell.bin build/tapeos.cmt
 python3 tools/mktape.py --loader build/tsload.bin \
     --script src/stage2.scm --out build/tsboot.cmt \
