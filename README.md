@@ -132,6 +132,8 @@ README の案内（meister68k 氏の X1 互換フォント配布）に従って
 ください。TapeOS 本体はこのフォントを同梱しません（漢字表示用
 フォントは上記 font.d88 として TapeOS 側に含まれます）。
 
+TapeOS というもの自体については `docs/about-tapeos.md` に
+まとめています。
 起動時の IPL-ROM の動き（ブートデバイス選択や内蔵モニタ）については
 `docs/boot-and-ipl.md` に、シェルの最低限のコマンドについては
 `docs/shell-commands.md` にまとめています。
