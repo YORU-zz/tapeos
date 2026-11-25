@@ -1,0 +1,4660 @@
+; mdb.z80 - MDB: a Markdown document browser for TapeOS,
+; X1 target. OUROBO/ROS reproduction (P2), roadmap id 29.
+;
+; In the fiction the protagonist gave up on Markdown in the
+; TOS era (the parser was judged too heavy) and only built
+; a roff-like document browser in the PC/XT era. MDB is the
+; reproduction side's answer: a deliberately small subset
+; parser that fits a Z80 TOSD program. It is a peripheral
+; tool, not part of the OS core, and can be dropped from a
+; KernelConfig-style build without touching anything else.
+;
+; MDB is an ordinary TOSD program loaded at 04000h by the
+; shell's R and started with G 4000; quitting returns (RET)
+; to the shell. It reuses SCED's proven layers verbatim in
+; spirit and mostly in code: the EMM text store (line
+; descriptors of the same 8-byte shape), the TOSD file
+; layer (byte-for-byte the EDAS/WICS scheme, so SCED /
+; MCED / EDAS documents open unchanged), and direct text
+; VRAM rendering (char plane page 030h, attribute plane
+; page 020h, cell = y*40 + x; CONOUT drops codes >= 07fh
+; and cannot do per-cell attributes).
+;
+; The one deliberate simplification against SCED: MDB is
+; read-only, so its line store is append-only - no free
+; list. Descriptors are still built in document order and
+; relinked exactly as SCED does.
+;
+; Subset (see ../markdown-browser.md for the fixed table):
+;   blocks: ATX headings, lists (- + * and 1. style),
+;     block quotes, fenced code (```), horizontal rules,
+;     reference definitions, paragraphs. No tables, no
+;     setext headings, no HTML blocks, no line joining.
+;   inline: *em* _em_ **strong** __strong__, `code` (and
+;     ``code``), [text](target), [text][id], [id] shortcut
+;     references, ![alt](target) shown as alt text,
+;     backslash escapes of ASCII punctuation.
+;   links:  file targets, #anchor targets and file#anchor,
+;     resolved through a per-document anchor table built
+;     from heading slugs; reference definitions are
+;     collected in a first pass over the document and
+;     resolved in a second pass.
+;   SJIS: a lead byte (081h-09fh, 0e0h-0fch) always
+;     consumes its trail byte, so a trail byte equal to
+;     '`' (060h, e.g. in 0x8160) is never seen as markup.
+;
+; Keys: j/k line, SPACE/b page, g/G top/bottom, h/l
+; horizontal scroll, TAB or n / N link select, ENTER
+; follow, u or BS history back, e edit in SCED (chain
+; load, state saved to the MDBSTATE file), o open file,
+; d drive 0/1, q quit.
+;
+; Memory map (main RAM):
+;   04000h..067ffh  this program (code + data, cap 10240)
+;   06800h..068ffh  TOSD directory sector buffer
+;   06900h..06affh  link table (64 entries x 8)
+;   06c00h..073ffh  line descriptors (256 x 8)
+;   07400h..0785fh  anchor table (40 entries x 28)
+;   07900h..07adf  reference table (24 entries x 20)
+;   07c00h..07effh  work buffers (line, render, names)
+;   08000h..0dfffh  file staging (24 KB); also the chain
+;                   loader stub's home while it runs
+;   stack: own, top at 08000h (set at entry)
+;
+; Text lives in the EMM area SCED uses for buffer 1
+; (EMM 010000h, 24 KB, mid byte 000h); link target
+; strings live in a pool in SCED's buffer-2 area
+; (EMM 016000h, mid byte 060h). SCED may overwrite both
+; while MDB is chained away; MDB's state is on disk
+; (MDBSTATE) and the document is reloaded on resume.
+;
+; A status block for automated verification is maintained
+; at 0e680h: "MDB1", line count, top line, selected link
+; line/ordinal, link count, history depth, resumed flag,
+; last follow kind, truncation flag, text checksum,
+; current file name, left column, anchor/ref counts,
+; current drive.
+
+; ---- IOCS table (3 bytes per entry), X1 base ----
+IOCS_BASE       equ     0e400h
+C_INKEY         equ     IOCS_BASE + 3 * 0
+C_KEYIN         equ     IOCS_BASE + 3 * 1
+C_CONOUT        equ     IOCS_BASE + 3 * 2
+C_PRTMSG        equ     IOCS_BASE + 3 * 3
+C_CRLF          equ     IOCS_BASE + 3 * 4
+C_GETLIN        equ     IOCS_BASE + 3 * 5
+C_CLRSCR        equ     IOCS_BASE + 3 * 6
+C_LOCATE        equ     IOCS_BASE + 3 * 7
+C_DREAD         equ     IOCS_BASE + 3 * 15
+C_DWRITE        equ     IOCS_BASE + 3 * 16
+C_RREAD         equ     IOCS_BASE + 3 * 24
+C_RWRITE        equ     IOCS_BASE + 3 * 25
+C_RINIT         equ     IOCS_BASE + 3 * 26
+
+; ---- fixed work areas ----
+DIRBUF          equ     06800h
+LINKTAB         equ     06900h          ; 64 x 8 bytes
+LA              equ     06c00h          ; 256 descriptors x 8
+ANCHTAB         equ     07400h          ; 40 x 28 bytes
+REFTAB          equ     07900h          ; 24 x 20 bytes
+TMPBUF          equ     07c00h          ; parse line (96)
+RLINE           equ     07c80h          ; raw line (96)
+REND            equ     07d00h          ; rendered text (88)
+RATTR           equ     07d60h          ; rendered attrs (88)
+STATBUF         equ     07dc0h          ; status line (48)
+NAMEBUF         equ     07e00h          ; file name (16)
+TGTBUF          equ     07e20h          ; target string (48)
+IDBUF           equ     07e60h          ; raw ref id (24)
+IDNBUF          equ     07e80h          ; normalised id (20)
+SLUGBUF         equ     07ea0h          ; slug (32)
+FRAGBUF         equ     07ec0h          ; anchor fragment (32)
+STAGE           equ     08000h          ; file staging
+SIGBLK          equ     0e680h          ; verification block
+STUBHOME        equ     08000h          ; chain stub runs here
+STUBPAR         equ     07f00h          ; chain stub parameters
+                                        ; (clear of the stack's reach)
+
+MAXLINES        equ     256
+MAXLEN          equ     80
+MAXLINK         equ     64
+MAXANCH         equ     40
+MAXREF          equ     24
+MAXHIST         equ     12
+AREASZ          equ     06000h          ; 24 KB per EMM area
+DIRREC          equ     32
+FDMAXREC        equ     1280
+RDDATA0         equ     1
+FDDATA0         equ     48
+EMID_TEXT       equ     000h            ; EMM 010000h
+EMID_POOL       equ     060h            ; EMM 016000h
+
+; descriptor fields (8 bytes per line, as in SCED)
+D_OFF           equ     0               ; u16 text offset
+D_LEN           equ     2               ; u8 length
+D_PREV          equ     3               ; u16 index or ffffh
+D_NEXT          equ     5               ; u16 index or ffffh
+
+; link table entry (8 bytes)
+L_LINE          equ     0               ; u16 source line
+L_ORD           equ     2               ; u8 ordinal in line
+L_DCOL          equ     3               ; u8 display start col
+L_DEND          equ     4               ; u8 display end col
+L_POOL          equ     5               ; u16 pool offset (3 pad)
+
+; anchor table entry (28 bytes): len u8, slug 24, line u16
+; reference table entry (20 bytes): len u8, id 15, pool u16
+
+; block types
+B_BLANK         equ     0
+B_PARA          equ     1
+B_HEAD          equ     2
+B_LIST          equ     3
+B_QUOTE         equ     4
+B_CODE          equ     5
+B_FENCE         equ     6
+B_HR            equ     7
+B_REFDEF        equ     8
+
+; attributes (foreground colour, low 3 bits - the only
+; bits the X1 text VRAM path displays safely, per SCED)
+A_BASE          equ     7               ; white
+A_H1            equ     6               ; yellow
+A_H2            equ     5               ; cyan
+A_H3            equ     4               ; green
+A_EM            equ     3               ; magenta
+A_STRONG        equ     6               ; yellow
+A_CODE          equ     4               ; green
+A_LINK          equ     5               ; cyan
+A_LINKSEL       equ     2               ; red
+A_DIM           equ     1               ; blue
+A_QUOTE         equ     3               ; magenta
+A_MARK          equ     6               ; yellow
+A_MSGOK         equ     6
+A_MSGERR        equ     2
+
+        org     04000h
+
+; ---------------------------------------------------------------
+; Entry. The shell's G command calls here; RET returns.
+; ---------------------------------------------------------------
+mdb_start:
+        ld      (save_sp), sp
+        ld      sp, 08000h
+        call    emm_probe
+        jp      nc, st_emm_ok
+        ld      hl, msg_noemm
+        call    C_PRTMSG
+        ld      sp, (save_sp)
+        ret
+st_emm_ok:
+        xor     a
+        ld      (cur_drv), a
+        ld      (histcnt), a
+        ld      (resumed), a
+        ld      (lastkind), a
+        ld      (msgptr), a
+        ld      (msgptr + 1), a
+        ; resume from an edit round trip, if a state file
+        ; with the resume flag is waiting
+        call    state_try_resume
+        jp      c, st_fresh
+        jp      main_loop
+st_fresh:
+        ld      hl, name_index
+        ld      de, NAMEBUF
+        ld      bc, 10
+        ldir
+        call    open_doc
+        jp      nc, main_loop
+        ; INDEX.MD is not on this disk: ask for a name
+st_prompt:
+        call    prompt_open
+        jp      c, quit_mdb             ; ESC: leave
+        call    open_doc
+        jp      c, st_prompt
+        jp      main_loop
+
+; quit path: drop the state file so the next start is
+; fresh, clear the screen via IOCS, return to the shell.
+quit_mdb:
+        call    state_delete
+        call    C_CLRSCR
+        ld      sp, (save_sp)
+        ret
+
+name_index:
+        db      "INDEX.MD  "
+
+; ---------------------------------------------------------------
+; EMM layer. Ports 0d00h..0d03h (address L/M/H, data with
+; auto-increment) - the M5 device, same protocol as SCED.
+; (emid_cur) selects the area: EMID_TEXT or EMID_POOL.
+; ---------------------------------------------------------------
+
+; emm_probe: write/read test at EMM 010000h, preserving
+; the original byte. -> carry set if the device is absent.
+emm_probe:
+        ld      bc, 00d00h
+        xor     a
+        out     (c), a                  ; L = 0
+        inc     c
+        out     (c), a                  ; M = 0
+        inc     c
+        ld      a, 001h
+        out     (c), a                  ; H = 1
+        inc     c
+        in      a, (c)                  ; original byte
+        ld      (probe_sv), a
+        call    ep_addr
+        inc     c
+        ld      a, 0a5h
+        out     (c), a
+        call    ep_addr
+        inc     c
+        in      a, (c)
+        cp      0a5h
+        jp      nz, ep_fail
+        call    ep_addr
+        inc     c
+        ld      a, (probe_sv)
+        out     (c), a                  ; restore original
+        or      a
+        ret
+ep_fail:
+        scf
+        ret
+ep_addr:                                ; bc <- 0d00h, addr 010000h
+        ld      bc, 00d00h
+        xor     a
+        out     (c), a
+        inc     c
+        out     (c), a
+        inc     c
+        ld      a, 001h
+        out     (c), a
+        ret
+
+; emm_seek: position the EMM address at offset de in the
+; area selected by (emid_cur). Destroys bc, af.
+emm_seek:
+        ld      bc, 00d00h
+        ld      a, e
+        out     (c), a                  ; L = off low
+        inc     c
+        ld      a, (emid_cur)
+        add     a, d
+        out     (c), a                  ; M = base mid + off high
+        inc     c
+        ld      a, 001h
+        out     (c), a                  ; H = 1
+        ret
+
+; emm_read: de = offset, hl = RAM dest, b = count (>0).
+; Destroys af, bc, hl. Preserves de. The byte count is
+; kept in memory: with bc = the EMM data port, b is the
+; port's high byte and must not double as a counter
+; (the trap SCED documented from fd_x1.inc).
+emm_read:
+        ld      a, b                    ; count first: emm_seek
+        ld      (emm_cnt), a            ; destroys bc (b = 0dh)
+        call    emm_seek
+        ld      bc, 00d03h
+er_lp:
+        in      a, (c)
+        ld      (hl), a
+        inc     hl
+        ld      a, (emm_cnt)
+        dec     a
+        ld      (emm_cnt), a
+        jp      nz, er_lp
+        ret
+
+; emm_write: de = offset, hl = RAM src, b = count (>0).
+; Destroys af, bc, hl. Preserves de.
+emm_write:
+        ld      a, b                    ; count first (see above)
+        ld      (emm_cnt), a
+        call    emm_seek
+        ld      bc, 00d03h
+ew_lp:
+        ld      a, (hl)
+        out     (c), a
+        inc     hl
+        ld      a, (emm_cnt)
+        dec     a
+        ld      (emm_cnt), a
+        jp      nz, ew_lp
+        ret
+
+; ---------------------------------------------------------------
+; Line store (append-only). Descriptors have SCED's
+; 8-byte shape and live at LA in document order; text is
+; packed from offset 0 of the text area with no gaps.
+; ---------------------------------------------------------------
+
+; desc_ptr: hl = index -> hl = descriptor pointer.
+; Destroys de.
+desc_ptr:
+        ld      de, LA
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; index * 8
+        add     hl, de
+        ret
+
+; desc_get: hl = index -> de = text offset, a = length.
+; Destroys hl.
+desc_get:
+        call    desc_ptr
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        ld      a, (hl)
+        ret
+
+; relink: rebuild prev/next links for all descriptors
+; (SCED's routine, fixed array base).
+relink:
+        ld      hl, (d_nlines)
+        ld      (rl_n), hl
+        ld      hl, 0
+        ld      (rl_i), hl
+        ld      hl, LA
+        ld      (rl_p), hl
+rl_lp:
+        ld      hl, (rl_i)
+        ld      de, (rl_n)
+        or      a
+        sbc     hl, de
+        ret     nc                      ; i >= n: done
+        ld      hl, (rl_i)
+        dec     hl
+        ld      (rl_v), hl              ; prev = i-1 (ffff if 0)
+        ld      hl, (rl_p)
+        inc     hl
+        inc     hl
+        inc     hl                      ; &prev
+        ld      a, (rl_v)
+        ld      (hl), a
+        inc     hl
+        ld      a, (rl_v + 1)
+        ld      (hl), a
+        ld      hl, (rl_i)
+        inc     hl                      ; next candidate = i+1
+        ld      de, (rl_n)
+        or      a
+        sbc     hl, de
+        jp      c, rl_nx_ok
+        ld      hl, 0ffffh
+        jp      rl_nx_st
+rl_nx_ok:
+        ld      hl, (rl_i)
+        inc     hl
+rl_nx_st:
+        ld      (rl_v), hl
+        ld      hl, (rl_p)
+        ld      de, D_NEXT
+        add     hl, de                  ; &next
+        ld      a, (rl_v)
+        ld      (hl), a
+        inc     hl
+        ld      a, (rl_v + 1)
+        ld      (hl), a
+        ld      hl, (rl_p)
+        ld      de, 8
+        add     hl, de
+        ld      (rl_p), hl
+        ld      hl, (rl_i)
+        inc     hl
+        ld      (rl_i), hl
+        jp      rl_lp
+
+; line_read: hl = index, de = RAM dest -> a = length.
+line_read:
+        ld      (lr_dest), de
+        call    desc_get                ; de = off, a = len
+        ld      b, a
+        or      a
+        ret     z
+        push    bc
+        ld      a, EMID_TEXT
+        ld      (emid_cur), a
+        ld      hl, (lr_dest)
+        call    emm_read                ; de = off, b = len
+        pop     bc
+        ld      a, b
+        ret
+
+; append_line: hl = RAM src, a = length. Appends the
+; line to the store and adds its bytes to (d_chk).
+; Carry set if the store is full (256 lines).
+append_line:
+        ld      (al_len), a
+        ld      (al_src), hl
+        ld      hl, (d_nlines)
+        ld      a, h
+        cp      MAXLINES >> 8
+        jp      nz, al_go
+        ld      a, l
+        or      a
+        jp      z, al_full              ; nlines == 256
+al_go:
+        ld      hl, (d_nlines)
+        call    desc_ptr
+        ld      de, (d_nextoff)
+        ld      (hl), e                 ; desc.off
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      a, (al_len)
+        ld      (hl), a                 ; desc.len
+        ; checksum over the line's bytes
+        ld      hl, (al_src)
+        ld      a, (al_len)
+        or      a
+        jp      z, al_write
+        ld      b, a
+al_sum:
+        ld      a, (hl)                 ; the byte
+        inc     hl
+        push    hl
+        ld      hl, (d_chk)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      (d_chk), hl
+        pop     hl
+        djnz    al_sum
+al_write:
+        ld      a, (al_len)
+        or      a
+        jp      z, al_done
+        ld      a, EMID_TEXT
+        ld      (emid_cur), a
+        ld      de, (d_nextoff)
+        ld      hl, (al_src)
+        ld      a, (al_len)
+        ld      b, a
+        call    emm_write
+al_done:
+        ld      hl, (d_nextoff)
+        ld      a, (al_len)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      (d_nextoff), hl
+        ld      hl, (d_nlines)
+        inc     hl
+        ld      (d_nlines), hl
+        or      a
+        ret
+al_full:
+        scf
+        ret
+
+; ---------------------------------------------------------------
+; parse_stage: split the staged file (STAGE, (fs_size)
+; bytes) into lines in the store. CRLF and LF endings are
+; both accepted; a line longer than MAXLEN is truncated
+; (the remainder of the line is skipped), as in SCED.
+; Carry set if the 256-line cap truncated the document
+; ((d_trunc) is also set then).
+; ---------------------------------------------------------------
+parse_stage:
+        ld      hl, STAGE
+        ld      (ld_ptr), hl
+        ld      hl, (fs_size)
+        ld      (ld_rem), hl
+        xor     a
+        ld      (ld_pcr), a
+ps_line:
+        xor     a
+        ld      (ld_len), a
+        ld      (ld_skip), a
+ps_ch:
+        ld      hl, (ld_rem)
+        ld      a, h
+        or      l
+        jp      z, ps_eof
+        ld      hl, (ld_ptr)
+        ld      a, (hl)
+        inc     hl
+        ld      (ld_ptr), hl
+        ld      hl, (ld_rem)
+        dec     hl
+        ld      (ld_rem), hl
+        ld      (ld_ch), a
+        ld      a, (ld_pcr)
+        or      a
+        jp      z, ps_nopcr
+        xor     a
+        ld      (ld_pcr), a
+        ld      a, (ld_ch)
+        cp      00ah
+        jp      z, ps_ch                ; swallow LF after CR
+ps_nopcr:
+        ld      a, (ld_ch)
+        cp      00dh
+        jp      z, ps_cr
+        cp      00ah
+        jp      z, ps_break
+        ld      a, (ld_skip)
+        or      a
+        jp      nz, ps_ch
+        ld      a, (ld_len)
+        cp      MAXLEN
+        jp      nc, ps_over
+        ld      e, a
+        ld      d, 0
+        ld      hl, TMPBUF
+        add     hl, de
+        ld      a, (ld_ch)
+        ld      (hl), a
+        ld      a, (ld_len)
+        inc     a
+        ld      (ld_len), a
+        jp      ps_ch
+ps_over:
+        ld      a, 1
+        ld      (ld_skip), a
+        jp      ps_ch
+ps_cr:
+        ld      a, 1
+        ld      (ld_pcr), a
+ps_break:
+        call    ps_store
+        ret     c
+        ld      hl, (ld_rem)
+        ld      a, h
+        or      l
+        jp      nz, ps_line
+        ret
+ps_eof:
+        ld      a, (ld_len)
+        or      a
+        jp      nz, ps_eof_store
+        ld      a, (ld_skip)
+        or      a
+        ret     z
+ps_eof_store:
+        call    ps_store
+        ret
+ps_store:
+        ld      a, (ld_len)
+        ld      hl, TMPBUF
+        call    append_line
+        ret     nc
+        ld      a, 1
+        ld      (d_trunc), a
+        scf
+        ret
+
+; ---------------------------------------------------------------
+; TOSD file layer: byte-for-byte the EDAS/WICS scheme, so
+; files round-trip between MDB, SCED and EDAS unchanged.
+; One IOCS unit is 256 bytes: on FD a unit is one record
+; (directory at record 32, data from record 48), on the
+; RAMDISK one block (directory at block 0, data from
+; block 1). The directory occupies one unit: magic
+; "TOSD", version 1 at +4, next-free unit at +6, then
+; 15 entries of 16 bytes at +16 (name 10 / start / size
+; / load). Allocation follows EDAS: reuse the old
+; entry's units when the new file fits, else free the
+; entry and append at next-free.
+; ---------------------------------------------------------------
+
+; blk_read / blk_write: de = record (FD) or block
+; (RAMDISK), hl = buffer (256 bytes). Carry = error.
+blk_read:
+        ld      a, (cur_drv)
+        or      a
+        jp      z, C_DREAD
+        jp      C_RREAD
+blk_write:
+        ld      a, (cur_drv)
+        or      a
+        jp      z, C_DWRITE
+        jp      C_RWRITE
+
+; setcap: (cap_units) = unit capacity of current drive.
+setcap:
+        ld      hl, FDMAXREC
+        ld      a, (cur_drv)
+        or      a
+        jp      z, scap_st
+        ld      hl, 0
+        call    C_RINIT                 ; hl = current blocks
+scap_st:
+        ld      (cap_units), hl
+        ret
+
+dir_load:
+        ld      de, DIRREC
+        ld      a, (cur_drv)
+        or      a
+        jp      z, dl_1
+        ld      de, 0
+dl_1:
+        ld      hl, DIRBUF
+        jp      blk_read
+dir_save:
+        ld      de, DIRREC
+        ld      a, (cur_drv)
+        or      a
+        jp      z, ds_1
+        ld      de, 0
+ds_1:
+        ld      hl, DIRBUF
+        jp      blk_write
+
+; dir_magic_ok: carry set if DIRBUF lacks the magic.
+dir_magic_ok:
+        ld      hl, str_tosd
+        ld      de, DIRBUF
+        ld      b, 4
+dm_lp:
+        ld      a, (de)
+        cp      (hl)
+        jp      nz, dm_bad
+        inc     hl
+        inc     de
+        djnz    dm_lp
+        or      a
+        ret
+dm_bad:
+        scf
+        ret
+str_tosd:
+        db      "TOSD"
+
+; dir_init: format DIRBUF in memory (the caller's
+; dir_save persists it).
+dir_init:
+        ld      hl, DIRBUF
+        xor     a
+        ld      b, 0                    ; 256 bytes
+di_lp:
+        ld      (hl), a
+        inc     hl
+        djnz    di_lp
+        ld      hl, str_tosd
+        ld      de, DIRBUF
+        ld      bc, 4
+        ldir
+        ld      a, 1
+        ld      (DIRBUF + 4), a         ; format version
+        ld      hl, FDDATA0
+        ld      a, (cur_drv)
+        or      a
+        jp      z, di_st
+        ld      hl, RDDATA0
+di_st:
+        ld      (DIRBUF + 6), hl        ; next-free unit
+        ret
+
+; find_entry: (fe_name) = name (10 bytes) -> hl =
+; entry, carry clear; or carry set if not found.
+find_entry:
+        ld      hl, DIRBUF + 16
+        ld      (fe_ptr), hl
+        ld      b, 15
+fe_lp:
+        ld      hl, (fe_ptr)
+        ld      a, (hl)
+        or      a
+        jp      z, fe_nx                ; free slot
+        ld      de, (fe_name)
+        push    bc
+        ld      b, 10
+fe_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jp      nz, fe_cmp_no
+        inc     hl
+        inc     de
+        djnz    fe_cmp
+        pop     bc
+        ld      hl, (fe_ptr)
+        or      a
+        ret
+fe_cmp_no:
+        pop     bc
+fe_nx:
+        ld      hl, (fe_ptr)
+        ld      de, 16
+        add     hl, de
+        ld      (fe_ptr), hl
+        djnz    fe_lp
+        scf
+        ret
+
+; find_free: -> hl = first free entry, or carry set.
+find_free:
+        ld      hl, DIRBUF + 16
+        ld      (fe_ptr), hl
+        ld      b, 15
+ffind_lp:
+        ld      hl, (fe_ptr)
+        ld      a, (hl)
+        or      a
+        jp      z, ffind_hit
+        ld      de, 16
+        add     hl, de
+        ld      (fe_ptr), hl
+        djnz    ffind_lp
+        scf
+        ret
+ffind_hit:
+        ld      hl, (fe_ptr)
+        or      a
+        ret
+
+; read_file: NAMEBUF -> STAGE + (fs_size). Carry set if
+; the file is missing or larger than one text area.
+read_file:
+        call    dir_load
+        jp      c, rf_notfound
+        call    dir_magic_ok
+        jp      c, rf_notfound
+        ld      hl, NAMEBUF
+        ld      (fe_name), hl
+        call    find_entry
+        jp      c, rf_notfound
+        ld      (rf_ent), hl
+        ld      de, 12
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; size
+        ld      (fs_size), hl
+        ld      de, AREASZ + 1
+        or      a
+        sbc     hl, de
+        jp      nc, rf_toobig           ; size > 24576
+        ld      hl, (rf_ent)
+        ld      de, 10
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        ld      (rf_blk), hl            ; start unit
+        ld      hl, STAGE
+        ld      (rf_dst), hl
+        ld      hl, (fs_size)
+        ld      a, h
+        or      l
+        jp      z, rf_done              ; empty file
+        dec     hl
+        ld      l, h
+        ld      h, 0
+        inc     hl                      ; units = ceil(size/256)
+        ld      (rf_cnt), hl
+rf_lp:
+        ld      de, (rf_blk)
+        ld      hl, (rf_dst)
+        call    blk_read
+        jp      c, rf_notfound
+        ld      hl, (rf_blk)
+        inc     hl
+        ld      (rf_blk), hl
+        ld      hl, (rf_dst)
+        ld      de, 256
+        add     hl, de
+        ld      (rf_dst), hl
+        ld      hl, (rf_cnt)
+        dec     hl
+        ld      (rf_cnt), hl
+        ld      a, h
+        or      l
+        jp      nz, rf_lp
+rf_done:
+        or      a
+        ret
+rf_notfound:
+        scf
+        ret
+rf_toobig:
+        scf
+        ret
+
+; write_raw: store (raw_total) bytes from STAGE under
+; the name in NAMEBUF, EDAS allocation rules (the tail
+; of SCED's write_file with a raw source). Carry set on
+; failure. The entry's load address is written as 0.
+write_raw:
+        ld      hl, (raw_total)
+        ld      (sv_total), hl
+        ld      a, h
+        or      l
+        jp      z, wr_sec0
+        dec     hl
+        ld      l, h
+        ld      h, 0
+        inc     hl
+        jp      wr_sec_ok
+wr_sec0:
+        ld      hl, 0
+wr_sec_ok:
+        ld      (wf_sec), hl
+        call    setcap
+        ld      hl, (cap_units)
+        ld      a, h
+        or      l
+        jp      z, wr_fail              ; drive not ready
+        call    dir_load
+        jp      c, wr_fail
+        call    dir_magic_ok
+        jp      nc, wr_have
+        call    dir_init                ; blank disk: new dir
+wr_have:
+        ld      hl, NAMEBUF
+        ld      (fe_name), hl
+        call    find_entry
+        jp      c, wr_alloc
+        ld      (wf_ent), hl
+        ld      de, 12
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; old size
+        ld      a, h
+        or      l
+        jp      z, wr_oldsec0
+        dec     hl
+        ld      l, h
+        ld      h, 0
+        inc     hl                      ; old units
+        jp      wr_cmpsec
+wr_oldsec0:
+        ld      hl, 0
+wr_cmpsec:
+        ld      de, (wf_sec)
+        or      a
+        sbc     hl, de                  ; old - new
+        jp      nc, wr_reuse            ; fits: reuse
+        ld      hl, (wf_ent)
+        ld      (hl), 0                 ; free the old entry
+        jp      wr_alloc
+wr_reuse:
+        ld      hl, (wf_ent)
+        ld      de, 10
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        ld      (wf_start), hl
+        jp      wr_write
+wr_alloc:
+        call    find_free
+        jp      c, wr_fail
+        ld      (wf_ent), hl
+        ld      hl, (DIRBUF + 6)        ; next-free unit
+        ld      (wf_start), hl
+        ld      de, (wf_sec)
+        add     hl, de
+        ld      (wf_end), hl            ; new next-free
+        ld      de, (cap_units)
+        inc     de                      ; one past the last unit
+        or      a
+        sbc     hl, de
+        jp      nc, wr_fail             ; new free > capacity
+        ld      hl, (wf_end)
+        ld      (DIRBUF + 6), hl
+wr_write:
+        ld      hl, (wf_start)
+        ld      (wf_blk), hl
+        ld      hl, STAGE
+        ld      (wf_src), hl
+        ld      hl, (wf_sec)
+        ld      (wf_cnt), hl
+wr_wlp:
+        ld      hl, (wf_cnt)
+        ld      a, h
+        or      l
+        jp      z, wr_upd
+        ld      de, (wf_blk)
+        ld      hl, (wf_src)
+        call    blk_write
+        jp      c, wr_fail
+        ld      hl, (wf_blk)
+        inc     hl
+        ld      (wf_blk), hl
+        ld      hl, (wf_src)
+        ld      de, 256
+        add     hl, de
+        ld      (wf_src), hl
+        ld      hl, (wf_cnt)
+        dec     hl
+        ld      (wf_cnt), hl
+        jp      wr_wlp
+wr_upd:
+        ld      hl, NAMEBUF
+        ld      de, (wf_ent)
+        ld      bc, 10
+        ldir                            ; entry name
+        ld      hl, (wf_ent)
+        ld      de, 10
+        add     hl, de
+        ld      de, (wf_start)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      de, (sv_total)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        xor     a
+        ld      (hl), a                 ; load address = 0
+        inc     hl
+        ld      (hl), a
+        call    dir_save
+        jp      c, wr_fail
+        ld      a, (cur_drv)
+        or      a
+        jp      nz, wr_ok               ; RAMDISK: no flush
+        ld      de, 0                   ; FD flush assist:
+        ld      hl, DIRBUF              ; read record 0 to
+        call    blk_read                ; force write-back
+wr_ok:
+        or      a
+        ret
+wr_fail:
+        scf
+        ret
+
+; delete_file: remove the NAMEBUF entry if present.
+; Errors are ignored (this is state cleanup only).
+delete_file:
+        call    dir_load
+        ret     c
+        call    dir_magic_ok
+        ret     c
+        ld      hl, NAMEBUF
+        ld      (fe_name), hl
+        call    find_entry
+        ret     c
+        ld      (hl), 0                 ; free the entry
+        call    dir_save
+        ret     c
+        ld      a, (cur_drv)
+        or      a
+        ret     nz
+        ld      de, 0
+        ld      hl, DIRBUF
+        jp      blk_read
+
+; ---------------------------------------------------------------
+; String pool: link target strings in the pool EMM area,
+; NUL-terminated, addressed by 16-bit offsets.
+; ---------------------------------------------------------------
+
+; pool_append: TGTBUF, (tgt_len) bytes -> de = offset,
+; or carry set when the pool is full (offset ffffh).
+pool_append:
+        ld      hl, (pool_next)
+        ld      a, (tgt_len)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        inc     hl                      ; + NUL
+        ld      de, AREASZ
+        or      a
+        sbc     hl, de
+        jp      nc, pa_full
+        ld      a, EMID_POOL
+        ld      (emid_cur), a
+        ld      de, (pool_next)
+        ld      (pa_off), de
+        ld      a, (tgt_len)
+        or      a
+        jp      z, pa_nul
+        ld      hl, TGTBUF
+        ld      b, a
+        call    emm_write               ; de = off (preserved)
+pa_nul:
+        ld      hl, (pool_next)
+        ld      a, (tgt_len)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; offset of the NUL
+        ex      de, hl
+        ld      hl, pa_zero
+        ld      b, 1
+        call    emm_write
+        ld      hl, (pool_next)
+        ld      a, (tgt_len)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        inc     hl
+        ld      (pool_next), hl
+        ld      de, (pa_off)
+        or      a
+        ret
+pa_full:
+        ld      de, 0ffffh
+        scf
+        ret
+pa_zero:
+        db      0
+
+; pool_read: de = offset -> TGTBUF, (tgt_len) = length
+; (without the NUL, capped at 40).
+pool_read:
+        ld      a, EMID_POOL
+        ld      (emid_cur), a
+        ld      (pr_off), de
+        ld      hl, TGTBUF
+        ld      (pr_dst), hl
+        xor     a
+        ld      (tgt_len), a
+pr_lp:
+        ld      de, (pr_off)
+        ld      hl, pr_byte
+        ld      b, 1
+        call    emm_read
+        ld      a, (pr_byte)
+        or      a
+        ret     z                       ; NUL: done
+        ld      hl, (pr_off)
+        inc     hl
+        ld      (pr_off), hl
+        ld      a, (tgt_len)
+        cp      40
+        ret     nc                      ; cap (should not happen)
+        ld      hl, (pr_dst)
+        ld      a, (pr_byte)
+        ld      (hl), a
+        inc     hl
+        ld      (pr_dst), hl
+        ld      a, (tgt_len)
+        inc     a
+        ld      (tgt_len), a
+        jp      pr_lp
+
+; ---------------------------------------------------------------
+; Parser helpers. Lines are handled in RLINE with (ln_len)
+; bytes; offsets are bytes (one byte = one display cell,
+; as in SCED - SJIS pairs occupy two cells of halfwidth
+; glyphs on this text screen).
+; ---------------------------------------------------------------
+
+; is_sjis_lead: a = byte -> carry set if a SJIS lead byte
+; (081h-09fh or 0e0h-0fch). Trail bytes of such pairs are
+; never markup, even when they equal '`' (060h) or ']'.
+is_sjis_lead:
+        cp      081h
+        jp      c, isl_no
+        cp      0a0h
+        jp      c, isl_yes
+        cp      0e0h
+        jp      c, isl_no
+        cp      0fdh
+        jp      c, isl_yes
+isl_no:
+        or      a
+        ret
+isl_yes:
+        scf
+        ret
+
+; line_fetch: hl = index -> line in RLINE, (ln_len) set.
+line_fetch:
+        ld      de, RLINE
+        call    line_read
+        ld      (ln_len), a
+        ret
+
+; is_fence_line: carry set if RLINE holds a fence line
+; (up to 3 leading spaces, then three backticks).
+is_fence_line:
+        xor     a
+        ld      (ifl_p), a
+ifl_lp:
+        ld      a, (ifl_p)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, ifl_no              ; ran off the line
+        ld      hl, RLINE
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        cp      ' '
+        jp      nz, ifl_chk
+        ld      a, (ifl_p)
+        inc     a
+        ld      (ifl_p), a
+        cp      4
+        jp      c, ifl_lp
+        jp      ifl_no                  ; 4+ spaces: not a fence
+ifl_chk:
+        ld      a, (ifl_p)
+        cp      4
+        jp      nc, ifl_no
+        ; need bytes p, p+1, p+2 all '`' and within the line
+        ld      a, (ln_len)
+        ld      hl, ifl_p
+        sub     (hl)
+        cp      3
+        jp      c, ifl_no
+        ld      hl, RLINE
+        ld      a, (ifl_p)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        cp      '`'
+        jp      nz, ifl_no
+        inc     hl
+        ld      a, (hl)
+        cp      '`'
+        jp      nz, ifl_no
+        inc     hl
+        ld      a, (hl)
+        cp      '`'
+        jp      nz, ifl_no
+        scf
+        ret
+ifl_no:
+        or      a
+        ret
+
+; rline_at: a = offset -> a = RLINE[offset] (0 past end).
+rline_at:
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, ra_zero
+        ld      hl, RLINE
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        ret
+ra_zero:
+        xor     a
+        ret
+
+; find_char: SJIS-aware search for (ff_ch) in RLINE from
+; (ff_from) to (ln_len). -> (ff_pos), carry clear; or
+; carry set when absent.
+find_char:
+        ld      a, (ff_from)
+        ld      (ff_i), a
+fc_lp:
+        ld      a, (ff_i)
+        ld      hl, ff_end
+        cp      (hl)
+        jp      nc, fc_no
+        call    rline_at                ; a = byte at i
+        ld      (ff_b), a
+        call    is_sjis_lead
+        jp      nc, fc_cmp
+        ; lead byte: skip the pair
+        ld      a, (ff_i)
+        inc     a
+        inc     a
+        ld      (ff_i), a
+        jp      fc_lp
+fc_cmp:
+        ld      a, (ff_b)
+        ld      hl, ff_ch
+        cp      (hl)
+        jp      z, fc_yes
+        ld      a, (ff_i)
+        inc     a
+        ld      (ff_i), a
+        jp      fc_lp
+fc_yes:
+        ld      a, (ff_i)
+        ld      (ff_pos), a
+        or      a
+        ret
+fc_no:
+        scf
+        ret
+
+; find_pair: SJIS-aware search for two consecutive
+; (ff_ch) from (ff_from). -> (ff_pos), carry clear; or
+; carry set when absent.
+find_pair:
+        ld      a, (ff_from)
+        ld      (ff_i), a
+fp_lp:
+        ld      a, (ff_i)
+        inc     a
+        ld      hl, ff_end
+        cp      (hl)
+        jp      nc, fp_no               ; need i+1 < end
+        ld      a, (ff_i)
+        call    rline_at
+        ld      (ff_b), a
+        call    is_sjis_lead
+        jp      nc, fp_cmp
+        ld      a, (ff_i)
+        inc     a
+        inc     a
+        ld      (ff_i), a
+        jp      fp_lp
+fp_cmp:
+        ld      a, (ff_b)
+        ld      hl, ff_ch
+        cp      (hl)
+        jp      nz, fp_nx
+        ld      a, (ff_i)
+        inc     a
+        call    rline_at
+        ld      hl, ff_ch
+        cp      (hl)
+        jp      z, fp_yes
+fp_nx:
+        ld      a, (ff_i)
+        inc     a
+        ld      (ff_i), a
+        jp      fp_lp
+fp_yes:
+        ld      a, (ff_i)
+        ld      (ff_pos), a
+        or      a
+        ret
+fp_no:
+        scf
+        ret
+
+; ---------------------------------------------------------------
+; classify: RLINE/(ln_len) + (fence_in) -> (blk_type),
+; (blk_start), (blk_end), (blk_level); (fence_in) is
+; updated. For B_REFDEF, (id_len) bytes at IDBUF hold
+; the raw id and (tgt_len) bytes at TGTBUF the target.
+; ---------------------------------------------------------------
+classify:
+        ld      a, (ln_len)
+        ld      (blk_end), a
+        xor     a
+        ld      (blk_start), a
+        ld      (blk_level), a
+        ld      a, (fence_in)
+        or      a
+        jp      z, cl_open
+        ; inside a fence: only a fence line changes state
+        call    is_fence_line
+        jp      c, cl_fence_end
+        ld      a, B_CODE
+        ld      (blk_type), a
+        ret
+cl_fence_end:
+        xor     a
+        ld      (fence_in), a
+        ld      a, B_FENCE
+        ld      (blk_type), a
+        ret
+cl_open:
+        ; count leading spaces into (cl_p)
+        xor     a
+        ld      (cl_p), a
+cl_sp:
+        ld      a, (cl_p)
+        call    rline_at
+        cp      ' '
+        jp      nz, cl_sp_done
+        ld      a, (cl_p)
+        inc     a
+        ld      (cl_p), a
+        jp      cl_sp
+cl_sp_done:
+        ld      a, (cl_p)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_blank            ; all spaces / empty
+        cp      4
+        jp      nc, cl_para             ; deep indent: paragraph
+        ; fence start?
+        call    is_fence_line
+        jp      nc, cl_head
+        ld      a, 1
+        ld      (fence_in), a
+        ld      a, B_FENCE
+        ld      (blk_type), a
+        ret
+cl_blank:
+        ld      a, B_BLANK
+        ld      (blk_type), a
+        ret
+cl_para:
+        ld      a, B_PARA
+        ld      (blk_type), a
+        ret
+cl_head:
+        ld      a, (cl_p)
+        call    rline_at
+        cp      '#'
+        jp      nz, cl_hr
+        ; count '#' run
+        ld      a, (cl_p)
+        ld      (cl_i), a
+cl_hcnt:
+        ld      a, (cl_i)
+        call    rline_at
+        cp      '#'
+        jp      nz, cl_hdone
+        ld      a, (cl_i)
+        inc     a
+        ld      (cl_i), a
+        jp      cl_hcnt
+cl_hdone:
+        ld      a, (cl_i)
+        ld      hl, cl_p
+        sub     (hl)                    ; a = hash count
+        or      a
+        jp      z, cl_hr
+        cp      7
+        jp      nc, cl_hr               ; 7+: not a heading
+        ld      (blk_level), a
+        ld      a, (cl_i)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_hok              ; heading runs to EOL
+        call    rline_at
+        cp      ' '
+        jp      nz, cl_hr               ; need space after #'s
+cl_hok:
+        ld      a, (cl_i)
+        ld      (blk_start), a
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_hfin
+        inc     a                       ; skip the one space
+        ld      (blk_start), a
+cl_hfin:
+        ; trim trailing spaces, then a trailing '#' run
+        ; preceded by a space (closed ATX)
+        ld      a, (blk_end)
+        ld      (cl_e), a
+cl_htrim:
+        ld      a, (cl_e)
+        ld      hl, blk_start
+        cp      (hl)
+        jp      z, cl_hset
+        dec     a
+        call    rline_at
+        cp      ' '
+        jp      nz, cl_hhash
+        ld      a, (cl_e)
+        dec     a
+        ld      (cl_e), a
+        jp      cl_htrim
+cl_hhash:
+        ld      a, (cl_e)
+        dec     a
+        call    rline_at
+        cp      '#'
+        jp      nz, cl_hset
+        ; find the run start
+        ld      a, (cl_e)
+        ld      (cl_rs), a
+cl_hrun:
+        ld      a, (cl_rs)
+        ld      hl, blk_start
+        cp      (hl)
+        jp      z, cl_hset
+        dec     a
+        call    rline_at
+        cp      '#'
+        jp      nz, cl_hrun_done
+        ld      a, (cl_rs)
+        dec     a
+        ld      (cl_rs), a
+        jp      cl_hrun
+cl_hrun_done:
+        ; byte before the run must be a space
+        ld      a, (cl_rs)
+        dec     a
+        call    rline_at
+        cp      ' '
+        jp      nz, cl_hset
+        ld      a, (cl_rs)
+        dec     a                       ; drop the space too
+        ld      (cl_e), a
+cl_hset:
+        ld      a, (cl_e)
+        ld      (blk_end), a
+        ld      a, B_HEAD
+        ld      (blk_type), a
+        ret
+cl_hr:
+        ; horizontal rule: only -, *, _ and spaces, one
+        ; distinct char, count >= 3
+        xor     a
+        ld      (cl_hch), a
+        ld      (cl_hcnt2), a
+        ld      a, (cl_p)
+        ld      (cl_i), a
+cl_hrlp:
+        ld      a, (cl_i)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_hrdone
+        call    rline_at
+        cp      ' '
+        jp      z, cl_hrnx
+        cp      '-'
+        jp      z, cl_hrch
+        cp      '*'
+        jp      z, cl_hrch
+        cp      '_'
+        jp      z, cl_hrch
+        jp      cl_refdef               ; other char: not HR
+cl_hrch:
+        ld      (cl_b), a
+        ld      a, (cl_hch)
+        or      a
+        jp      z, cl_hrset
+        ld      hl, cl_b
+        cp      (hl)
+        jp      nz, cl_refdef           ; mixed chars: not HR
+        jp      cl_hrinc
+cl_hrset:
+        ld      a, (cl_b)
+        ld      (cl_hch), a
+cl_hrinc:
+        ld      a, (cl_hcnt2)
+        inc     a
+        ld      (cl_hcnt2), a
+cl_hrnx:
+        ld      a, (cl_i)
+        inc     a
+        ld      (cl_i), a
+        jp      cl_hrlp
+cl_hrdone:
+        ld      a, (cl_hcnt2)
+        cp      3
+        jp      c, cl_refdef
+        ld      a, B_HR
+        ld      (blk_type), a
+        ret
+cl_refdef:
+        ld      a, (cl_p)
+        call    rline_at
+        cp      '['
+        jp      nz, cl_quote
+        ld      a, (cl_p)
+        inc     a
+        ld      (ff_from), a
+        ld      a, ']'
+        ld      (ff_ch), a
+        ld      a, (ln_len)
+        ld      (ff_end), a
+        call    find_char
+        jp      c, cl_quote
+        ld      a, (ff_pos)
+        ld      (cl_tend), a
+        inc     a
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_quote            ; ':' would be past EOL
+        call    rline_at
+        cp      ':'
+        jp      nz, cl_quote
+        ; id = (cl_p, cl_tend), must be non-empty
+        ld      a, (cl_tend)
+        ld      hl, cl_p
+        sub     (hl)
+        dec     a                       ; id length
+        or      a
+        jp      z, cl_quote
+        ld      (id_len), a
+        cp      24
+        jp      c, cl_idcpy
+        ld      a, 23
+        ld      (id_len), a
+cl_idcpy:
+        ld      a, (cl_p)
+        inc     a
+        ld      hl, RLINE
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      de, IDBUF
+        ld      a, (id_len)
+        ld      b, a
+cl_idlp:
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    cl_idlp
+        ; target: skip spaces/tabs after ':'
+        ld      a, (cl_tend)
+        add     a, 2
+        ld      (cl_i), a
+cl_tskip:
+        ld      a, (cl_i)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_quote            ; no target: not a def
+        call    rline_at
+        cp      ' '
+        jp      z, cl_tnext
+        cp      009h
+        jp      nz, cl_tgt
+cl_tnext:
+        ld      a, (cl_i)
+        inc     a
+        ld      (cl_i), a
+        jp      cl_tskip
+cl_tgt:
+        cp      '<'
+        jp      nz, cl_traw
+        ld      a, (cl_i)
+        inc     a
+        ld      (cl_i), a
+        ld      a, '>'
+        ld      (cl_tstop), a
+        jp      cl_tcopy
+cl_traw:
+        ld      a, ' '
+        ld      (cl_tstop), a
+cl_tcopy:
+        xor     a
+        ld      (tgt_len), a
+        ld      de, TGTBUF
+        ld      (cl_dst), de
+cl_tlp:
+        ld      a, (cl_i)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_tdone
+        call    rline_at
+        ld      (cl_b), a
+        ld      hl, cl_tstop
+        cp      (hl)
+        jp      z, cl_tdone
+        ld      a, (cl_b)
+        cp      009h
+        jp      z, cl_tdone             ; tab also ends a raw target
+        ld      a, (tgt_len)
+        cp      40
+        jp      nc, cl_tdone
+        ld      hl, (cl_dst)
+        ld      a, (cl_b)
+        ld      (hl), a
+        inc     hl
+        ld      (cl_dst), hl
+        ld      a, (tgt_len)
+        inc     a
+        ld      (tgt_len), a
+        ld      a, (cl_i)
+        inc     a
+        ld      (cl_i), a
+        jp      cl_tlp
+cl_tdone:
+        ld      a, (tgt_len)
+        or      a
+        jp      z, cl_quote             ; empty target: not a def
+        ld      a, B_REFDEF
+        ld      (blk_type), a
+        ret
+cl_quote:
+        ld      a, (cl_p)
+        call    rline_at
+        cp      '>'
+        jp      nz, cl_list
+        ld      a, (cl_p)
+        inc     a
+        ld      (blk_start), a
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_qset
+        call    rline_at
+        cp      ' '
+        jp      nz, cl_qset
+        ld      a, (blk_start)
+        inc     a
+        ld      (blk_start), a
+cl_qset:
+        ld      a, B_QUOTE
+        ld      (blk_type), a
+        ret
+cl_list:
+        ld      a, (cl_p)
+        call    rline_at
+        cp      '-'
+        jp      z, cl_bullet
+        cp      '+'
+        jp      z, cl_bullet
+        cp      '*'
+        jp      z, cl_bullet
+        ; ordered: digits then '.' or ')'
+        ld      (cl_b), a
+        ld      a, (cl_b)
+        cp      '0'
+        jp      c, cl_para2
+        cp      '9' + 1
+        jp      nc, cl_para2
+        ld      a, (cl_p)
+        ld      (cl_i), a
+cl_dig:
+        ld      a, (cl_i)
+        call    rline_at
+        cp      '0'
+        jp      c, cl_digdone
+        cp      '9' + 1
+        jp      nc, cl_digdone
+        ld      a, (cl_i)
+        inc     a
+        ld      (cl_i), a
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_para2
+        jp      cl_dig
+cl_digdone:
+        ld      a, (cl_i)
+        call    rline_at
+        cp      '.'
+        jp      z, cl_mark
+        cp      ')'
+        jp      z, cl_mark
+        jp      cl_para2
+cl_mark:
+        ld      a, (cl_i)
+        inc     a
+        ld      (cl_mend), a
+        jp      cl_markchk
+cl_bullet:
+        ld      a, (cl_p)
+        inc     a
+        ld      (cl_mend), a
+cl_markchk:
+        ld      a, (cl_mend)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_lset             ; marker runs to EOL
+        call    rline_at
+        cp      ' '
+        jp      nz, cl_para2
+        ld      a, (cl_mend)
+        inc     a
+        ld      (blk_start), a
+        jp      cl_lskip
+cl_lset:
+        ld      a, (cl_mend)
+        ld      (blk_start), a
+        jp      cl_lset2
+cl_lskip:
+        ld      a, (blk_start)
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, cl_lset2
+        call    rline_at
+        cp      ' '
+        jp      nz, cl_lset2
+        ld      a, (blk_start)
+        inc     a
+        ld      (blk_start), a
+        jp      cl_lskip
+cl_lset2:
+        ld      a, B_LIST
+        ld      (blk_type), a
+        ret
+cl_para2:
+        jp      cl_para
+
+; ---------------------------------------------------------------
+; Anchor slugs and reference ids.
+; ---------------------------------------------------------------
+
+; norm_slug: hl = source, a = length -> SLUGBUF +
+; (slug_len). Rules: ASCII letters fold to lower case,
+; space becomes '-', [a-z0-9-_] are kept, other ASCII
+; punctuation is dropped, bytes >= 080h pass through
+; (SJIS pairs as pairs). Capped at 24 bytes.
+norm_slug:
+        ld      (ns_src), hl
+        ld      (ns_len), a
+        xor     a
+        ld      (slug_len), a
+        ld      (ns_i), a
+        ld      hl, SLUGBUF
+        ld      (ns_dst), hl
+ns_lp:
+        ld      a, (ns_i)
+        ld      hl, ns_len
+        cp      (hl)
+        ret     nc
+        ld      hl, (ns_src)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        ld      (ns_b), a
+        call    is_sjis_lead
+        jp      c, ns_pair
+        ld      a, (ns_b)
+        cp      'A'
+        jp      c, ns_low
+        cp      'Z' + 1
+        jp      nc, ns_low
+        add     a, 020h                 ; fold to lower case
+        jp      ns_keep
+ns_low:
+        cp      ' '
+        jp      nz, ns_chk
+        ld      a, '-'
+        jp      ns_keep
+ns_chk:
+        cp      'a'
+        jp      c, ns_num
+        cp      'z' + 1
+        jp      c, ns_keep
+ns_num:
+        cp      '0'
+        jp      c, ns_hyp
+        cp      '9' + 1
+        jp      c, ns_keep
+ns_hyp:
+        cp      '-'
+        jp      z, ns_keep
+        cp      '_'
+        jp      z, ns_keep
+        cp      080h
+        jp      nc, ns_keep             ; kana etc. pass
+        jp      ns_drop
+ns_keep:
+        ld      (ns_b), a
+        ld      a, (slug_len)
+        cp      24
+        jp      nc, ns_drop
+        ld      hl, (ns_dst)
+        ld      a, (ns_b)
+        ld      (hl), a
+        inc     hl
+        ld      (ns_dst), hl
+        ld      a, (slug_len)
+        inc     a
+        ld      (slug_len), a
+ns_drop:
+        ld      a, (ns_i)
+        inc     a
+        ld      (ns_i), a
+        jp      ns_lp
+ns_pair:
+        ; SJIS pair: copy both bytes if they fit
+        ld      a, (ns_i)
+        inc     a
+        ld      hl, ns_len
+        cp      (hl)
+        jp      nc, ns_drop             ; lone lead at end: drop
+        ld      a, (slug_len)
+        cp      23
+        jp      nc, ns_pair_skip        ; no room for the pair
+        ld      hl, (ns_src)
+        ld      a, (ns_i)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        ld      (ns_b), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ns_b2), a
+        ld      hl, (ns_dst)
+        ld      a, (ns_b)
+        ld      (hl), a
+        inc     hl
+        ld      a, (ns_b2)
+        ld      (hl), a
+        inc     hl
+        ld      (ns_dst), hl
+        ld      a, (slug_len)
+        inc     a
+        inc     a
+        ld      (slug_len), a
+ns_pair_skip:
+        ld      a, (ns_i)
+        inc     a
+        inc     a
+        ld      (ns_i), a
+        jp      ns_lp
+
+; norm_id: IDBUF/(id_len) -> IDNBUF + (idn_len).
+; Trims, folds case, collapses runs of spaces to one.
+norm_id:
+        xor     a
+        ld      (idn_len), a
+        ld      (ni_i), a
+        ld      (ni_pend), a
+        ld      hl, IDNBUF
+        ld      (ni_dst), hl
+ni_lp:
+        ld      a, (ni_i)
+        ld      hl, id_len
+        cp      (hl)
+        ret     nc
+        ld      hl, IDBUF
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        cp      ' '
+        jp      z, ni_sp
+        cp      009h
+        jp      z, ni_sp
+        ld      (ni_b), a
+        ; a pending space becomes real before this char
+        ld      a, (ni_pend)
+        or      a
+        jp      z, ni_ch
+        ld      a, (idn_len)
+        or      a
+        jp      z, ni_ch                ; leading: drop
+        ld      a, ' '
+        call    ni_put
+        xor     a
+        ld      (ni_pend), a
+ni_ch:
+        ld      a, (ni_b)
+        cp      'A'
+        jp      c, ni_put_a
+        cp      'Z' + 1
+        jp      nc, ni_put_a
+        add     a, 020h
+ni_put_a:
+        call    ni_put
+        jp      ni_nx
+ni_sp:
+        ld      a, 1
+        ld      (ni_pend), a
+ni_nx:
+        ld      a, (ni_i)
+        inc     a
+        ld      (ni_i), a
+        jp      ni_lp
+ni_put:
+        ld      (ni_b), a
+        ld      a, (idn_len)
+        cp      15
+        ret     nc
+        ld      hl, (ni_dst)
+        ld      a, (ni_b)
+        ld      (hl), a
+        inc     hl
+        ld      (ni_dst), hl
+        ld      a, (idn_len)
+        inc     a
+        ld      (idn_len), a
+        ret
+
+; anchor_add: SLUGBUF/(slug_len), line in (ca_i).
+anchor_add:
+        ld      a, (nanch)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        add     hl, hl                  ; *8
+        ld      e, l
+        ld      d, h                    ; *8 in de
+        add     hl, hl                  ; *16
+        add     hl, de                  ; *24
+        add     hl, de                  ; *28 (approx: *24 + *4 below)
+        ; recompute cleanly: idx*28 = idx*32 - idx*4
+        ld      a, (nanch)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; *32
+        ld      e, a
+        ld      d, 0
+        ex      de, hl
+        add     hl, hl
+        add     hl, hl                  ; idx*4
+        ex      de, hl
+        or      a
+        sbc     hl, de                  ; *28
+        ld      de, ANCHTAB
+        add     hl, de
+        ld      (aa_ptr), hl
+        ld      a, (slug_len)
+        ld      (hl), a
+        inc     hl
+        ld      de, SLUGBUF
+        ld      b, a
+        or      a
+        jp      z, aa_line
+aa_lp:
+        ld      a, (de)
+        ld      (hl), a
+        inc     hl
+        inc     de
+        djnz    aa_lp
+aa_line:
+        ld      hl, (aa_ptr)
+        ld      de, 25
+        add     hl, de
+        ld      de, (ca_i)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      a, (nanch)
+        inc     a
+        ld      (nanch), a
+        ret
+
+; anchor_find: SLUGBUF/(slug_len) -> hl = line, carry
+; clear; or carry set when absent.
+anchor_find:
+        xor     a
+        ld      (af_i), a
+        ld      hl, ANCHTAB
+        ld      (af_ptr), hl
+af_lp:
+        ld      a, (af_i)
+        ld      hl, nanch
+        cp      (hl)
+        jp      nc, af_no
+        ld      hl, (af_ptr)
+        ld      a, (slug_len)
+        cp      (hl)
+        jp      nz, af_nx
+        ; compare slug bytes
+        inc     hl
+        ld      de, SLUGBUF
+        ld      a, (slug_len)
+        or      a
+        jp      z, af_hit
+        ld      b, a
+af_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jp      nz, af_nx
+        inc     hl
+        inc     de
+        djnz    af_cmp
+af_hit:
+        ld      hl, (af_ptr)
+        ld      de, 25
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        or      a
+        ret
+af_nx:
+        ld      hl, (af_ptr)
+        ld      de, 28
+        add     hl, de
+        ld      (af_ptr), hl
+        ld      a, (af_i)
+        inc     a
+        ld      (af_i), a
+        jp      af_lp
+af_no:
+        scf
+        ret
+
+; ref_find: IDNBUF/(idn_len) -> de = pool offset,
+; carry clear; or carry set when absent.
+ref_find:
+        xor     a
+        ld      (af_i), a
+        ld      hl, REFTAB
+        ld      (af_ptr), hl
+rfl_lp:
+        ld      a, (af_i)
+        ld      hl, nrefs
+        cp      (hl)
+        jp      nc, rf_no2
+        ld      hl, (af_ptr)
+        ld      a, (idn_len)
+        cp      (hl)
+        jp      nz, rfl_nx
+        inc     hl
+        ld      de, IDNBUF
+        ld      a, (idn_len)
+        or      a
+        jp      z, rfl_hit
+        ld      b, a
+rfl_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jp      nz, rfl_nx
+        inc     hl
+        inc     de
+        djnz    rfl_cmp
+rfl_hit:
+        ld      hl, (af_ptr)
+        ld      de, 16
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        ex      de, hl                  ; de = pool offset
+        or      a
+        ret
+rfl_nx:
+        ld      hl, (af_ptr)
+        ld      de, 20
+        add     hl, de
+        ld      (af_ptr), hl
+        ld      a, (af_i)
+        inc     a
+        ld      (af_i), a
+        jp      rfl_lp
+rf_no2:
+        scf
+        ret
+
+; ref_add: IDNBUF/(idn_len), pool offset in de.
+ref_add:
+        ld      (ra_off), de
+        ld      a, (nrefs)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        ld      e, l
+        ld      d, h
+        add     hl, hl                  ; *8
+        add     hl, hl                  ; *16
+        add     hl, de                  ; *20
+        ld      de, REFTAB
+        add     hl, de
+        ld      a, (idn_len)
+        ld      (hl), a
+        inc     hl
+        ld      de, IDNBUF
+        ld      b, a
+        or      a
+        jp      z, ra_off_st
+ra_lp:
+        ld      a, (de)
+        ld      (hl), a
+        inc     hl
+        inc     de
+        djnz    ra_lp
+ra_off_st:
+        ; pool offset goes at entry + 16 regardless of id len
+        ld      a, (nrefs)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        ld      e, l
+        ld      d, h
+        add     hl, hl
+        add     hl, hl
+        add     hl, de
+        ld      de, REFTAB + 16
+        add     hl, de
+        ld      de, (ra_off)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      a, (nrefs)
+        inc     a
+        ld      (nrefs), a
+        ret
+
+; ---------------------------------------------------------------
+; collect_all: pass A gathers anchors and reference
+; definitions; pass B gathers links (resolving references
+; against the completed table).
+; ---------------------------------------------------------------
+collect_all:
+        xor     a
+        ld      (nanch), a
+        ld      (nrefs), a
+        ld      (fence_in), a
+        ld      hl, 0
+        ld      (ca_i), hl
+ca_lp:
+        ld      hl, (ca_i)
+        ld      de, (d_nlines)
+        or      a
+        sbc     hl, de
+        jp      nc, cb_init
+        ld      hl, (ca_i)
+        call    line_fetch
+        call    classify
+        ld      a, (blk_type)
+        cp      B_HEAD
+        jp      z, ca_head
+        cp      B_REFDEF
+        jp      z, ca_ref
+        jp      ca_nx
+ca_head:
+        ld      hl, RLINE
+        ld      a, (blk_start)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        push    hl
+        ld      a, (blk_end)
+        ld      hl, blk_start
+        sub     (hl)
+        pop     hl
+        call    norm_slug
+        ld      a, (slug_len)
+        or      a
+        jp      z, ca_nx
+        ld      a, (nanch)
+        cp      MAXANCH
+        jp      nc, ca_nx
+        call    anchor_add
+        jp      ca_nx
+ca_ref:
+        call    norm_id
+        call    ref_find
+        jp      nc, ca_nx               ; first definition wins
+        ld      a, (nrefs)
+        cp      MAXREF
+        jp      nc, ca_nx
+        call    pool_append             ; TGTBUF -> de
+        jp      c, ca_nx
+        call    ref_add
+ca_nx:
+        ld      hl, (ca_i)
+        inc     hl
+        ld      (ca_i), hl
+        jp      ca_lp
+cb_init:
+        xor     a
+        ld      (nlinks), a
+        ld      (fence_in), a
+        ld      hl, 0
+        ld      (ca_i), hl
+cb_lp:
+        ld      hl, (ca_i)
+        ld      de, (d_nlines)
+        or      a
+        sbc     hl, de
+        ret     nc
+        ld      hl, (ca_i)
+        ld      (sc_line), hl
+        call    line_fetch
+        call    classify
+        ld      a, (blk_type)
+        cp      B_HEAD
+        jp      z, cb_scan
+        cp      B_PARA
+        jp      z, cb_scan
+        cp      B_LIST
+        jp      z, cb_scan
+        cp      B_QUOTE
+        jp      z, cb_scan
+        jp      cb_nx
+cb_scan:
+        call    blk_base_attr
+        ld      a, 1
+        ld      (sc_collect), a
+        call    scan_inline
+cb_nx:
+        ld      hl, (ca_i)
+        inc     hl
+        ld      (ca_i), hl
+        jp      cb_lp
+
+; blk_base_attr: (sc_base) = the base attribute for the
+; current block type.
+blk_base_attr:
+        ld      a, (blk_type)
+        cp      B_HEAD
+        jp      z, bba_head
+        cp      B_QUOTE
+        jp      z, bba_quote
+        ld      a, A_BASE
+        ld      (sc_base), a
+        ret
+bba_head:
+        ld      a, (blk_level)
+        cp      1
+        jp      z, bba_h1
+        cp      2
+        jp      z, bba_h2
+        ld      a, A_H3
+        ld      (sc_base), a
+        ret
+bba_h1:
+        ld      a, A_H1
+        ld      (sc_base), a
+        ret
+bba_h2:
+        ld      a, A_H2
+        ld      (sc_base), a
+        ret
+bba_quote:
+        ld      a, A_QUOTE
+        ld      (sc_base), a
+        ret
+
+; ---------------------------------------------------------------
+; Inline scanner. Processes RLINE from (blk_start) to
+; (blk_end), honouring SJIS pairs before any marker test.
+; In collect mode ((sc_collect) = 1) it fills LINKTAB;
+; in render mode it fills REND/RATTR. Both modes run the
+; identical code path and count display columns the same
+; way, so link ordinals and columns agree between them.
+; ---------------------------------------------------------------
+
+; emit_ch: a = char, c = attribute.
+emit_ch:
+        ld      (ec_ch), a
+        ld      a, (sc_out)
+        cp      MAXLEN
+        ret     nc
+        ld      (ec_n), a
+        ld      a, (sc_collect)
+        or      a
+        jp      nz, ec_adv
+        ld      a, (ec_n)
+        ld      e, a
+        ld      d, 0
+        ld      hl, REND
+        add     hl, de
+        ld      a, (ec_ch)
+        ld      (hl), a
+        ld      hl, RATTR
+        add     hl, de
+        ld      (hl), c
+ec_adv:
+        ld      a, (ec_n)
+        inc     a
+        ld      (sc_out), a
+        ret
+
+; emit_range: RLINE[(er_from) .. (er_to)) with (er_attr).
+emit_range:
+        ld      a, (er_from)
+        ld      (er_i), a
+egr_lp:
+        ld      a, (er_i)
+        ld      hl, er_to
+        cp      (hl)
+        ret     nc
+        call    rline_at
+        ld      (er_b), a
+        ld      a, (er_attr)
+        ld      c, a
+        ld      a, (er_b)
+        call    emit_ch
+        ld      a, (er_i)
+        inc     a
+        ld      (er_i), a
+        jp      egr_lp
+
+; link_attr: a = the attribute for the link whose text
+; is about to be emitted (selected link stands out).
+link_attr:
+        ld      hl, (sc_line)
+        ld      de, (sel_line)
+        or      a
+        sbc     hl, de
+        jp      nz, la_norm
+        ld      a, (sc_ord)
+        ld      hl, sel_ord
+        cp      (hl)
+        jp      nz, la_norm
+        ld      a, A_LINKSEL
+        ret
+la_norm:
+        ld      a, A_LINK
+        ret
+
+; register_link: store the just-emitted link (collect
+; mode only). (lk_pool) = target pool offset,
+; (lk_dstart) = its display start column.
+register_link:
+        ld      a, (sc_collect)
+        or      a
+        ret     z
+        ld      a, (nlinks)
+        cp      MAXLINK
+        ret     nc
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; idx * 8
+        ld      de, LINKTAB
+        add     hl, de
+        ld      de, (sc_line)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      a, (sc_ord)
+        ld      (hl), a
+        inc     hl
+        ld      a, (lk_dstart)
+        ld      (hl), a
+        inc     hl
+        ld      a, (sc_out)
+        ld      (hl), a                 ; display end col
+        inc     hl
+        ld      de, (lk_pool)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      a, (nlinks)
+        inc     a
+        ld      (nlinks), a
+        ret
+
+; copy_id: (si_from)/(si_n) -> IDBUF/(id_len), cap 23.
+copy_id:
+        ld      a, (si_n)
+        cp      24
+        jp      c, ci_len
+        ld      a, 23
+        ld      (si_n), a
+ci_len:
+        ld      a, (si_n)
+        ld      (id_len), a
+        or      a
+        ret     z
+        ld      hl, RLINE
+        ld      a, (si_from)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      de, IDBUF
+        ld      b, a
+ci_lp:
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    ci_lp
+        ret
+
+; is_punct: a = byte -> carry set if ASCII punctuation.
+is_punct:
+        cp      021h
+        jp      c, ipn_no
+        cp      030h
+        jp      c, ipn_yes              ; 21-2f
+        cp      03ah
+        jp      c, ipn_no
+        cp      041h
+        jp      c, ipn_yes              ; 3a-40
+        cp      05bh
+        jp      c, ipn_no
+        cp      061h
+        jp      c, ipn_yes              ; 5b-60
+        cp      07bh
+        jp      c, ipn_no
+        cp      07fh
+        jp      c, ipn_yes              ; 7b-7e
+ipn_no:
+        or      a
+        ret
+ipn_yes:
+        scf
+        ret
+
+scan_inline:
+        xor     a
+        ld      (sc_out), a
+        ld      (sc_ord), a
+        ld      a, (blk_end)
+        ld      (ff_end), a             ; searches stay in range
+        ; block prefix (identical in both modes, so link
+        ; display columns agree)
+        ld      a, (blk_type)
+        cp      B_LIST
+        jp      z, si_pfx_list
+        cp      B_QUOTE
+        jp      z, si_pfx_quote
+        jp      si_body
+si_pfx_list:
+        ld      c, A_MARK
+        ld      a, 0a5h                 ; halfwidth middle dot
+        call    emit_ch
+        ld      c, A_MARK
+        ld      a, ' '
+        call    emit_ch
+        jp      si_body
+si_pfx_quote:
+        ld      c, A_DIM
+        ld      a, '>'
+        call    emit_ch
+        ld      c, A_DIM
+        ld      a, ' '
+        call    emit_ch
+si_body:
+        ld      a, (blk_start)
+        ld      (sc_pos), a
+si_lp:
+        ld      a, (sc_pos)
+        ld      hl, blk_end
+        cp      (hl)
+        ret     nc
+        call    rline_at
+        ld      (si_b), a
+        call    is_sjis_lead
+        jp      c, si_sjis
+        ld      a, (si_b)
+        cp      05ch
+        jp      z, si_esc
+        cp      '`'
+        jp      z, si_code
+        cp      '*'
+        jp      z, si_emph
+        cp      '_'
+        jp      z, si_emph
+        cp      '!'
+        jp      z, si_bang
+        cp      '['
+        jp      z, si_link
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, (si_b)
+        call    emit_ch
+        jp      si_next1
+si_next1:
+        ld      a, (sc_pos)
+        inc     a
+        ld      (sc_pos), a
+        jp      si_lp
+si_sjis:
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, (si_b)
+        call    emit_ch
+        ld      a, (sc_pos)
+        inc     a
+        ld      (sc_pos), a             ; at the trail byte
+        ld      hl, blk_end
+        cp      (hl)
+        jp      nc, si_lp               ; lone lead: consumed
+        call    rline_at
+        ld      (si_b), a
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, (si_b)
+        call    emit_ch
+        jp      si_next1
+si_esc:
+        ld      a, (sc_pos)
+        inc     a
+        ld      hl, blk_end
+        cp      (hl)
+        jp      nc, si_esc_lit
+        call    rline_at
+        ld      (si_b2), a
+        call    is_punct
+        jp      nc, si_esc_lit
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, (si_b2)
+        call    emit_ch
+        ld      a, (sc_pos)
+        inc     a
+        inc     a
+        ld      (sc_pos), a
+        jp      si_lp
+si_esc_lit:
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, 05ch
+        call    emit_ch
+        jp      si_next1
+si_code:
+        ld      a, (sc_pos)
+        ld      (si_from), a
+        inc     a
+        ld      hl, blk_end
+        cp      (hl)
+        jp      nc, si_code1
+        call    rline_at
+        cp      '`'
+        jp      z, si_code2
+si_code1:
+        ld      a, 1
+        ld      (si_delim), a
+        ld      a, (si_from)
+        inc     a
+        ld      (ff_from), a
+        jp      si_code_find
+si_code2:
+        ld      a, 2
+        ld      (si_delim), a
+        ld      a, (si_from)
+        inc     a
+        inc     a
+        ld      (ff_from), a
+si_code_find:
+        ld      a, '`'
+        ld      (ff_ch), a
+        call    find_char
+        jp      c, si_code_lit
+        ld      a, (ff_from)
+        ld      (er_from), a
+        ld      a, (ff_pos)
+        ld      (er_to), a
+        ld      a, A_CODE
+        ld      (er_attr), a
+        call    emit_range
+        ld      a, (ff_pos)
+        ld      hl, si_delim
+        add     a, (hl)
+        ld      (sc_pos), a
+        jp      si_lp
+si_code_lit:
+        ld      a, (si_delim)
+        ld      (si_n), a
+si_cl_lp:
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, '`'
+        call    emit_ch
+        ld      a, (si_n)
+        dec     a
+        ld      (si_n), a
+        jp      nz, si_cl_lp
+        ld      a, (sc_pos)
+        ld      hl, si_delim
+        add     a, (hl)
+        ld      (sc_pos), a
+        jp      si_lp
+si_emph:
+        ld      a, (si_b)
+        ld      (si_ch), a
+        ld      a, (sc_pos)
+        ld      (si_from), a
+        inc     a
+        ld      hl, blk_end
+        cp      (hl)
+        jp      nc, si_em_lit
+        call    rline_at
+        ld      hl, si_ch
+        cp      (hl)
+        jp      z, si_strong
+        ld      a, (si_from)
+        inc     a
+        ld      (ff_from), a
+        ld      a, (si_ch)
+        ld      (ff_ch), a
+        call    find_char
+        jp      c, si_em_lit
+        ld      a, (ff_from)
+        ld      (er_from), a
+        ld      a, (ff_pos)
+        ld      (er_to), a
+        ld      a, A_EM
+        ld      (er_attr), a
+        call    emit_range
+        ld      a, (ff_pos)
+        inc     a
+        ld      (sc_pos), a
+        jp      si_lp
+si_strong:
+        ld      a, (si_from)
+        inc     a
+        inc     a
+        ld      (ff_from), a
+        ld      a, (si_ch)
+        ld      (ff_ch), a
+        call    find_pair
+        jp      c, si_em_lit
+        ld      a, (ff_from)
+        ld      (er_from), a
+        ld      a, (ff_pos)
+        ld      (er_to), a
+        ld      a, A_STRONG
+        ld      (er_attr), a
+        call    emit_range
+        ld      a, (ff_pos)
+        inc     a
+        inc     a
+        ld      (sc_pos), a
+        jp      si_lp
+si_em_lit:
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, (si_ch)
+        call    emit_ch
+        jp      si_next1
+si_bang:
+        ld      a, (sc_pos)
+        inc     a
+        ld      hl, blk_end
+        cp      (hl)
+        jp      nc, si_bang_lit
+        call    rline_at
+        cp      '['
+        jp      nz, si_bang_lit
+        ld      a, (sc_pos)
+        inc     a
+        inc     a
+        ld      (ff_from), a
+        ld      a, ']'
+        ld      (ff_ch), a
+        call    find_char
+        jp      c, si_bang_lit
+        ld      a, (ff_pos)
+        ld      (lk_tend), a
+        inc     a
+        ld      hl, blk_end
+        cp      (hl)
+        jp      nc, si_bang_lit
+        call    rline_at
+        cp      '('
+        jp      nz, si_bang_lit
+        ld      a, (lk_tend)
+        inc     a
+        inc     a
+        ld      (ff_from), a
+        ld      a, ')'
+        ld      (ff_ch), a
+        call    find_char
+        jp      c, si_bang_lit
+        ld      a, (sc_pos)
+        inc     a
+        inc     a
+        ld      (er_from), a
+        ld      a, (lk_tend)
+        ld      (er_to), a
+        ld      a, A_CODE
+        ld      (er_attr), a
+        call    emit_range
+        ld      a, (ff_pos)
+        inc     a
+        ld      (sc_pos), a
+        jp      si_lp
+si_bang_lit:
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, '!'
+        call    emit_ch
+        jp      si_next1
+si_link:
+        ld      a, (sc_pos)
+        ld      (lk_pos), a
+        inc     a
+        ld      (ff_from), a
+        ld      a, ']'
+        ld      (ff_ch), a
+        call    find_char
+        jp      c, si_lk_lit
+        ld      a, (ff_pos)
+        ld      (lk_tend), a
+        inc     a
+        ld      hl, blk_end
+        cp      (hl)
+        jp      nc, si_lk_short         ; ']' at end: shortcut
+        call    rline_at
+        cp      '('
+        jp      z, si_lk_inline
+        cp      '['
+        jp      z, si_lk_ref
+        jp      si_lk_short
+si_lk_lit:
+        ld      a, (sc_base)
+        ld      c, a
+        ld      a, '['
+        call    emit_ch
+        jp      si_next1
+si_lk_inline:
+        ld      a, (lk_tend)
+        inc     a
+        inc     a
+        ld      (ff_from), a
+        ld      a, ')'
+        ld      (ff_ch), a
+        call    find_char
+        jp      c, si_lk_lit
+        ld      a, (ff_pos)
+        ld      (lk_pend), a
+        ; extract the target token (up to a space)
+        ld      a, (lk_tend)
+        inc     a
+        inc     a
+        ld      (si_i), a
+si_lt_skip:
+        ld      a, (si_i)
+        ld      hl, lk_pend
+        cp      (hl)
+        jp      nc, si_lt_done0
+        call    rline_at
+        cp      ' '
+        jp      nz, si_lt_copy
+        ld      a, (si_i)
+        inc     a
+        ld      (si_i), a
+        jp      si_lt_skip
+si_lt_copy:
+        xor     a
+        ld      (tgt_len), a
+        ld      hl, TGTBUF
+        ld      (si_dst), hl
+si_lt_lp:
+        ld      a, (si_i)
+        ld      hl, lk_pend
+        cp      (hl)
+        jp      nc, si_lt_done
+        call    rline_at
+        cp      ' '
+        jp      z, si_lt_done
+        ld      (si_b), a
+        ld      a, (tgt_len)
+        cp      40
+        jp      nc, si_lt_done
+        ld      hl, (si_dst)
+        ld      a, (si_b)
+        ld      (hl), a
+        inc     hl
+        ld      (si_dst), hl
+        ld      a, (tgt_len)
+        inc     a
+        ld      (tgt_len), a
+        ld      a, (si_i)
+        inc     a
+        ld      (si_i), a
+        jp      si_lt_lp
+si_lt_done0:
+        xor     a
+        ld      (tgt_len), a
+si_lt_done:
+        ld      a, (tgt_len)
+        or      a
+        jp      z, si_lk_lit            ; empty target: literal '['
+        ld      a, (lk_pend)
+        inc     a
+        ld      (lk_next), a
+        ld      a, (sc_collect)
+        or      a
+        jp      z, si_lk_emit           ; render: no pool write
+        call    pool_append
+        ld      (lk_pool), de
+        jp      si_lk_emit
+si_lk_ref:
+        ld      a, (lk_tend)
+        inc     a
+        inc     a
+        ld      (ff_from), a
+        ld      a, ']'
+        ld      (ff_ch), a
+        call    find_char
+        jp      c, si_lk_lit
+        ld      a, (ff_pos)
+        ld      (lk_iend), a
+        ld      a, (lk_tend)
+        inc     a
+        inc     a
+        ld      (si_from), a            ; id start
+        ld      a, (lk_iend)
+        ld      hl, si_from
+        sub     (hl)                    ; id length
+        or      a
+        jp      nz, si_lr_id
+        ; collapsed form: the id is the link text
+        ld      a, (lk_pos)
+        inc     a
+        ld      (si_from), a
+        ld      a, (lk_tend)
+        ld      hl, si_from
+        sub     (hl)
+si_lr_id:
+        ld      (si_n), a
+        call    copy_id
+        call    norm_id
+        call    ref_find
+        jp      c, si_lr_miss
+        ld      (lk_pool), de
+        ld      a, (lk_iend)
+        inc     a
+        ld      (lk_next), a
+        jp      si_lk_emit
+si_lr_miss:
+        ld      a, (lk_pos)
+        ld      (er_from), a
+        ld      a, (lk_iend)
+        inc     a
+        ld      (er_to), a
+        ld      a, (sc_base)
+        ld      (er_attr), a
+        call    emit_range
+        ld      a, (lk_iend)
+        inc     a
+        ld      (sc_pos), a
+        jp      si_lp
+si_lk_short:
+        ld      a, (lk_pos)
+        inc     a
+        ld      (si_from), a
+        ld      a, (lk_tend)
+        ld      hl, si_from
+        sub     (hl)
+        ld      (si_n), a
+        call    copy_id
+        call    norm_id
+        call    ref_find
+        jp      c, si_ls_miss
+        ld      (lk_pool), de
+        ld      a, (lk_tend)
+        inc     a
+        ld      (lk_next), a
+        jp      si_lk_emit
+si_ls_miss:
+        ld      a, (lk_pos)
+        ld      (er_from), a
+        ld      a, (lk_tend)
+        inc     a
+        ld      (er_to), a
+        ld      a, (sc_base)
+        ld      (er_attr), a
+        call    emit_range
+        ld      a, (lk_tend)
+        inc     a
+        ld      (sc_pos), a
+        jp      si_lp
+si_lk_emit:
+        ld      a, (sc_out)
+        ld      (lk_dstart), a
+        call    link_attr
+        ld      (er_attr), a
+        ld      a, (lk_pos)
+        inc     a
+        ld      (er_from), a
+        ld      a, (lk_tend)
+        ld      (er_to), a
+        call    emit_range
+        call    register_link
+        ld      a, (sc_ord)
+        inc     a
+        ld      (sc_ord), a
+        ld      a, (lk_next)
+        ld      (sc_pos), a
+        jp      si_lp
+
+; ---------------------------------------------------------------
+; Rendering. Direct text VRAM writes, as in SCED: char
+; plane page 030h, attribute plane page 020h, cell
+; offset = y*40 + x; only the low 3 attribute bits
+; (foreground colour) are displayed safely.
+; ---------------------------------------------------------------
+
+; set_msg: hl = message (0-terminated), a = attribute.
+; The message replaces the status line for one redraw.
+set_msg:
+        ld      (msgptr), hl
+        ld      (msgattr), a
+        ret
+
+; putcell: hl = cell offset, a = char, attr in (cattr).
+; Destroys bc.
+putcell:
+        push    af
+        ld      c, l
+        ld      a, h
+        add     a, 030h
+        ld      b, a
+        pop     af
+        out     (c), a                  ; char plane
+        ld      c, l
+        ld      a, h
+        add     a, 020h
+        ld      b, a
+        ld      a, (cattr)
+        out     (c), a                  ; attribute plane
+        ret
+
+; cell_cursor: hl = cell offset, a = attribute. Rewrites
+; the cell's existing char with the given attribute.
+cell_cursor:
+        ld      (cattr), a
+        push    hl
+        ld      c, l
+        ld      a, h
+        add     a, 030h
+        ld      b, a
+        in      a, (c)                  ; char under the cursor
+        pop     hl
+        jp      putcell
+
+; fence_state_upto: hl = line index -> a = the fence
+; state (0/1) in effect at the start of that line.
+fence_state_upto:
+        ld      (fs_n), hl
+        ld      hl, 0
+        ld      (fs_i), hl
+        xor     a
+        ld      (fs_st), a
+fs_lp:
+        ld      hl, (fs_i)
+        ld      de, (fs_n)
+        or      a
+        sbc     hl, de
+        jp      nc, fs_done
+        ld      hl, (fs_i)
+        call    line_fetch
+        call    is_fence_line
+        jp      nc, fs_nx
+        ld      a, (fs_st)
+        xor     1
+        ld      (fs_st), a
+fs_nx:
+        ld      hl, (fs_i)
+        inc     hl
+        ld      (fs_i), hl
+        jp      fs_lp
+fs_done:
+        ld      a, (fs_st)
+        ret
+
+; sig_update: refresh the verification block at SIGBLK.
+sig_update:
+        ld      hl, sig_magic
+        ld      de, SIGBLK
+        ld      bc, 4
+        ldir
+        ld      hl, (d_nlines)
+        ld      (SIGBLK + 4), hl
+        ld      hl, (top_line)
+        ld      (SIGBLK + 6), hl
+        ld      hl, (sel_line)
+        ld      (SIGBLK + 8), hl
+        ld      a, (sel_ord)
+        ld      (SIGBLK + 10), a
+        ld      a, (nlinks)
+        ld      (SIGBLK + 11), a
+        ld      a, (histcnt)
+        ld      (SIGBLK + 12), a
+        ld      a, (resumed)
+        ld      (SIGBLK + 13), a
+        ld      a, (lastkind)
+        ld      (SIGBLK + 14), a
+        ld      a, (d_trunc)
+        ld      (SIGBLK + 15), a
+        ld      hl, (d_chk)
+        ld      (SIGBLK + 16), hl
+        ld      hl, curfile
+        ld      de, SIGBLK + 18
+        ld      bc, 10
+        ldir
+        ld      a, (leftcol)
+        ld      (SIGBLK + 28), a
+        ld      a, (nanch)
+        ld      (SIGBLK + 29), a
+        ld      a, (nrefs)
+        ld      (SIGBLK + 30), a
+        ld      a, (cur_drv)
+        ld      (SIGBLK + 31), a
+        ret
+sig_magic:
+        db      "MDB1"
+
+; sel_sync: refresh (sel_line)/(sel_ord) from (sel_idx).
+sel_sync:
+        ld      hl, (sel_idx)
+        ld      a, h
+        inc     a
+        jp      z, ss_none              ; sel_idx = ffffh
+        ld      hl, (sel_idx)
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; idx * 8
+        ld      de, LINKTAB
+        add     hl, de
+        ld      a, (hl)                 ; L_LINE low
+        ld      (sel_line), a
+        inc     hl
+        ld      a, (hl)                 ; L_LINE high
+        ld      (sel_line + 1), a
+        inc     hl
+        ld      a, (hl)                 ; L_ORD
+        ld      (sel_ord), a
+        ret
+ss_none:
+        ld      hl, 0ffffh
+        ld      (sel_line), hl
+        ld      a, 0ffh
+        ld      (sel_ord), a
+        ret
+
+; redraw: the 24 text rows, the status row, the sig.
+redraw:
+        call    sig_update
+        ld      hl, (top_line)
+        call    fence_state_upto
+        ld      (fence_in), a
+        ld      hl, (top_line)
+        ld      (rd_idx), hl
+        xor     a
+        ld      (rd_row), a
+rd_lp:
+        ld      a, (rd_row)
+        cp      24
+        jp      z, rd_status
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        ld      (rd_off), hl
+        add     hl, hl
+        add     hl, hl
+        ld      de, (rd_off)
+        add     hl, de                  ; row * 40
+        ld      (rd_off), hl
+        ld      hl, (rd_idx)
+        ld      de, (d_nlines)
+        or      a
+        sbc     hl, de
+        jp      nc, rd_tilde
+        ld      hl, (rd_idx)
+        ld      (sc_line), hl
+        call    line_fetch
+        call    classify
+        call    draw_row_cells
+        jp      rd_next
+rd_tilde:
+        ld      a, A_DIM
+        ld      (cattr), a
+        ld      a, '~'
+        ld      hl, (rd_off)
+        call    putcell
+        ld      a, A_BASE
+        ld      (cattr), a
+        ld      b, 39
+rd_tl_lp:
+        push    bc
+        ld      hl, (rd_off)
+        inc     hl
+        ld      (rd_off), hl
+        ld      a, ' '
+        call    putcell
+        pop     bc
+        djnz    rd_tl_lp
+rd_next:
+        ld      hl, (rd_idx)
+        inc     hl
+        ld      (rd_idx), hl
+        ld      a, (rd_row)
+        inc     a
+        ld      (rd_row), a
+        jp      rd_lp
+rd_status:
+        jp      draw_status
+
+; draw_row_cells: draw the classified line in RLINE at
+; the row starting at (rd_off).
+draw_row_cells:
+        ld      a, (blk_type)
+        cp      B_BLANK
+        jp      z, drc_blank
+        cp      B_HR
+        jp      z, drc_hr
+        cp      B_CODE
+        jp      z, drc_code
+        cp      B_FENCE
+        jp      z, drc_fence
+        cp      B_REFDEF
+        jp      z, drc_refdef
+        ; inline-rendered types
+        xor     a
+        ld      (sc_collect), a
+        call    blk_base_attr
+        call    scan_inline
+        xor     a
+        ld      (rd_x), a
+drc_win:
+        ld      a, (rd_x)
+        cp      40
+        ret     z
+        ld      a, (leftcol)
+        ld      hl, rd_x
+        add     a, (hl)                 ; display pos
+        ld      (rd_pos), a
+        ld      hl, sc_out
+        cp      (hl)
+        jp      nc, drc_wblank          ; past the rendered end
+        ld      hl, REND
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        ld      (rd_ch), a
+        ld      hl, RATTR
+        add     hl, de
+        ld      a, (hl)
+        ld      (cattr), a
+        ld      a, (rd_ch)
+        jp      drc_put
+drc_wblank:
+        ld      a, A_BASE
+        ld      (cattr), a
+        ld      a, ' '
+drc_put:
+        ld      hl, (rd_off)
+        call    putcell
+        ld      hl, (rd_off)
+        inc     hl
+        ld      (rd_off), hl
+        ld      a, (rd_x)
+        inc     a
+        ld      (rd_x), a
+        jp      drc_win
+drc_blank:
+        ld      a, ' '
+        ld      (cp_ch), a
+        ld      a, A_BASE
+        ld      (cp_attr), a
+        jp      drc_fill
+drc_hr:
+        ld      a, '-'
+        ld      (cp_ch), a
+        ld      a, A_DIM
+        ld      (cp_attr), a
+        jp      drc_fill
+drc_code:
+        ld      a, A_CODE
+        ld      (cp_attr), a
+        jp      drc_copy
+drc_fence:
+        ld      a, A_DIM
+        ld      (cp_attr), a
+        jp      drc_copy
+drc_refdef:
+        ld      a, A_DIM
+        ld      (cp_attr), a
+        jp      drc_copy
+drc_fill:
+        xor     a
+        ld      (rd_x), a
+drc_fl_lp:
+        ld      a, (rd_x)
+        cp      40
+        ret     z
+        ld      a, (cp_attr)
+        ld      (cattr), a
+        ld      a, (cp_ch)
+        ld      hl, (rd_off)
+        call    putcell
+        ld      hl, (rd_off)
+        inc     hl
+        ld      (rd_off), hl
+        ld      a, (rd_x)
+        inc     a
+        ld      (rd_x), a
+        jp      drc_fl_lp
+drc_copy:
+        xor     a
+        ld      (rd_x), a
+drc_cp_lp:
+        ld      a, (rd_x)
+        cp      40
+        ret     z
+        ld      a, (leftcol)
+        ld      hl, rd_x
+        add     a, (hl)                 ; source pos
+        ld      (rd_pos), a
+        ld      hl, ln_len
+        cp      (hl)
+        jp      nc, drc_cp_blank
+        call    rline_at
+        cp      020h
+        jp      c, drc_cp_blank
+        cp      07fh
+        jp      z, drc_cp_blank
+        ld      (rd_ch), a
+        ld      a, (cp_attr)
+        ld      (cattr), a
+        ld      a, (rd_ch)
+        jp      drc_cp_put
+drc_cp_blank:
+        ld      a, (cp_attr)
+        ld      (cattr), a
+        ld      a, ' '
+drc_cp_put:
+        ld      hl, (rd_off)
+        call    putcell
+        ld      hl, (rd_off)
+        inc     hl
+        ld      (rd_off), hl
+        ld      a, (rd_x)
+        inc     a
+        ld      (rd_x), a
+        jp      drc_cp_lp
+
+; ---------------------------------------------------------------
+; Status line.
+; ---------------------------------------------------------------
+
+; dc_put: a = char -> STATBUF at (dptr), advancing it.
+dc_put:
+        push    hl
+        ld      hl, (dptr)
+        ld      (hl), a
+        inc     hl
+        ld      (dptr), hl
+        pop     hl
+        ret
+
+; div10hl: hl = hl / 10, a = hl mod 10. Destroys bc, de.
+div10hl:
+        ld      de, 0
+        ld      b, 16
+d10_lp:
+        add     hl, hl
+        ex      de, hl
+        adc     hl, hl
+        ex      de, hl
+        ld      a, e
+        cp      10
+        jp      c, d10_nx
+        sub     10
+        ld      e, a
+        inc     hl                      ; set the quotient bit
+d10_nx:
+        djnz    d10_lp
+        ld      a, e
+        ret
+
+; dec16: hl = value -> decimal text at (dptr).
+dec16:
+        ld      a, h
+        or      l
+        jp      nz, dc_nz
+        ld      a, '0'
+        jp      dc_put
+dc_nz:
+        ld      c, 0                    ; digit count (div10hl
+                                        ; destroys b, so use c)
+dc_lp:
+        call    div10hl                 ; hl = hl/10, a = rem
+        add     a, '0'
+        push    af
+        inc     c
+        ld      a, h
+        or      l
+        jp      nz, dc_lp
+        ld      b, c
+dc_pop:
+        pop     af
+        call    dc_put
+        djnz    dc_pop
+        ret
+
+; sb_str: hl = 0-terminated string -> STATBUF.
+sb_str:
+        ld      a, (hl)
+        or      a
+        ret     z
+        call    dc_put
+        inc     hl
+        jp      sb_str
+
+; sb_pad: pad STATBUF with spaces up to 40 chars.
+sb_pad:
+        ld      hl, (dptr)
+        ld      de, STATBUF + 40
+        or      a
+        sbc     hl, de
+        ret     nc
+        ld      a, ' '
+        call    dc_put
+        jp      sb_pad
+
+stat_build:
+        ld      hl, STATBUF
+        ld      (dptr), hl
+        ld      hl, (msgptr)
+        ld      a, h
+        or      l
+        jp      nz, sb_msg
+        ld      a, A_BASE
+        ld      (stat_attr), a
+        ld      hl, curfile
+        ld      b, 10
+sb_nm:
+        ld      a, (hl)
+        call    dc_put
+        inc     hl
+        djnz    sb_nm
+        ld      a, ' '
+        call    dc_put
+        ld      hl, (top_line)
+        inc     hl
+        call    dec16
+        ld      a, '/'
+        call    dc_put
+        ld      hl, (d_nlines)
+        call    dec16
+        ld      a, ' '
+        call    dc_put
+        ld      hl, str_link
+        call    sb_str
+        ld      hl, (sel_idx)
+        ld      a, h
+        inc     a
+        jp      z, sb_nosel
+        ld      hl, (sel_idx)
+        inc     hl
+        call    dec16
+        jp      sb_nosel2
+sb_nosel:
+        ld      a, '-'
+        call    dc_put
+sb_nosel2:
+        ld      a, '/'
+        call    dc_put
+        ld      a, (nlinks)
+        ld      l, a
+        ld      h, 0
+        call    dec16
+        jp      sb_pad
+sb_msg:
+        ld      a, (msgattr)
+        ld      (stat_attr), a
+        ld      hl, (msgptr)
+        call    sb_str
+        jp      sb_pad
+str_link:
+        db      "LINK ", 0
+
+draw_status:
+        call    stat_build
+        call    blit_status
+        ; one-shot message consumed
+        ld      hl, 0
+        ld      (msgptr), hl
+        ret
+
+; blit_status: copy STATBUF to row 24 with (stat_attr).
+blit_status:
+        ld      hl, 24 * 40
+        ld      (rd_off), hl
+        ld      hl, STATBUF
+        ld      (ds_src), hl
+        ld      a, (stat_attr)
+        ld      (cattr), a
+        ld      b, 40
+ds_lp:
+        push    bc
+        ld      hl, (ds_src)
+        ld      a, (hl)
+        inc     hl
+        ld      (ds_src), hl
+        ld      hl, (rd_off)
+        push    af
+        call    putcell
+        pop     af
+        ld      hl, (rd_off)
+        inc     hl
+        ld      (rd_off), hl
+        pop     bc
+        djnz    ds_lp
+        ret
+
+; ---------------------------------------------------------------
+; Document loading.
+; ---------------------------------------------------------------
+
+; open_doc: NAMEBUF = the file to open. On success the
+; document store, anchor/ref/link tables and view state
+; are rebuilt. Carry set (with a message) on failure;
+; the previous document is then untouched (the store is
+; only rebuilt after the file has been read).
+open_doc:
+        call    read_file
+        jp      c, od_fail
+        ld      hl, NAMEBUF
+        ld      de, curfile
+        ld      bc, 10
+        ldir
+        ld      hl, 0
+        ld      (d_nlines), hl
+        ld      (d_nextoff), hl
+        ld      (d_chk), hl
+        ld      (top_line), hl
+        ld      (pool_next), hl
+        xor     a
+        ld      (d_trunc), a
+        ld      (leftcol), a
+        ld      hl, 0ffffh
+        ld      (sel_idx), hl
+        call    sel_sync
+        call    parse_stage             ; carry = truncated
+        call    relink
+        call    collect_all
+        ld      a, (d_trunc)
+        or      a
+        jp      z, od_ok
+        ld      hl, msg_trunc
+        ld      a, A_MSGERR
+        call    set_msg
+od_ok:
+        or      a
+        ret
+od_fail:
+        ld      hl, msg_notfound
+        ld      a, A_MSGERR
+        call    set_msg
+        scf
+        ret
+
+; clamp_top: hl = desired top line -> hl clamped to
+; [0, nlines-1] (0 for an empty document).
+clamp_top:
+        ld      de, (d_nlines)
+        ld      a, d
+        or      e
+        jp      z, ct_zero
+        dec     de                      ; max top
+        or      a
+        sbc     hl, de
+        jp      nc, ct_max              ; hl >= max: use max
+        add     hl, de                  ; restore
+        ret
+ct_max:
+        ex      de, hl
+        ret
+ct_zero:
+        ld      hl, 0
+        ret
+
+; ---------------------------------------------------------------
+; History.
+; ---------------------------------------------------------------
+
+; push_hist: remember the current position.
+push_hist:
+        ld      a, (histcnt)
+        cp      MAXHIST
+        jp      c, ph_go
+        ld      hl, histtab + 15
+        ld      de, histtab
+        ld      bc, 165                 ; (MAXHIST-1)*15
+        ldir
+        ld      a, MAXHIST - 1
+        ld      (histcnt), a
+ph_go:
+        ld      a, (histcnt)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; *16
+        ld      e, a
+        ld      d, 0
+        or      a
+        sbc     hl, de                  ; *15
+        ld      de, histtab
+        add     hl, de                  ; entry pointer
+        push    hl
+        ld      hl, curfile
+        pop     de
+        ld      bc, 10
+        ldir                            ; name; de = entry+10
+        ex      de, hl
+        ld      de, (top_line)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      a, (leftcol)
+        ld      (hl), a
+        inc     hl
+        ld      de, (sel_idx)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        ld      a, (histcnt)
+        inc     a
+        ld      (histcnt), a
+        ret
+
+; hist_ptr: a = index -> hl = entry pointer.
+hist_ptr:
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        ld      e, a
+        ld      d, 0
+        or      a
+        sbc     hl, de
+        ld      de, histtab
+        add     hl, de
+        ret
+
+; do_back: pop the most recent history entry.
+do_back:
+        ld      a, (histcnt)
+        or      a
+        jp      nz, db_go
+        ld      hl, msg_hist
+        ld      a, A_MSGERR
+        call    set_msg
+        ret
+db_go:
+        dec     a
+        ld      (histcnt), a
+        call    hist_ptr
+        ld      de, NAMEBUF
+        ld      bc, 10
+        ldir
+        ld      a, (hl)
+        ld      (st_top), a
+        inc     hl
+        ld      a, (hl)
+        ld      (st_top + 1), a
+        inc     hl
+        ld      a, (hl)
+        ld      (st_left), a
+        inc     hl
+        ld      a, (hl)
+        ld      (st_sel), a
+        inc     hl
+        ld      a, (hl)
+        ld      (st_sel + 1), a
+        call    open_doc
+        ret     c                       ; message already set
+        ld      hl, (st_top)
+        call    clamp_top
+        ld      (top_line), hl
+        ld      a, (st_left)
+        cp      41
+        jp      c, db_left
+        ld      a, 40
+db_left:
+        ld      (leftcol), a
+        ld      hl, (st_sel)
+        ld      a, h
+        or      a
+        jp      nz, db_sel_none
+        ld      a, l
+        ld      hl, nlinks
+        cp      (hl)
+        jp      nc, db_sel_none
+        ld      hl, (st_sel)
+        jp      db_sel_set
+db_sel_none:
+        ld      hl, 0ffffh
+db_sel_set:
+        ld      (sel_idx), hl
+        call    sel_sync
+        ret
+
+; ---------------------------------------------------------------
+; Link following.
+; ---------------------------------------------------------------
+
+; resolve_frag: FRAGBUF/(frag_len) -> hl = line, or
+; carry set when the anchor is unknown.
+resolve_frag:
+        ld      hl, FRAGBUF
+        ld      a, (frag_len)
+        call    norm_slug
+        jp      anchor_find
+
+do_follow:
+        ld      hl, (sel_idx)
+        ld      a, h
+        inc     a
+        jp      z, df_nosel
+        ld      hl, (sel_idx)
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        ld      de, LINKTAB + L_POOL
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        ex      de, hl                  ; de = pool offset
+        call    pool_read               ; TGTBUF/(tgt_len)
+        ; split the target at '#'
+        xor     a
+        ld      (fw_i), a
+        ld      a, 0ffh
+        ld      (fw_hp), a
+df_scan:
+        ld      a, (fw_i)
+        ld      hl, tgt_len
+        cp      (hl)
+        jp      nc, df_split
+        ld      hl, TGTBUF
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        cp      '#'
+        jp      z, df_hash
+        ld      a, (fw_i)
+        inc     a
+        ld      (fw_i), a
+        jp      df_scan
+df_hash:
+        ld      a, (fw_i)
+        ld      (fw_hp), a
+df_split:
+        ld      a, (fw_hp)
+        cp      0ffh
+        jp      z, df_nofrag
+        ld      (fw_flen), a
+        ld      a, (tgt_len)
+        ld      hl, fw_hp
+        sub     (hl)
+        dec     a
+        ld      (frag_len), a
+        or      a
+        jp      z, df_filepart
+        ld      hl, TGTBUF
+        ld      a, (fw_hp)
+        inc     a
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      de, FRAGBUF
+        ld      a, (frag_len)
+        ld      b, a
+df_frcp:
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    df_frcp
+        jp      df_filepart
+df_nofrag:
+        ld      a, (tgt_len)
+        ld      (fw_flen), a
+        xor     a
+        ld      (frag_len), a
+df_filepart:
+        ; normalise the file part into NAMEBUF: trim
+        ; spaces, upper-case, space-pad to 10.
+        xor     a
+        ld      (fw_si), a
+df_lead:
+        ld      a, (fw_si)
+        ld      hl, fw_flen
+        cp      (hl)
+        jp      nc, df_trail
+        ld      hl, TGTBUF
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        cp      ' '
+        jp      nz, df_trail
+        ld      a, (fw_si)
+        inc     a
+        ld      (fw_si), a
+        jp      df_lead
+df_trail:
+        ld      a, (fw_flen)
+        ld      (fw_e), a
+df_trlp:
+        ld      a, (fw_e)
+        ld      hl, fw_si
+        cp      (hl)
+        jp      z, df_norm
+        dec     a
+        ld      hl, TGTBUF
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)
+        cp      ' '
+        jp      nz, df_norm2
+        ld      a, (fw_e)
+        dec     a
+        ld      (fw_e), a
+        jp      df_trlp
+df_norm2:
+        ld      a, (fw_e)
+df_norm:
+        ld      hl, fw_si
+        sub     (hl)                    ; a = name length
+        ld      (fw_nlen), a
+        cp      11
+        jp      c, df_ncap
+        ld      a, 10
+        ld      (fw_nlen), a
+df_ncap:
+        ld      hl, NAMEBUF
+        ld      b, 10
+        ld      a, ' '
+df_pad:
+        ld      (hl), a
+        inc     hl
+        djnz    df_pad
+        ld      a, (fw_nlen)
+        or      a
+        jp      z, df_same              ; empty: same file
+        ld      hl, TGTBUF
+        ld      a, (fw_si)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      de, NAMEBUF
+        ld      a, (fw_nlen)
+        ld      b, a
+df_ncp:
+        ld      a, (hl)
+        cp      'a'
+        jp      c, df_nc1
+        cp      'z' + 1
+        jp      nc, df_nc1
+        sub     020h                    ; upper-case
+df_nc1:
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    df_ncp
+        ; same file?
+        ld      hl, NAMEBUF
+        ld      de, curfile
+        ld      b, 10
+df_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jp      nz, df_other
+        inc     hl
+        inc     de
+        djnz    df_cmp
+        jp      df_same
+df_other:
+        call    push_hist
+        call    open_doc
+        jp      nc, df_other_ok
+        ld      a, (histcnt)            ; undo the push
+        dec     a
+        ld      (histcnt), a
+        ret
+df_other_ok:
+        ld      a, (frag_len)
+        or      a
+        jp      z, df_kind1
+        ld      a, 3
+        ld      (lastkind), a
+        call    resolve_frag
+        jp      c, df_noanchor
+        ld      (top_line), hl
+        ret
+df_kind1:
+        ld      a, 1
+        ld      (lastkind), a
+        ret
+df_same:
+        ld      a, (frag_len)
+        or      a
+        jp      z, df_top
+        call    resolve_frag
+        jp      c, df_noanchor
+        ld      (fw_line), hl
+        call    push_hist
+        ld      hl, (fw_line)
+        ld      (top_line), hl
+        ld      hl, 0ffffh
+        ld      (sel_idx), hl
+        call    sel_sync
+        ld      a, 2
+        ld      (lastkind), a
+        ret
+df_top:
+        call    push_hist
+        ld      hl, 0
+        ld      (top_line), hl
+        ld      hl, 0ffffh
+        ld      (sel_idx), hl
+        call    sel_sync
+        ld      a, 2
+        ld      (lastkind), a
+        ret
+df_noanchor:
+        ld      hl, msg_anchor
+        ld      a, A_MSGERR
+        call    set_msg
+        ret
+df_nosel:
+        ld      hl, msg_nosel
+        ld      a, A_MSGERR
+        call    set_msg
+        ret
+
+; ---------------------------------------------------------------
+; Link selection.
+; ---------------------------------------------------------------
+
+do_next_link:
+        ld      a, (nlinks)
+        or      a
+        jp      z, dl_none
+        ld      hl, (sel_idx)
+        inc     hl                      ; ffffh -> 0
+        ld      a, (nlinks)
+        ld      e, a
+        ld      d, 0
+        push    hl
+        or      a
+        sbc     hl, de
+        pop     hl
+        jp      c, dl_set
+        ld      hl, 0
+        jp      dl_set
+do_prev_link:
+        ld      a, (nlinks)
+        or      a
+        jp      z, dl_none
+        ld      hl, (sel_idx)
+        ld      a, h
+        inc     a
+        jp      z, dl_last              ; none -> last
+        ld      a, h
+        or      l
+        jp      z, dl_last              ; 0 -> last
+        dec     hl
+        jp      dl_set
+dl_last:
+        ld      a, (nlinks)
+        ld      l, a
+        ld      h, 0
+        dec     hl
+dl_set:
+        ld      (sel_idx), hl
+        call    sel_sync
+        ; reveal vertically
+        ld      hl, (sel_line)
+        ld      de, (top_line)
+        or      a
+        sbc     hl, de
+        jp      c, dl_top_set           ; line < top
+        ld      a, h
+        or      a
+        jp      nz, dl_far
+        ld      a, l
+        cp      24
+        jp      c, dl_horiz
+dl_far:
+        ld      hl, (sel_line)
+        ld      de, 23
+        or      a
+        sbc     hl, de
+        ld      (top_line), hl
+        jp      dl_horiz
+dl_top_set:
+        ld      hl, (sel_line)
+        ld      (top_line), hl
+dl_horiz:
+        ld      hl, (sel_idx)
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        ld      de, LINKTAB + L_DCOL
+        add     hl, de
+        ld      a, (hl)                 ; dcol
+        ld      (fw_dcol), a
+        inc     hl
+        ld      a, (hl)                 ; dend (at +4 from entry)
+        ld      (fw_dend), a
+        ld      a, (fw_dend)
+        ld      hl, leftcol
+        cp      (hl)
+        jp      z, dl_h2
+        jp      c, dl_hl                ; dend < leftcol
+dl_h2:
+        ld      a, (fw_dcol)
+        ld      hl, leftcol
+        sub     (hl)
+        cp      40
+        ret     c                       ; fully visible
+        ld      a, (fw_dend)
+        sub     40
+        ld      (leftcol), a
+        ret
+dl_hl:
+        ld      a, (fw_dend)
+        ld      hl, leftcol
+        cp      (hl)
+        ret     z
+        ld      a, (fw_dcol)
+        ld      (leftcol), a
+        ret
+dl_none:
+        ld      hl, msg_nolink
+        ld      a, A_MSGERR
+        call    set_msg
+        ret
+
+; ---------------------------------------------------------------
+; Open-file prompt (status-line input).
+; ---------------------------------------------------------------
+
+prompt_open:
+        xor     a
+        ld      (pr_len), a
+po_draw:
+        ld      hl, STATBUF
+        ld      (dptr), hl
+        ld      hl, str_open
+        call    sb_str
+        ld      hl, pr_buf
+        ld      a, (pr_len)
+        or      a
+        jp      z, po_pad
+        ld      b, a
+po_echo:
+        ld      a, (hl)
+        call    dc_put
+        inc     hl
+        djnz    po_echo
+po_pad:
+        call    sb_pad
+        ld      a, A_BASE
+        ld      (stat_attr), a
+        call    blit_status
+        ; cursor at the input end
+        ld      a, (pr_len)
+        add     a, 6
+        ld      l, a
+        ld      h, 0
+        ld      de, 24 * 40
+        add     hl, de
+        ld      a, 002h
+        call    cell_cursor
+        call    C_KEYIN
+        cp      01bh
+        jp      z, po_cancel
+        cp      00dh
+        jp      z, po_done
+        cp      008h
+        jp      z, po_bs
+        cp      07fh
+        jp      z, po_bs
+        cp      020h
+        jp      c, po_draw
+        cp      07fh
+        jp      nc, po_draw
+        ld      (po_b), a
+        ld      a, (pr_len)
+        cp      10
+        jp      nc, po_draw
+        ld      hl, pr_buf
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (po_b)
+        ld      (hl), a
+        ld      a, (pr_len)
+        inc     a
+        ld      (pr_len), a
+        jp      po_draw
+po_bs:
+        ld      a, (pr_len)
+        or      a
+        jp      z, po_draw
+        dec     a
+        ld      (pr_len), a
+        jp      po_draw
+po_done:
+        ld      a, (pr_len)
+        or      a
+        jp      z, po_cancel
+        ; build NAMEBUF: upper-case, space-padded
+        ld      hl, NAMEBUF
+        ld      b, 10
+        ld      a, ' '
+po_pd:
+        ld      (hl), a
+        inc     hl
+        djnz    po_pd
+        ld      hl, pr_buf
+        ld      de, NAMEBUF
+        ld      a, (pr_len)
+        ld      b, a
+po_cp:
+        ld      a, (hl)
+        cp      'a'
+        jp      c, po_c1
+        cp      'z' + 1
+        jp      nc, po_c1
+        sub     020h
+po_c1:
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    po_cp
+        or      a
+        ret
+po_cancel:
+        scf
+        ret
+str_open:
+        db      "OPEN: ", 0
+
+; ---------------------------------------------------------------
+; State file (MDBSTATE) and the SCED chain load.
+; ---------------------------------------------------------------
+
+; state_save: a = resume flag. Writes the 256-byte
+; state block from STAGE under the name MDBSTATE.
+state_save:
+        ld      (st_flag), a
+        ld      hl, STAGE
+        ld      b, 0
+        xor     a
+ssz_lp:
+        ld      (hl), a
+        inc     hl
+        djnz    ssz_lp
+        ld      hl, str_mdbstate
+        ld      de, STAGE
+        ld      bc, 4
+        ldir
+        ld      a, 1
+        ld      (STAGE + 4), a          ; version
+        ld      a, (st_flag)
+        ld      (STAGE + 5), a
+        ld      a, (cur_drv)
+        ld      (STAGE + 6), a
+        ld      a, (histcnt)
+        ld      (STAGE + 7), a
+        ld      hl, curfile
+        ld      de, STAGE + 8
+        ld      bc, 10
+        ldir
+        ld      hl, (top_line)
+        ld      (STAGE + 18), hl
+        ld      a, (leftcol)
+        ld      (STAGE + 20), a
+        ld      hl, (sel_idx)
+        ld      (STAGE + 21), hl
+        ld      hl, histtab
+        ld      de, STAGE + 24
+        ld      bc, MAXHIST * 15
+        ldir
+        ld      hl, name_state
+        ld      de, NAMEBUF
+        ld      bc, 10
+        ldir
+        ld      hl, 256
+        ld      (raw_total), hl
+        jp      write_raw
+str_mdbstate:
+        db      "MDBS"
+name_state:
+        db      "MDBSTATE  "
+
+; state_delete: remove MDBSTATE if it exists.
+state_delete:
+        ld      hl, name_state
+        ld      de, NAMEBUF
+        ld      bc, 10
+        ldir
+        jp      delete_file
+
+; state_try_resume: when a state file with the resume
+; flag set is present, restore the session. Carry set
+; when there is nothing to resume.
+state_try_resume:
+        ld      hl, name_state
+        ld      de, NAMEBUF
+        ld      bc, 10
+        ldir
+        call    read_file
+        ret     c
+        ld      hl, str_mdbstate
+        ld      de, STAGE
+        ld      b, 4
+sr_cmp:
+        ld      a, (de)
+        cp      (hl)
+        jp      nz, sr_no
+        inc     hl
+        inc     de
+        djnz    sr_cmp
+        ld      a, (STAGE + 5)
+        cp      1
+        jp      nz, sr_no
+        ; extract the fields before open_doc reuses STAGE
+        ld      a, (STAGE + 6)
+        ld      (cur_drv), a
+        ld      a, (STAGE + 7)
+        ld      (histcnt), a
+        ld      hl, STAGE + 24
+        ld      de, histtab
+        ld      bc, MAXHIST * 15
+        ldir
+        ld      hl, (STAGE + 18)
+        ld      (st_top), hl
+        ld      a, (STAGE + 20)
+        ld      (st_left), a
+        ld      hl, (STAGE + 21)
+        ld      (st_sel), hl
+        ld      hl, STAGE + 8
+        ld      de, st_name
+        ld      bc, 10
+        ldir
+        ld      hl, st_name
+        ld      de, NAMEBUF
+        ld      bc, 10
+        ldir
+        call    open_doc
+        jp      nc, sr_apply
+        xor     a
+        ld      (histcnt), a            ; stale state: fresh
+        scf
+        ret
+sr_apply:
+        ld      hl, (st_top)
+        call    clamp_top
+        ld      (top_line), hl
+        ld      a, (st_left)
+        cp      41
+        jp      c, sr_left
+        ld      a, 40
+sr_left:
+        ld      (leftcol), a
+        ld      hl, (st_sel)
+        ld      a, h
+        or      a
+        jp      nz, sr_sel_none
+        ld      a, l
+        ld      hl, nlinks
+        cp      (hl)
+        jp      nc, sr_sel_none
+        ld      hl, (st_sel)
+        jp      sr_sel_set
+sr_sel_none:
+        ld      hl, 0ffffh
+sr_sel_set:
+        ld      (sel_idx), hl
+        call    sel_sync
+        ld      a, 1
+        ld      (resumed), a
+        ; consume the flag so a later plain start is fresh
+        xor     a
+        call    state_save
+        or      a
+        ret
+sr_no:
+        scf
+        ret
+
+; chain_sced: save the session state, load the SCED
+; program file over this one and jump to it. The load
+; runs from a small stub at STUBHOME (the program area
+; is overwritten while the stub works).
+chain_sced:
+        call    dir_load
+        jp      c, cs_nosced
+        call    dir_magic_ok
+        jp      c, cs_nosced
+        ld      hl, name_sced
+        ld      (fe_name), hl
+        call    find_entry
+        jp      c, cs_nosced
+        ld      (cs_ent), hl
+        ld      de, 10
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        ld      (STUBPAR + 2), hl       ; start unit
+        ld      hl, (cs_ent)
+        ld      de, 12
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; size
+        ld      a, h
+        or      l
+        jp      z, cs_units0
+        dec     hl
+        ld      l, h
+        ld      h, 0
+        inc     hl                      ; units = ceil(size/256)
+        jp      cs_units
+cs_units0:
+        ld      hl, 0
+cs_units:
+        ld      (STUBPAR + 0), hl       ; units left
+        ld      hl, (cs_ent)
+        ld      de, 14
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; load address
+        ld      (STUBPAR + 8), hl
+        ld      (STUBPAR + 4), hl       ; dst = load address
+        ld      a, (cur_drv)
+        ld      (STUBPAR + 6), a
+        ld      a, 1
+        call    state_save
+        jp      c, cs_fail
+        ld      hl, stubimg
+        ld      de, STUBHOME
+        ld      bc, stubend - stubimg
+        ldir
+        jp      STUBHOME
+cs_nosced:
+        ld      hl, msg_nosced
+        ld      a, A_MSGERR
+        call    set_msg
+        ret
+cs_fail:
+        ld      hl, msg_state
+        ld      a, A_MSGERR
+        call    set_msg
+        ret
+name_sced:
+        db      "SCED      "
+
+; The chain loader stub. It is copied to STUBHOME and
+; run from there; it uses only relative jumps internally
+; (its absolute references are the IOCS table and the
+; fixed STUBPAR block), so it survives the move.
+stubimg:
+        ld      sp, 08000h
+stub_lp:
+        ld      hl, (STUBPAR + 0)       ; units left
+        ld      a, h
+        or      l
+        jr      z, stub_go
+        ld      de, (STUBPAR + 2)       ; unit
+        ld      hl, (STUBPAR + 4)       ; destination
+        ld      a, (STUBPAR + 6)        ; drive
+        or      a
+        jr      z, stub_fd
+        call    C_RREAD
+        jr      stub_nx
+stub_fd:
+        call    C_DREAD
+stub_nx:
+        ld      hl, (STUBPAR + 2)
+        inc     hl
+        ld      (STUBPAR + 2), hl
+        ld      hl, (STUBPAR + 4)
+        ld      de, 256
+        add     hl, de
+        ld      (STUBPAR + 4), hl
+        ld      hl, (STUBPAR + 0)
+        dec     hl
+        ld      (STUBPAR + 0), hl
+        jr      stub_lp
+stub_go:
+        ld      hl, (STUBPAR + 8)       ; load address
+        jp      (hl)
+stubend:
+
+; ---------------------------------------------------------------
+; Main loop and key dispatch.
+; ---------------------------------------------------------------
+main_loop:
+        call    redraw
+        call    C_KEYIN
+        ld      (key), a
+        cp      009h                    ; TAB
+        jp      z, do_next_link_main
+        cp      00dh                    ; ENTER
+        jp      z, do_follow_main
+        cp      008h                    ; BS
+        jp      z, do_back_main
+        cp      07fh                    ; DEL = BS here too
+        jp      z, do_back_main
+        cp      'G'
+        jp      z, key_bottom
+        cp      'N'
+        jp      z, do_prev_link_main
+        cp      'A'
+        jp      c, ml_cmp
+        cp      'Z' + 1
+        jp      nc, ml_cmp
+        add     a, 020h                 ; fold case
+ml_cmp:
+        ld      (key), a
+        cp      'j'
+        jp      z, key_down
+        cp      'k'
+        jp      z, key_up
+        cp      ' '
+        jp      z, key_pgdn
+        cp      'b'
+        jp      z, key_pgup
+        cp      'g'
+        jp      z, key_top
+        cp      'h'
+        jp      z, key_left
+        cp      'l'
+        jp      z, key_right
+        cp      'n'
+        jp      z, do_next_link_main
+        cp      'u'
+        jp      z, do_back_main
+        cp      'e'
+        jp      z, key_edit
+        cp      'o'
+        jp      z, key_open
+        cp      'd'
+        jp      z, key_drive
+        cp      'q'
+        jp      z, quit_mdb
+        jp      main_loop
+do_next_link_main:
+        call    do_next_link
+        jp      main_loop
+do_prev_link_main:
+        call    do_prev_link
+        jp      main_loop
+do_follow_main:
+        call    do_follow
+        jp      main_loop
+do_back_main:
+        call    do_back
+        jp      main_loop
+key_down:
+        ld      hl, (top_line)
+        inc     hl
+        call    clamp_top
+        ld      (top_line), hl
+        jp      main_loop
+key_up:
+        ld      hl, (top_line)
+        ld      a, h
+        or      l
+        jp      z, main_loop
+        dec     hl
+        ld      (top_line), hl
+        jp      main_loop
+key_pgdn:
+        ld      hl, (top_line)
+        ld      de, 24
+        add     hl, de
+        call    clamp_top
+        ld      (top_line), hl
+        jp      main_loop
+key_pgup:
+        ld      hl, (top_line)
+        ld      de, 24
+        or      a
+        sbc     hl, de
+        jp      nc, kp_set
+        ld      hl, 0
+kp_set:
+        ld      (top_line), hl
+        jp      main_loop
+key_top:
+        ld      hl, 0
+        ld      (top_line), hl
+        jp      main_loop
+key_bottom:
+        ld      hl, (d_nlines)
+        ld      de, 24
+        or      a
+        sbc     hl, de
+        jp      nc, kb_set
+        ld      hl, 0
+kb_set:
+        ld      (top_line), hl
+        jp      main_loop
+key_left:
+        ld      a, (leftcol)
+        cp      11
+        jp      c, kl_zero
+        sub     10
+        jp      kl_set
+kl_zero:
+        xor     a
+kl_set:
+        ld      (leftcol), a
+        jp      main_loop
+key_right:
+        ld      a, (leftcol)
+        add     a, 10
+        cp      41
+        jp      c, kr_set
+        ld      a, 40
+kr_set:
+        ld      (leftcol), a
+        jp      main_loop
+key_edit:
+        call    chain_sced
+        jp      main_loop
+key_open:
+        call    prompt_open
+        jp      c, main_loop            ; cancelled
+        call    push_hist
+        call    open_doc
+        jp      nc, main_loop
+        ld      a, (histcnt)            ; undo the push
+        dec     a
+        ld      (histcnt), a
+        jp      main_loop
+key_drive:
+        ld      a, (cur_drv)
+        xor     1
+        ld      (cur_drv), a
+        or      a
+        jp      z, kd_0
+        ld      hl, msg_drv1
+        jp      kd_msg
+kd_0:
+        ld      hl, msg_drv0
+kd_msg:
+        ld      a, A_MSGOK
+        call    set_msg
+        jp      main_loop
+
+; ---------------------------------------------------------------
+; Variables and messages.
+; ---------------------------------------------------------------
+
+save_sp: ds     2
+probe_sv: ds    1
+emm_cnt: ds     1
+emid_cur: ds    1
+lr_dest: ds     2
+al_len: ds      1
+al_src: ds      2
+rl_n:   ds      2
+rl_i:   ds      2
+rl_p:   ds      2
+rl_v:   ds      2
+
+ld_ptr: ds      2
+ld_rem: ds      2
+ld_len: ds      1
+ld_skip: ds     1
+ld_pcr: ds      1
+ld_ch:  ds      1
+
+cur_drv: ds     1
+cap_units: ds   2
+fe_name: ds     2
+fe_ptr: ds      2
+fs_size: ds     2
+rf_ent: ds      2
+rf_blk: ds      2
+rf_dst: ds      2
+rf_cnt: ds      2
+sv_total: ds    2
+raw_total: ds   2
+wf_sec: ds      2
+wf_ent: ds      2
+wf_start: ds    2
+wf_end: ds      2
+wf_blk: ds      2
+wf_src: ds      2
+wf_cnt: ds      2
+pa_off: ds      2
+pr_off: ds      2
+pr_dst: ds      2
+pr_byte: ds     1
+pool_next: ds   2
+tgt_len: ds     1
+
+ln_len: ds      1
+ifl_p:  ds      1
+ff_from: ds     1
+ff_ch:  ds      1
+ff_i:   ds      1
+ff_b:   ds      1
+ff_pos: ds      1
+ff_end: ds      1
+
+blk_type: ds    1
+blk_start: ds   1
+blk_end: ds     1
+blk_level: ds   1
+fence_in: ds    1
+cl_p:   ds      1
+cl_i:   ds      1
+cl_e:   ds      1
+cl_rs:  ds      1
+cl_b:   ds      1
+cl_hch: ds      1
+cl_hcnt2: ds    1
+cl_tend: ds     1
+cl_tstop: ds    1
+cl_dst: ds      2
+cl_mend: ds     1
+id_len: ds      1
+
+ns_src: ds      2
+ns_len: ds      1
+ns_i:   ds      1
+ns_dst: ds      2
+ns_b:   ds      1
+ns_b2:  ds      1
+slug_len: ds    1
+idn_len: ds     1
+ni_i:   ds      1
+ni_pend: ds     1
+ni_dst: ds      2
+ni_b:   ds      1
+aa_ptr: ds      2
+af_i:   ds      1
+af_ptr: ds      2
+ra_off: ds      2
+ca_i:   ds      2
+
+sc_line: ds     2
+sc_pos: ds      1
+sc_out: ds      1
+sc_ord: ds      1
+sc_collect: ds  1
+sc_base: ds     1
+ec_ch:  ds      1
+ec_n:   ds      1
+er_from: ds     1
+er_to:  ds      1
+er_attr: ds     1
+er_i:   ds      1
+er_b:   ds      1
+si_b:   ds      1
+si_b2:  ds      1
+si_from: ds     1
+si_ch:  ds      1
+si_delim: ds    1
+si_n:   ds      1
+si_i:   ds      1
+si_dst: ds      2
+lk_pos: ds      1
+lk_tend: ds     1
+lk_pend: ds     1
+lk_iend: ds     1
+lk_next: ds     1
+lk_pool: ds     2
+lk_dstart: ds   1
+
+cattr:  ds      1
+msgptr: ds      2
+msgattr: ds     1
+stat_attr: ds   1
+rd_row: ds      1
+rd_idx: ds      2
+rd_off: ds      2
+rd_x:   ds      1
+rd_pos: ds      1
+rd_ch:  ds      1
+cp_attr: ds     1
+cp_ch:  ds      1
+fs_n:   ds      2
+fs_i:   ds      2
+fs_st:  ds      1
+dptr:   ds      2
+ds_src: ds      2
+
+d_nlines: ds    2
+d_nextoff: ds   2
+d_chk:  ds      2
+d_trunc: ds     1
+curfile: ds     10
+top_line: ds    2
+leftcol: ds     1
+sel_idx: ds     2
+sel_line: ds    2
+sel_ord: ds     1
+nlinks: ds      1
+nanch:  ds      1
+nrefs:  ds      1
+resumed: ds     1
+lastkind: ds    1
+histcnt: ds     1
+histtab: ds     MAXHIST * 15
+st_top: ds      2
+st_left: ds     1
+st_sel: ds      2
+st_flag: ds     1
+st_name: ds     10
+fw_i:   ds      1
+fw_hp:  ds      1
+fw_flen: ds     1
+fw_si:  ds      1
+fw_e:   ds      1
+fw_nlen: ds     1
+fw_line: ds     2
+fw_dcol: ds     1
+fw_dend: ds     1
+frag_len: ds    1
+cs_ent: ds      2
+pr_len: ds      1
+pr_buf: ds      12
+po_b:   ds      1
+key:    ds      1
+
+msg_noemm:
+        db      "EMM NOT FOUND", 00dh, 00ah, 0
+msg_notfound:
+        db      "FILE NOT FOUND", 0
+msg_trunc:
+        db      "DOCUMENT TRUNCATED", 0
+msg_nolink:
+        db      "NO LINKS", 0
+msg_nosel:
+        db      "NO LINK SELECTED", 0
+msg_anchor:
+        db      "ANCHOR NOT FOUND", 0
+msg_hist:
+        db      "NO HISTORY", 0
+msg_nosced:
+        db      "SCED NOT FOUND", 0
+msg_state:
+        db      "CANNOT SAVE STATE", 0
+msg_drv0:
+        db      "DRIVE 0 (FD)", 0
+msg_drv1:
+        db      "DRIVE 1 (RAMDISK)", 0

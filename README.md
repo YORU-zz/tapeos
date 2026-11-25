@@ -50,6 +50,7 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
   - NEWASM ― オンマシンアセンブラ（`src/newasm.z80`）
   - SCED ― スクリーンエディタ（`src/sced.z80`）
   - MCED ― MicroEmacs 風エディタ（`src/mced.z80`）。モードレスな Emacs 系操作（C-k キル／C-y ヤンク、リージョン、検索、C-x プレフィクス）で、SCED とは別プログラム。ファイル形式は SCED と互換
+  - MDB ― Markdown ブラウザ（`src/mdb.z80`）。実用サブセット（ATX 見出し、リスト、引用、コードフェンス、水平線、強調・コード・リンクのインライン装飾）を属性色で描画します。リンクはファイル間ジャンプ、`#アンカー`、履歴で戻る、参照スタイルリンクに対応し、`e` キーで SCED に渡して編集・保存してから閲覧へ復帰できます。サンプル文書は `src/INDEX.MD` / `src/GUIDE.MD` / `src/REF.MD` / `src/JIS.MD`
   - TBC / TBI ― TinyBASIC コンパイラ／インタープリタ（`src/tbc.z80`、`src/tbi.z80`、共有コア `src/tbcore.inc`、X1 ライブラリ `src/tblib.z80`）。X-BASIC 風方言（関数定義の集合、int/char、再帰、配列、print/input/stick/vsync など）。TBC は TOSR 実行ファイルを出力し、TBI は関数単位の遅延 JIT で即実行する。サンプルは `src/fib.tb` / `src/calc.tb` / `src/game.tb` など
   - SCC / SCI ― Small-C コンパイラ／インタープリタ（`src/scc.z80`、`src/sci.z80`、共有コア `src/sccore.inc`、X1 ライブラリ `src/clib.z80`）。Small-C サブセット（int/char、1段ポインタ、配列、再帰、構造化制御、#include/#define、printf/getchar など）。SCC は TOSR 実行ファイルを出力し、SCI は関数単位の遅延 JIT で即実行する（コンパイラと実行結果は完全一致）。TinyBASIC との双方向変換ツール `tools/bascvt.py` 付き（共通サブセット外は変換不可として報告される）。サンプルは `src/fib.c` / `src/calc.c` / `src/game.c` など、変換 corpus は `src/cvsum.tb`＋`src/cvsum.c` ほかの対照ペア
   - DISASM ― Z80 逆アセンブラ（`src/disasm.z80`、デコード部は EDIS と共有の `src/disasm_core.inc`／`src/disasm_util.inc`）。TOSD ファイルまたはメモリ範囲を、NEWASM／EDAS で再アセンブル可能なソースへ変換します。全命令（CB／ED／DD／FD プレフィックス含む）に対応し、範囲内の制御フロー飛び先には自動でラベルを生成します。コード／データの区別は DATA 範囲の指定によります。再アセンブルでバイト一致しない非正規エンコーディングは DB として出力する方針で、出力は常に対象とバイト一致します
@@ -95,6 +96,7 @@ newasm.bin、sced.bin、mced.bin など）とディスク／テープイメー�
 
 - `images/shell.d88` ― TapeOS シェルの起動ディスクイメージ
 - `images/mced.d88` ― シェル起動ディスク＋ MCED プログラムファイル入り。起動後に `r mced` / `g 4000` で MCED が使えます
+- `images/mdb.d88` ― シェル起動ディスク＋ MDB / SCED プログラムファイルとサンプル文書（INDEX.MD / GUIDE.MD / REF.MD / JIS.MD）入り。起動後に `r mdb` / `g 4000` で INDEX.MD が開きます
 - `images/tinybasic.d88` ― シェル起動ディスク＋ TBC / TBI とサンプル（FIB.TB / CALC.TB / GAME.TB / SCM.TB）、Scheme 組み込みコア SCMCORE 入り。起動後に `r tbc` / `g 4000` でコンパイル（SRC/OUT を聞かれます）、`r tbi` / `g 4000` で即実行できます
 - `images/smallc.d88` ― シェル起動ディスク＋ SCC / SCI とサンプル（FIB.C / CALC.C / GAME.C / SCM.C）、Scheme 組み込みコア SCMCORE 入り。起動後に `r scc` / `g 4000` でコンパイル（SRC/OUT を聞かれます）、`r sci` / `g 4000` で即実行できます
 - `images/disasm.d88` ― シェル起動ディスク＋ DISASM プログラムファイル入り。起動後に `r disasm` / `g 4000` で逆アセンブルできます（SRC/BASE、またはメモリ範囲 FROM/TO、DATA 範囲、OUT を聞かれます）

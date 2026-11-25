@@ -14,6 +14,7 @@
 #   newasm.bin        NEWASM on-machine assembler (TOSD program)
 #   sced.bin          SCED screen editor (TOSD program)
 #   mced.bin          MCED MicroEmacs-style editor (TOSD program)
+#   mdb.bin           MDB Markdown browser (TOSD program)
 #   tbc.bin           TBC TinyBASIC compiler (TOSD program)
 #   tbi.bin           TBI TinyBASIC interpreter (JIT, TOSD program)
 #   scc.bin           SCC Small-C compiler (TOSD program)
@@ -37,6 +38,7 @@
 #   tapeos.d88        bootable disk image of the M1 program
 #   shell.d88         bootable disk image of the shell
 #   mced.d88          bootable shell disk with the MCED program file
+#   mdb.d88           bootable shell disk with MDB, SCED and sample docs
 #   tinybasic.d88     bootable shell disk with TBC/TBI and samples
 #   smallc.d88        bootable shell disk with SCC/SCI and samples
 #   disasm.d88        bootable shell disk with the DISASM program file
@@ -64,6 +66,7 @@ echo "== assemble =="
 "$PASMO" src/newasm.z80 build/newasm.bin build/newasm.lst
 "$PASMO" src/sced.z80 build/sced.bin build/sced.lst
 "$PASMO" src/mced.z80 build/mced.bin build/mced.lst
+"$PASMO" src/mdb.z80 build/mdb.bin build/mdb.lst
 python3 tools/mklibtab.py src/tblib.z80 "$PASMO" build
 python3 tools/genstub.py tools/stub-template.bin build/stub.inc
 "$PASMO" -I src -I build src/tbc.z80 build/tbc.bin build/tbc.lst
@@ -132,6 +135,14 @@ python3 tools/mkd88.py build/tapeos.bin build/tapeos.d88
 python3 tools/mkd88.py build/tapeos-shell.bin build/shell.d88
 python3 tools/mkd88.py build/tapeos-shell.bin build/mced.d88 0x2000 0x2000 full
 python3 tools/putfile.py build/mced.d88 build/mced.bin MCED 0x4000
+python3 tools/mkd88.py build/tapeos-shell.bin build/mdb.d88 0x2000 0x2000 full
+python3 tools/putfiles.py build/mdb.d88 \
+    build/mdb.bin MDB 0x4000 \
+    build/sced.bin SCED 0x4000 \
+    src/INDEX.MD INDEX.MD 0 \
+    src/GUIDE.MD GUIDE.MD 0 \
+    src/REF.MD REF.MD 0 \
+    src/JIS.MD JIS.MD 0
 python3 tools/mkd88.py build/tapeos-shell.bin build/tinybasic.d88 0x2000 0x2000 full
 python3 tools/putfiles.py build/tinybasic.d88 \
     build/tbc.bin TBC 0x4000 \
