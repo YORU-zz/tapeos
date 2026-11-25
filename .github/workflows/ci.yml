@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pasmo (Z80 assembler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pasmo
+          pasmo 2>&1 | head -1 || true
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Contract check (published X1 subset)
+        run: sh tools/contract-check.sh
+
+      - name: ROM ledger check (binary allowlist)
+        run: python3 tools/check-rom-ledger.py
+
+      - name: Smoke check (artifact sizes and headers)
+        run: python3 tools/smoke-check.py
