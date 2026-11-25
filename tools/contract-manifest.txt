@@ -1,0 +1,78 @@
+# contract-manifest.txt - expected values for tools/contract-check.sh
+# (repository edition). See docs/interface-spec.md section 7 for the
+# contract itself. HASH/IOCS hashes are refreshed with:
+#   sh tools/contract-check.sh --generate
+# EQU/TEXT/SIZE lines are the contract: change them only together
+# with docs/interface-spec.md.
+#
+# Scope: this repository publishes the X1 tree only, so this manifest
+# carries the X1 subset of the development tree's full manifest
+# (which additionally covers the MZ-80B / MZ-80K / PC-8801 builds).
+# Every value below is identical to the corresponding entry of the
+# full manifest; only the paths are remapped to this repository's
+# layout (tapeos/src/... -> src/..., stage build dirs -> build/...).
+# Run ./build.sh first: HASH/IOCS/SIZE entries refer to build outputs.
+
+# --- IOCS jump-table templates (31 entries x JP = 93 bytes) in the
+# canonical X1 monitor builds. Offset = iocs_template address -
+# LOADADDR, taken from each build's pasmo listing.
+IOCS build/tapeos-shell.bin 4483 9727de44a5942020ddab79d591046f5d0d11b9649d1ef1967ed96a8b13ead361 93
+IOCS build/tapeos-4800.bin 4460 e140513fd0b7903ff4b5c770f9627dad8708e0bbbca595c2de41b787fe16e4a2 93
+
+# --- Interface constants (equates). Values in decimal.
+EQU src/common.inc I_INKEY 0
+EQU src/common.inc I_KEYIN 1
+EQU src/common.inc I_CONOUT 2
+EQU src/common.inc I_PRTMSG 3
+EQU src/common.inc I_CRLF 4
+EQU src/common.inc I_GETLIN 5
+EQU src/common.inc I_CLRSCR 6
+EQU src/common.inc I_LOCATE 7
+EQU src/common.inc I_HEXOUT 8
+EQU src/common.inc I_HEX16 9
+EQU src/common.inc I_TINF 10
+EQU src/common.inc I_TDAT 11
+EQU src/common.inc I_TWINF 12
+EQU src/common.inc I_TWDAT 13
+EQU src/common.inc I_TCTRL 14
+EQU src/common.inc I_DREAD 15
+EQU src/common.inc I_DWRITE 16
+EQU src/common.inc I_RREAD 24
+EQU src/common.inc I_RWRITE 25
+EQU src/common.inc I_RINIT 26
+EQU src/common.inc I_BEEP 21
+EQU src/common.inc I_RTGET 22
+EQU src/common.inc I_BREAK 23
+EQU src/common.inc I_SIN 28
+EQU src/common.inc I_SOUT 29
+EQU src/common.inc I_SPOLL 30
+EQU src/machine_x1.inc IOCS_BASE 58368
+EQU src/machine_x1.inc LOADADDR 8192
+EQU src/machine_x1.inc STACKTOP 57344
+EQU src/machine_x1.inc SIGADDR 57600
+EQU src/machine_x1.inc RDMAX 256
+
+# --- Source literals that pin the 0x4000 program origin of the
+# on-machine tools (EDAS / NEWASM / SCED all load at 0x4000).
+TEXT src/edas.z80 org     04000h
+TEXT src/newasm.z80 org     04000h
+TEXT src/sced.z80 org     04000h
+
+# --- Deliverable binaries: byte-identity (sha256). The hashes are
+# the same values the development tree's full manifest records for
+# the corresponding X1 deliverables.
+HASH c5e839c0f270a36007a5445c539983835630745f292a9d7445cd3cdbd3d27e22 build/tapeos.bin
+HASH 9660489fde84162df2197c207b4644617817e1667e081912c1d4178f4fe2f67d build/edas.bin
+HASH a56c809feef3f29fc93ec1947be8daaacc2a1e15db0edd29ae820b1b09e03ffe build/edasr.bin
+HASH be98426a5f34231a1f5a8ed7ca756c966cf403c48a7683781c38c76eea64bec8 build/newasm.bin
+HASH 41c243afa63a7fcffd50e0a96f60b6550917dafad3a14bf6c65f3f3b72156706 build/sced.bin
+HASH bd1b915a807d344da921776145fe56e02278125cd8be0ccbd0bd130436d93944 tools/stub-template.bin
+
+# --- Component size caps (bytes, must be <=). Shell = FD system
+# area 31 records x 256; EDAS/EDASR gate is 0x4000+n < 0x6400, i.e.
+# n <= 9215; NEWASM/SCED gates are n < 10240, i.e. n <= 10239.
+SIZE build/tapeos-shell.bin 7936
+SIZE build/edas.bin 9215
+SIZE build/edasr.bin 9215
+SIZE build/newasm.bin 10239
+SIZE build/sced.bin 10239
