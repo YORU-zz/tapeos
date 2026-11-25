@@ -126,6 +126,12 @@ README の案内（meister68k 氏の X1 互換フォント配布）に従って
 `docs/shell-commands.md` にまとめています。
 実装の技術解説（モジュール別の設計と実装、原作との技術的差異、メモリマップ）は
 `docs/tech/tech-00-index.md` から始まるシリーズにまとめています。
+上層プログラムが依存してよい契約の正本は `docs/interface-spec.md`
+（インターフェース仕様）です。検証の方法と結果は `docs/audit.md` に、
+ROM・フォント等の出自とライセンスは `docs/rom-provenance.md` に
+まとめています。契約チェック（`tools/contract-check.sh`）と
+ROM 台帳チェック（`tools/check-rom-ledger.py`）は CI でも実行
+しています。
 
 ## ライセンスとクレジット
 
