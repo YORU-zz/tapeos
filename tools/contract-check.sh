@@ -38,6 +38,30 @@
 # EQU / TEXT / SIZE lines are the contract itself: edit them only
 # together with interface-spec.md.
 #
+# Change classification gate on --generate (interface-spec.md
+# section 7.1, adopted 2026-11-25):
+#
+#   class A  additions only: no existing value, address or format
+#            changes.  Passes with no extra options; a new entry is
+#            added by appending its line with an all-zero hash,
+#            which --generate then fills in.
+#   class B  observable change (compatible, but existing behaviour
+#            changes or an undefined point becomes defined), and
+#   class C  breaking change (existing addresses / formats change;
+#            needs the project owner's prior approval).
+#
+# If the regeneration diff changes the value of an existing EQU /
+# IOCS entry, or changes or deletes an existing HASH line, the
+# change is class B or higher: --generate then refuses unless it
+# is given an explicit classification and approver:
+#
+#   sh contract-check.sh --generate --class B --approver NAME \
+#       --note "what changed and why"
+#
+# Accepted regenerations of class B/C (and any run given --class)
+# are appended to contract-changes.md next to the manifest.
+# Pure additions pass with no options and no record.
+#
 # Exit status: 0 = all checks PASS, 1 = at least one FAIL.
 
 set -u
@@ -46,12 +70,32 @@ ROOT=$PWD
 MANIFEST="tools/contract-manifest.txt"
 
 if [ "${1:-}" = "--generate" ]; then
-    python3 - "$MANIFEST" <<'PYEOF'
-import hashlib, re, sys
-man = sys.argv[1]
+    shift
+    GEN_CLASS=""; GEN_APPROVER=""; GEN_NOTE=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --class)   GEN_CLASS="${2:-}"; shift 2 ;;
+        --approver) GEN_APPROVER="${2:-}"; shift 2 ;;
+        --note)    GEN_NOTE="${2:-}"; shift 2 ;;
+        *) echo "FAIL: unknown --generate option: $1"; exit 1 ;;
+        esac
+    done
+    case "$GEN_CLASS" in
+    ""|A|B|C) ;;
+    *) echo "FAIL: --class must be A, B or C"; exit 1 ;;
+    esac
+    python3 - "$MANIFEST" "$GEN_CLASS" "$GEN_APPROVER" "$GEN_NOTE" <<'PYEOF'
+import hashlib, os, sys
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Asia/Tokyo")
+except Exception:
+    TZ = None
+man, gclass, approver, note = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+old_lines = [l.rstrip("\n") for l in open(man, encoding="utf-8")]
 out = []
-for line in open(man, encoding="utf-8"):
-    line = line.rstrip("\n")
+for line in old_lines:
     parts = line.split()
     if len(parts) >= 3 and parts[0] == "HASH":
         path = parts[2]
@@ -74,8 +118,77 @@ for line in open(man, encoding="utf-8"):
             out.append(line)
     else:
         out.append(line)
+
+ZERO = "0" * 64
+def entry_key(line):
+    p = line.split()
+    if not p:
+        return None
+    if p[0] == "HASH" and len(p) >= 3:
+        return ("HASH", p[2])
+    if p[0] == "IOCS" and len(p) >= 4:
+        return ("IOCS", p[1], p[2])
+    if p[0] == "EQU" and len(p) >= 4:
+        return ("EQU", p[1], p[2])
+    if p[0] == "TEXT" and len(p) >= 3:
+        return ("TEXT", p[1], p[2])
+    if p[0] == "SIZE" and len(p) >= 2:
+        return ("SIZE", p[1])
+    return None
+def hash_field(line):
+    p = line.split()
+    if p and p[0] == "HASH" and len(p) >= 3:
+        return p[1]
+    if p and p[0] == "IOCS" and len(p) >= 4:
+        return p[3]
+    return None
+old_map, new_map = {}, {}
+for l in old_lines:
+    k = entry_key(l)
+    if k is not None:
+        old_map[k] = l
+for l in out:
+    k = entry_key(l)
+    if k is not None:
+        new_map[k] = l
+value_changes = []
+for k, old in old_map.items():
+    if k not in new_map:
+        value_changes.append("deleted: " + old)
+    elif new_map[k] != old and hash_field(old) != ZERO:
+        value_changes.append("changed: %s  ->  %s" % (old, new_map[k]))
+
+if value_changes:
+    if gclass not in ("B", "C"):
+        print("REFUSED: this regeneration changes existing contract values")
+        print("(class B or higher under interface-spec.md section 7.1):")
+        for c in value_changes:
+            print("  " + c)
+        print("Re-run with --class B|C --approver NAME --note \"...\" to record it.")
+        sys.exit(1)
+    if not approver:
+        print("REFUSED: class %s regeneration requires --approver NAME." % gclass)
+        sys.exit(1)
+
 open(man, "w", encoding="utf-8").write("\n".join(out) + "\n")
 print("manifest hashes refreshed:", man)
+if gclass:
+    chlog = os.path.join(os.path.dirname(man), "contract-changes.md")
+    if not os.path.exists(chlog):
+        with open(chlog, "w", encoding="utf-8") as f:
+            f.write("# 契約ベースライン変更履歴\n\n")
+            f.write("`contract-check.sh --generate` による再生成のうち、変更分類\n")
+            f.write("（interface-spec §7.1）を伴ったものの記録。\n\n")
+            f.write("| 日時 | 分類 | 承認者 | 変更行数 | メモ |\n")
+            f.write("|---|---|---|---|---|\n")
+    stamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M %Z")
+    memo = note.replace("|", "/") if note else "-"
+    who = approver if approver else "-"
+    with open(chlog, "a", encoding="utf-8") as f:
+        f.write("| %s | %s | %s | %d | %s |\n"
+                % (stamp, gclass, who, len(value_changes), memo))
+    print("change recorded in %s (class %s, %d changed entries)"
+          % (chlog, gclass, len(value_changes)))
 PYEOF
     exit $?
 fi
