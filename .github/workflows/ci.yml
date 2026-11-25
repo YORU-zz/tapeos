@@ -10,11 +10,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pasmo (Z80 assembler)
+      - name: Install pasmo (Z80 assembler, version-pinned)
+        # Pinned toolchain: Pasmo 0.5.3, Ubuntu 24.04 (noble)
+        # package pasmo=0.5.3-7 (upstream release 0.5.3;
+        # pasmo_0.5.3.orig.tar.gz sha256
+        # db3c41cac16df5966fcca4719bb218af78224de13785b222d1d8e292fc87f1eb).
+        # Build outputs are byte-compared by the contract check, so
+        # the assembler version is part of the build contract and
+        # must not drift with distribution updates. See the README
+        # "Build" section.
         run: |
           sudo apt-get update
-          sudo apt-get install -y pasmo
-          pasmo 2>&1 | head -1 || true
+          sudo apt-get install -y pasmo=0.5.3-7
+          banner="$(pasmo 2>&1 | head -1)"
+          echo "$banner"
+          case "$banner" in
+            "Pasmo v. 0.5.3"*) ;;
+            *) echo "unexpected pasmo version: $banner" >&2; exit 1 ;;
+          esac
 
       - name: Build
         run: ./build.sh
