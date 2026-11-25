@@ -64,8 +64,8 @@ echo "== assemble =="
 "$PASMO" src/edas.z80 build/edas.bin build/edas.lst
 "$PASMO" src/edasr.z80 build/edasr.bin build/edasr.lst
 "$PASMO" src/newasm.z80 build/newasm.bin build/newasm.lst
-"$PASMO" src/sced.z80 build/sced.bin build/sced.lst
-"$PASMO" src/mced.z80 build/mced.bin build/mced.lst
+"$PASMO" -I src src/sced.z80 build/sced.bin build/sced.lst
+"$PASMO" -I src src/mced.z80 build/mced.bin build/mced.lst
 "$PASMO" src/mdb.z80 build/mdb.bin build/mdb.lst
 python3 tools/mklibtab.py src/tblib.z80 "$PASMO" build
 python3 tools/genstub.py tools/stub-template.bin build/stub.inc

@@ -65,7 +65,7 @@ HASH c5e839c0f270a36007a5445c539983835630745f292a9d7445cd3cdbd3d27e22 build/tape
 HASH 9660489fde84162df2197c207b4644617817e1667e081912c1d4178f4fe2f67d build/edas.bin
 HASH a56c809feef3f29fc93ec1947be8daaacc2a1e15db0edd29ae820b1b09e03ffe build/edasr.bin
 HASH be98426a5f34231a1f5a8ed7ca756c966cf403c48a7683781c38c76eea64bec8 build/newasm.bin
-HASH 41c243afa63a7fcffd50e0a96f60b6550917dafad3a14bf6c65f3f3b72156706 build/sced.bin
+HASH 2716adbc5415ae9fc0e8daee1f31f41454287f2399918c9e138e49a99c5af623 build/sced.bin
 HASH bd1b915a807d344da921776145fe56e02278125cd8be0ccbd0bd130436d93944 tools/stub-template.bin
 
 # --- Component size caps (bytes, must be <=). Shell = FD system

@@ -59,8 +59,8 @@ TapeOS は「機械語モニタ＋α」（原作作中の自己評）――モ�
 - **同梱プログラム**（TOSD プログラムとしてシェルから読み込み）：
   - EDAS ― エディタ／アセンブラ（`src/edas.z80`、TOSR リロケータブル版は `src/edasr.z80`）。`Z` コマンドで逆アセンブラを内蔵します（通常版のみ）。デコード部は単体版 DISASM と共有ソース（`src/disasm_core.inc`／`src/disasm_util.inc`）で、モジュール `EDIS`（`src/edis.z80`、0x9000 配置）を `Z` が読み込んで実行し、結果をテキストバッファへ直接追加します。そのまま編集して `B` で再アセンブルできます
   - NEWASM ― オンマシンアセンブラ（`src/newasm.z80`）
-  - SCED ― スクリーンエディタ（`src/sced.z80`）
-  - MCED ― MicroEmacs 風エディタ（`src/mced.z80`）。モードレスな Emacs 系操作（C-k キル／C-y ヤンク、リージョン、検索、C-x プレフィクス）で、SCED とは別プログラム。ファイル形式は SCED と互換
+  - SCED ― スクリーンエディタ（`src/sced.z80`）。テキストバッファ管理と表示層は MCED と共有のコア（`src/edcore.inc`）を使っており、モード付きのコマンドライン操作（`:e` / `:w` / `:q` など）が特徴です
+  - MCED ― MicroEmacs 風エディタ（`src/mced.z80`）。モードレスな Emacs 系操作（C-k キル／C-y ヤンク、リージョン、検索、C-x プレフィクス）で、SCED とは別プログラム。テキストバッファ管理と表示層は SCED と共有のコア（`src/edcore.inc`）で、相違点は条件分岐で切り替えます。ファイル形式は SCED と互換
   - MDB ― Markdown ブラウザ（`src/mdb.z80`）。実用サブセット（ATX 見出し、リスト、引用、コードフェンス、水平線、強調・コード・リンクのインライン装飾）を属性色で描画します。リンクはファイル間ジャンプ、`#アンカー`、履歴で戻る、参照スタイルリンクに対応し、`e` キーで SCED に渡して編集・保存してから閲覧へ復帰できます。サンプル文書は `src/INDEX.MD` / `src/GUIDE.MD` / `src/REF.MD` / `src/JIS.MD`
   - TBC / TBI ― TinyBASIC コンパイラ／インタープリタ（`src/tbc.z80`、`src/tbi.z80`、共有コア `src/tbcore.inc`、X1 ライブラリ `src/tblib.z80`）。X-BASIC 風方言（関数定義の集合、int/char、再帰、配列、print/input/stick/vsync など）。TBC は TOSR 実行ファイルを出力し、TBI は関数単位の遅延 JIT で即実行する。サンプルは `src/fib.tb` / `src/calc.tb` / `src/game.tb` など
   - SCC / SCI ― Small-C コンパイラ／インタープリタ（`src/scc.z80`、`src/sci.z80`、共有コア `src/sccore.inc`、X1 ライブラリ `src/clib.z80`）。Small-C サブセット（int/char、1段ポインタ、配列、再帰、構造化制御、#include/#define、printf/getchar など）。SCC は TOSR 実行ファイルを出力し、SCI は関数単位の遅延 JIT で即実行する（コンパイラと実行結果は完全一致）。TinyBASIC との双方向変換ツール `tools/bascvt.py` 付き（共通サブセット外は変換不可として報告される）。サンプルは `src/fib.c` / `src/calc.c` / `src/game.c` など、変換 corpus は `src/cvsum.tb`＋`src/cvsum.c` ほかの対照ペア
